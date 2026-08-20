@@ -2,11 +2,32 @@
 Configuration constants for Docker evaluations.
 """
 
+import os
+
+
+def _seconds(name: str, default: int) -> int:
+    """Delai reglable par variable d'environnement.
+
+    Chaque examen a ses propres temps de demarrage : un stack Compose complet
+    n'est pas une image BentoML deja construite. Plutot qu'une copie du fichier
+    par skill, chacun declare ce qui le concerne avant d'importer le moteur.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 # Default timeouts (seconds)
-DEFAULT_TIMEOUT = 600  # 10 minutes for compose evaluations
-BENTOML_TIMEOUT = 300  # 5 minutes for BentoML
-SERVICE_READY_TIMEOUT = 60  # Wait for services to become ready
-API_STARTUP_TIMEOUT = 60  # Wait for API startup probes before declaring timeout
+DEFAULT_TIMEOUT = _seconds("EXAM_DEFAULT_TIMEOUT", 600)  # compose evaluations
+BENTOML_TIMEOUT = _seconds("EXAM_BENTOML_TIMEOUT", 300)
+SERVICE_READY_TIMEOUT = _seconds("EXAM_SERVICE_READY_TIMEOUT", 60)
+# Attente de la sonde de disponibilite avant de conclure a une API muette.
+API_STARTUP_TIMEOUT = _seconds("EXAM_API_STARTUP_TIMEOUT", 60)
 
 # Resource limits
 MAX_MEMORY = "2g"  # 2GB memory limit per container
