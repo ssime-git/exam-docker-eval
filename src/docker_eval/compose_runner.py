@@ -124,6 +124,7 @@ class ComposeRunner(BaseRunner):
         self._log_execution_start()
 
         run_started = time.time()
+        self.record_submission_step()
         try:
             # Verify docker-compose.yml exists
             compose_file = os.path.join(self.eval_dir, "docker-compose.yml")

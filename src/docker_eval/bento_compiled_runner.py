@@ -26,6 +26,7 @@ import requests
 from testcontainers.core.container import DockerContainer
 
 from .base_runner import BaseRunner
+from .utils import find_credentials_in_texts
 from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT
 
 
@@ -83,6 +84,7 @@ class BentoCompiledRunner(BaseRunner):
             Dictionary with evaluation results
         """
         self._log_execution_start()
+        self.record_submission_step()
 
         bento_extracted = False
         image_built = False
@@ -281,21 +283,6 @@ class BentoCompiledRunner(BaseRunner):
             shutil.rmtree(extract_dir, ignore_errors=True)
             return None
 
-    # Motifs par lesquels un apprenant ecrit ses identifiants. Les trois
-    # premiers viennent du service, les suivants des fichiers de test -- ou
-    # ils finissent le plus souvent, en dur.
-    CREDENTIAL_PATTERNS = (
-        # USERS = {"admin": "secret"}
-        (r'USERS\s*=\s*\{[^}]*?["\']([^"\']+)["\']\s*:\s*["\']([^"\']+)["\']', "USERS"),
-        # VALID_USERNAME = "x" ... VALID_PASSWORD = "y"
-        (r'VALID_USERNAME\s*=\s*["\']([^"\']+)["\'][\s\S]{0,400}?VALID_PASSWORD\s*=\s*["\']([^"\']+)["\']', "VALID_*"),
-        (r'USERNAME\s*=\s*["\']([^"\']+)["\'][\s\S]{0,400}?PASSWORD\s*=\s*["\']([^"\']+)["\']', "USERNAME/PASSWORD"),
-        # requests.post(..., auth=("x", "y"))
-        (r'auth\s*=\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)', "auth=()"),
-        # json={"username": "x", "password": "y"} ou data={...}
-        (r'["\']username["\']\s*:\s*["\']([^"\']+)["\'][\s\S]{0,200}?["\']password["\']\s*:\s*["\']([^"\']+)["\']', "payload json"),
-    )
-
     _CREDENTIAL_SUFFIXES = (".py", ".env", ".json", ".yaml", ".yml", ".sh", ".txt")
     _CREDENTIAL_SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "site-packages"}
 
@@ -336,18 +323,9 @@ class BentoCompiledRunner(BaseRunner):
                     content = handle.read()
             except OSError:
                 continue
-            for pattern, label in self.CREDENTIAL_PATTERNS:
-                match = re.search(pattern, content)
-                if not match:
-                    continue
-                relative = os.path.relpath(full, root)
-                lowered = relative.lower()
-                return {
-                    "username": match.group(1),
-                    "password": match.group(2),
-                    "source": f"{relative} ({label})",
-                    "in_tests": "test" in lowered or lowered.startswith("tests"),
-                }
+            found = find_credentials_in_texts([(os.path.relpath(full, root), content)])
+            if found:
+                return found
         return None
 
     def _extract_credentials_from_service(

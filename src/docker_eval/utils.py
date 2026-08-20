@@ -175,3 +175,51 @@ def format_exit_code(exit_code: int) -> str:
 
     desc = descriptions.get(exit_code, "Unknown")
     return f"{exit_code} ({desc})"
+
+
+# --- identifiants ecrits par l'apprenant -------------------------------------
+# Les apprenants declarent rarement leurs identifiants proprement. Ils les
+# mettent dans le service, mais aussi -- et souvent -- en dur dans leur fichier
+# de test, avec l'URL et parfois un jeton. Les lire la evite de refuser une
+# copie qui fonctionne, et l'endroit ou on les trouve devient un constat a
+# rendre a l'apprenant.
+
+CREDENTIAL_PATTERNS = (
+    (r"""USERS\s*=\s*\{[^}]*?["']([^"']+)["']\s*:\s*["']([^"']+)["']""", "USERS"),
+    (r"""VALID_USERNAME\s*=\s*["']([^"']+)["'][\s\S]{0,400}?VALID_PASSWORD\s*=\s*["']([^"']+)["']""", "VALID_*"),
+    (r"""USERNAME\s*=\s*["']([^"']+)["'][\s\S]{0,400}?PASSWORD\s*=\s*["']([^"']+)["']""", "USERNAME/PASSWORD"),
+    (r"""auth\s*=\s*\(\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']\s*\)""", "auth=()"),
+    (r"""["']username["']\s*:\s*["']([^"']+)["'][\s\S]{0,200}?["']password["']\s*:\s*["']([^"']+)["']""", "payload json"),
+)
+
+
+def looks_like_test_file(path: str) -> bool:
+    """Le chemin designe-t-il un fichier de test ?"""
+    lowered = path.replace("\\", "/").lower()
+    return "test" in os.path.basename(lowered) or "/tests/" in f"/{lowered}"
+
+
+def find_credentials_in_texts(texts):
+    """Premiers identifiants trouves dans une suite de (chemin, contenu).
+
+    Les fichiers sont examines dans l'ordre recu : appeler avec le service en
+    premier pour qu'il prime sur les tests.
+
+    Rend un dict `username`, `password`, `source`, `in_tests`, ou None.
+    """
+    import re as _re
+
+    for path, content in texts:
+        if not content:
+            continue
+        for pattern, label in CREDENTIAL_PATTERNS:
+            match = _re.search(pattern, content)
+            if not match:
+                continue
+            return {
+                "username": match.group(1),
+                "password": match.group(2),
+                "source": f"{path} ({label})",
+                "in_tests": looks_like_test_file(path),
+            }
+    return None

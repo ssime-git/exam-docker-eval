@@ -67,3 +67,21 @@ with tempfile.TemporaryDirectory() as d:
     step = r.steps[0]
     assert "README.md" in step["output"] and "J'ai fait ceci." in step["output"]
     print("OK : arborescence sans le bruit, README inclus")
+
+
+# --- les motifs sont mutualises et le service prime sur les tests ------------
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+from docker_eval.utils import find_credentials_in_texts, looks_like_test_file
+
+assert looks_like_test_file("tests/test_api.py") is True
+assert looks_like_test_file("src/service.py") is False
+assert looks_like_test_file("test_login.py") is True
+
+# l'ordre recu decide : le service passe devant
+service = ("src/service.py", 'USERS = {"admin": "du-service"}')
+test = ("tests/test_api.py", 'json={"username": "u", "password": "du-test"}')
+assert find_credentials_in_texts([service, test])["password"] == "du-service"
+assert find_credentials_in_texts([test, service])["password"] == "du-test"
+assert find_credentials_in_texts([test])["in_tests"] is True
+assert find_credentials_in_texts([("vide.py", "")]) is None
+print("OK : motifs mutualises, l'ordre decide de la priorite")

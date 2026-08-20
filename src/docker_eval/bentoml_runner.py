@@ -22,6 +22,7 @@ import requests
 from testcontainers.core.container import DockerContainer
 
 from .base_runner import BaseRunner
+from .utils import find_credentials_in_texts, looks_like_test_file
 from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT
 
 
@@ -76,6 +77,8 @@ class BentoMLRunner(BaseRunner):
         self._log_execution_start()
 
         run_started = time.time()
+        self.credentials_source = None
+        self.credentials_in_tests = False
         # Ce que l'apprenant a rendu ouvre la trace : c'est la premiere chose
         # qu'un relecteur regarde.
         self.record_submission_step()
@@ -251,6 +254,8 @@ class BentoMLRunner(BaseRunner):
                 "host_port": host_port,
                 "emulated_platform": emulated_platform,
                 "host_arch": self._host_arch(),
+                "credentials_source": self.credentials_source,
+                "credentials_in_tests": self.credentials_in_tests,
                 "steps": self.steps,
             }
 
@@ -765,15 +770,27 @@ class BentoMLRunner(BaseRunner):
             ],
         }
 
-        for source_path, text in self._iter_submission_texts():
+        # Les identifiants sont cherches sur l'ensemble du rendu, le service
+        # d'abord, les tests ensuite. Un apprenant qui les ecrit en dur dans son
+        # test a quand meme droit a une correction -- et a le savoir.
+        texts = list(self._iter_submission_texts())
+        ordered = sorted(texts, key=lambda item: looks_like_test_file(item[0]))
+        found = find_credentials_in_texts(ordered)
+        if found:
+            contract['usernames'] = [found['username']]
+            contract['passwords'] = [found['password']]
+            contract['credentials_source'] = found['source']
+            contract['credentials_in_tests'] = found['in_tests']
+            self.credentials_source = found['source']
+            self.credentials_in_tests = found['in_tests']
+            self.logger.info(
+                f"Identifiants lus dans {found['source']}"
+                + (" -- ecrits en dur dans un test" if found['in_tests'] else "")
+            )
+
+        for source_path, text in texts:
             if contract['source'] == 'fallback':
                 contract['source'] = source_path
-
-            username_match = re.search(r"""VALID_USERNAME\s*=\s*["']([^"']+)["']""", text)
-            password_match = re.search(r"""VALID_PASSWORD\s*=\s*["']([^"']+)["']""", text)
-            if username_match and password_match:
-                contract['usernames'] = [username_match.group(1)]
-                contract['passwords'] = [password_match.group(1)]
 
             login_signature = re.search(r'def\s+login\s*\(\s*self\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([a-zA-Z_][a-zA-Z0-9_]*)', text)
             if login_signature:
