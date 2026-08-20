@@ -60,6 +60,10 @@ class BentoCompiledRunner(BaseRunner):
             " ", "_"
         ).lower()
         self.credentials = None
+        # D'ou viennent les identifiants, et si l'apprenant les a ecrits dans
+        # ses tests -- ce qui se dit dans le feedback.
+        self.credentials_source = None
+        self.credentials_in_tests = False
 
     def run_evaluation(self) -> Dict[str, Any]:
         """
@@ -177,6 +181,8 @@ class BentoCompiledRunner(BaseRunner):
                 "port_mode": port_mode,
                 "host_port": host_port,
                 "credentials_detected": self.credentials is not None,
+                "credentials_source": self.credentials_source,
+                "credentials_in_tests": self.credentials_in_tests,
             }
 
             self._log_execution_end(result)
@@ -246,41 +252,103 @@ class BentoCompiledRunner(BaseRunner):
                     tar.extractall(extract_dir)
                 self.logger.info(f"✓ Extracted xz-compressed archive to {extract_dir}")
 
-            # Detect credentials from service.py
-            service_py_paths = [
-                os.path.join(extract_dir, "src", "service.py"),
-                os.path.join(extract_dir, "src", "src", "service.py"),
-            ]
-
-            for service_py_path in service_py_paths:
-                self.logger.info(f"Checking service.py path: {service_py_path}")
-                if os.path.exists(service_py_path):
-                    self.logger.info(f"Found service.py at: {service_py_path}")
-                    self.credentials = self._extract_credentials_from_service(
-                        service_py_path
-                    )
-                    if self.credentials:
-                        self.logger.info(
-                            f"✓ Credentials detected: user={self.credentials['username']}"
-                        )
-                        return extract_dir
-                    else:
-                        self.logger.warning(
-                            f"Could not extract credentials from {service_py_path}"
-                        )
-                else:
-                    self.logger.info(f"Service.py not found at: {service_py_path}")
+            # Les identifiants sont ceux que l'apprenant a ecrits. On les cherche
+            # partout dans son rendu, y compris dans ses tests -- c'est souvent
+            # la qu'ils atterrissent, et c'est un constat a lui rendre.
+            found = self._find_credentials_in_submission([extract_dir, self.eval_dir])
+            if found:
+                self.credentials = {
+                    "username": found["username"],
+                    "password": found["password"],
+                }
+                self.credentials_source = found["source"]
+                self.credentials_in_tests = found["in_tests"]
+                self.logger.info(
+                    f"✓ Identifiants lus dans {found['source']} : user={found['username']}"
+                )
+                return extract_dir
 
             self.logger.warning(
-                "Could not detect credentials from service.py, using defaults"
+                "Aucun identifiant trouve dans le rendu ; essai avec le defaut de l'enonce"
             )
             self.credentials = {"username": "admin", "password": "admin123"}
+            self.credentials_source = "defaut de l'enonce"
+            self.credentials_in_tests = False
             return extract_dir
 
         except Exception as e:
             self.logger.error(f"Failed to extract .bento: {e}")
             shutil.rmtree(extract_dir, ignore_errors=True)
             return None
+
+    # Motifs par lesquels un apprenant ecrit ses identifiants. Les trois
+    # premiers viennent du service, les suivants des fichiers de test -- ou
+    # ils finissent le plus souvent, en dur.
+    CREDENTIAL_PATTERNS = (
+        # USERS = {"admin": "secret"}
+        (r'USERS\s*=\s*\{[^}]*?["\']([^"\']+)["\']\s*:\s*["\']([^"\']+)["\']', "USERS"),
+        # VALID_USERNAME = "x" ... VALID_PASSWORD = "y"
+        (r'VALID_USERNAME\s*=\s*["\']([^"\']+)["\'][\s\S]{0,400}?VALID_PASSWORD\s*=\s*["\']([^"\']+)["\']', "VALID_*"),
+        (r'USERNAME\s*=\s*["\']([^"\']+)["\'][\s\S]{0,400}?PASSWORD\s*=\s*["\']([^"\']+)["\']', "USERNAME/PASSWORD"),
+        # requests.post(..., auth=("x", "y"))
+        (r'auth\s*=\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)', "auth=()"),
+        # json={"username": "x", "password": "y"} ou data={...}
+        (r'["\']username["\']\s*:\s*["\']([^"\']+)["\'][\s\S]{0,200}?["\']password["\']\s*:\s*["\']([^"\']+)["\']', "payload json"),
+    )
+
+    _CREDENTIAL_SUFFIXES = (".py", ".env", ".json", ".yaml", ".yml", ".sh", ".txt")
+    _CREDENTIAL_SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "site-packages"}
+
+    def _find_credentials_in_submission(self, roots) -> Optional[Dict[str, Any]]:
+        """Chercher les identifiants ecrits par l'apprenant, partout dans son rendu.
+
+        Le service ne les declare pas toujours proprement : ils atterrissent
+        souvent dans le fichier de test, en dur, avec l'URL et parfois un
+        jeton. Les lire la evite de refuser une copie qui fonctionne, et
+        l'endroit ou on les a trouves devient un constat a rendre.
+
+        Rend un dictionnaire avec `username`, `password`, `source` (chemin
+        relatif) et `in_tests`, ou None.
+        """
+        service_first = []
+        others = []
+
+        for root in roots:
+            if not root or not os.path.isdir(root):
+                continue
+            for current, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if d not in self._CREDENTIAL_SKIP_DIRS]
+                for name in sorted(files):
+                    if not name.endswith(self._CREDENTIAL_SUFFIXES):
+                        continue
+                    full = os.path.join(current, name)
+                    try:
+                        if os.path.getsize(full) > 400_000:
+                            continue
+                    except OSError:
+                        continue
+                    # Le service fait foi ; les tests ne sont qu'un repli.
+                    (service_first if name == "service.py" else others).append((root, full))
+
+        for root, full in service_first + others:
+            try:
+                with open(full, encoding="utf-8", errors="ignore") as handle:
+                    content = handle.read()
+            except OSError:
+                continue
+            for pattern, label in self.CREDENTIAL_PATTERNS:
+                match = re.search(pattern, content)
+                if not match:
+                    continue
+                relative = os.path.relpath(full, root)
+                lowered = relative.lower()
+                return {
+                    "username": match.group(1),
+                    "password": match.group(2),
+                    "source": f"{relative} ({label})",
+                    "in_tests": "test" in lowered or lowered.startswith("tests"),
+                }
+        return None
 
     def _extract_credentials_from_service(
         self, service_py_path: str

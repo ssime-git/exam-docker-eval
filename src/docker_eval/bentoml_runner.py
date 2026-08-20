@@ -76,6 +76,9 @@ class BentoMLRunner(BaseRunner):
         self._log_execution_start()
 
         run_started = time.time()
+        # Ce que l'apprenant a rendu ouvre la trace : c'est la premiere chose
+        # qu'un relecteur regarde.
+        self.record_submission_step()
         emulated_platform = None
         auto_containerized = False
         image_loaded = False
@@ -201,6 +204,20 @@ class BentoMLRunner(BaseRunner):
             # Step 4: Run API tests
             tests_started = time.time()
             test_results = self._run_api_tests(base_url)
+            credentials_source = getattr(self, "credentials_source", None)
+            if credentials_source:
+                in_tests = getattr(self, "credentials_in_tests", False)
+                self.record_step(
+                    "Retrouver les identifiants du service",
+                    output=f"Lus dans : {credentials_source}",
+                    note=(
+                        "Les identifiants sont ecrits en dur dans un fichier de test. "
+                        "La correction s'en sert pour ne pas refuser une copie qui "
+                        "fonctionne, mais c'est une pratique a signaler a l'apprenant."
+                        if in_tests
+                        else "Identifiants declares par le service de l'apprenant."
+                    ),
+                )
             self.record_step(
                 "Appeler les endpoints attendus",
                 command=f"POST {base_url}/login  puis  POST {base_url}/predict",

@@ -5,6 +5,7 @@ Defines the common interface that all runners must implement.
 """
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 
@@ -37,6 +38,86 @@ class BaseRunner(ABC):
         # matiere du scratchpad : sans elle, un relecteur doit recouper trois
         # fichiers pour reconstituer une execution.
         self.steps: list = []
+
+    _TREE_SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
+
+    def describe_submission(self, max_entries: int = 80) -> dict:
+        """Ce que l'apprenant a rendu : l'arborescence, et son README.
+
+        Un relecteur doit pouvoir juger le rendu sans le telecharger. C'est
+        souvent la premiere chose qu'il regarde -- ce qui a ete livre, et ce
+        que l'apprenant en dit.
+        """
+        entries = []
+        truncated = False
+        root = self.eval_dir
+
+        for current, dirs, files in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if d not in self._TREE_SKIP_DIRS)
+            relative_dir = os.path.relpath(current, root)
+            depth = 0 if relative_dir == "." else relative_dir.count(os.sep) + 1
+            if depth > 3:
+                dirs[:] = []
+                continue
+            for name in sorted(files):
+                if len(entries) >= max_entries:
+                    truncated = True
+                    break
+                path = os.path.join(relative_dir, name) if relative_dir != "." else name
+                try:
+                    size = os.path.getsize(os.path.join(current, name))
+                except OSError:
+                    size = None
+                entries.append((path, size))
+            if truncated:
+                break
+
+        readme = ""
+        readme_name = ""
+        for candidate in ("README.md", "README.txt", "README", "readme.md"):
+            for current, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if d not in self._TREE_SKIP_DIRS]
+                if candidate in files:
+                    full = os.path.join(current, candidate)
+                    try:
+                        readme = open(full, encoding="utf-8", errors="ignore").read(6000)
+                        readme_name = os.path.relpath(full, root)
+                    except OSError:
+                        pass
+                    break
+            if readme:
+                break
+
+        return {
+            "entries": entries,
+            "truncated": truncated,
+            "readme_name": readme_name,
+            "readme": readme,
+        }
+
+    def record_submission_step(self) -> None:
+        """Consigner le contenu du rendu comme premiere etape du scratchpad."""
+        described = self.describe_submission()
+        lines = [
+            f"{path}" + (f"  ({size} o)" if size is not None else "")
+            for path, size in described["entries"]
+        ]
+        if described["truncated"]:
+            lines.append("... (liste tronquee)")
+        output = "\n".join(lines) or "(rendu vide)"
+        if described["readme"]:
+            output += (
+                f"\n\n--- {described['readme_name']} ---\n{described['readme'].strip()}"
+            )
+        self.record_step(
+            "Ce que l'apprenant a rendu",
+            command=f"find . -type f   # dans {os.path.basename(self.eval_dir)}",
+            output=output,
+            note=(
+                "Arborescence du rendu et contenu du README, pour juger sur pieces "
+                "sans telecharger l'archive."
+            ),
+        )
 
     def record_step(
         self,
