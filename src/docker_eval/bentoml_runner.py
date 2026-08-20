@@ -1246,8 +1246,19 @@ class BentoMLRunner(BaseRunner):
         junit_path = os.path.join(self.eval_dir, "pytest_report.xml")
         if os.path.exists(junit_path):
             os.remove(junit_path)
+        # pytest-asyncio en mode strict fait echouer les tests `async def` non
+        # marques — ceux que l'apprenant a ecrits en pensant qu'ils tourneraient.
+        # Le mode auto les execute au lieu de les compter en erreur.
         command.extend(
-            ["pytest", patched_tests_path, "-v", "--tb=short", f"--junit-xml={junit_path}"]
+            [
+                "pytest",
+                patched_tests_path,
+                "-v",
+                "--tb=short",
+                "-o",
+                "asyncio_mode=auto",
+                f"--junit-xml={junit_path}",
+            ]
         )
 
         self.logger.info("Running pytest against running API...")
@@ -1281,6 +1292,8 @@ class BentoMLRunner(BaseRunner):
                     *discovered_files,
                     "-v",
                     "--tb=short",
+                    "-o",
+                    "asyncio_mode=auto",
                     f"--junit-xml={junit_path}",
                 ]
                 self.logger.info(
@@ -1321,6 +1334,11 @@ class BentoMLRunner(BaseRunner):
                 f"pytest n'a collecté aucun test (code {result.returncode}). "
                 f"Fin de sortie :\n{queue}"
             )
+
+        # Le fichier de sortie vit dans le repertoire de travail, qui est
+        # supprime a la fin. Sans cet extrait, la revue n'a plus rien a lire
+        # pour juger si un echec vient de la copie ou de nous.
+        results["output_tail"] = "\n".join(output.strip().splitlines()[-60:])
 
         results.update(
             {
