@@ -826,7 +826,13 @@ class BentoMLRunner(BaseRunner):
             predict_signature = re.search(r'def\s+predict\s*\(\s*self\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([a-zA-Z_][a-zA-Z0-9_]*)', text)
             if predict_signature:
                 predict_wrapper = predict_signature.group(1)
-                if predict_wrapper not in contract['predict_wrappers']:
+                # Un parametre positionnel (marque par `/`) n'est PAS enveloppe
+                # par BentoML : les champs vont a la racine du corps. Verifie
+                # sur une copie reelle -- le corps nu rend 200, l'enveloppe 400.
+                positional = re.search(
+                    r'def\s+predict\s*\([\s\S]{0,300}?^\s*/\s*,', text, re.M
+                )
+                if predict_wrapper not in contract['predict_wrappers'] and not positional:
                     contract['predict_wrappers'].insert(0, predict_wrapper)
                 request_type = predict_signature.group(2)
                 request_fields = self._extract_class_fields(text, request_type)
@@ -943,12 +949,17 @@ class BentoMLRunner(BaseRunner):
                 ]
             for payload in predict_bodies:
                 normalized_payload = json.loads(json.dumps(payload).replace('{token}', token))
+                # Le token obtenu au login doit accompagner la requete. Il ne
+                # l'etait pas : les en-tetes partaient vides et /predict rendait
+                # 401, ce qui etait compte contre l'apprenant alors que son
+                # endpoint verifie correctement l'autorisation.
+                auth_headers = {"Authorization": f"Bearer {token}"} if token else {}
                 request_variants = []
                 for wrapper in contract.get("predict_wrappers", [None, "request"]):
                     if wrapper:
-                        request_variants.append(( {wrapper: normalized_payload}, {} ))
+                        request_variants.append(({wrapper: normalized_payload}, dict(auth_headers)))
                     else:
-                        request_variants.append((normalized_payload, {}))
+                        request_variants.append((normalized_payload, dict(auth_headers)))
                 if isinstance(normalized_payload, dict) and 'authorization' in normalized_payload:
                     body = dict(normalized_payload)
                     auth_value = body.pop('authorization')
