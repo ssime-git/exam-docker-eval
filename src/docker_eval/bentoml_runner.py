@@ -642,9 +642,19 @@ class BentoMLRunner(BaseRunner):
                 sock.settimeout(1)
                 tcp_ready = sock.connect_ex((host, port)) == 0
 
-            if tcp_ready and saw_startup_signal:
-                self.logger.info(
-                    "✓ TCP port is open and BentoML startup logs were observed; proceeding to API tests"
+            # Un port TCP ouvert ne veut pas dire que l'application repond : le
+            # noyau accepte la connexion et le serveur la reinitialise aussitot
+            # tant qu'il demarre. Mesure sous emulation : reset instantane a
+            # t+0, puis 200 en 24s. Se contenter du TCP faisait echouer toutes
+            # les requetes suivantes, et notait 0 une copie qui fonctionne.
+            #
+            # On ne retient donc ce repli que dans le dernier quart du delai,
+            # quand aucune reponse HTTP n'est venue -- pour ne pas bloquer un
+            # service qui refuserait vraiment toutes les routes sondees.
+            if tcp_ready and saw_startup_signal and elapsed > API_STARTUP_TIMEOUT * 0.75:
+                self.logger.warning(
+                    "Aucune reponse HTTP, mais le port est ouvert et le demarrage "
+                    "observe : on tente les tests malgre tout"
                 )
                 return
 
@@ -890,7 +900,11 @@ class BentoMLRunner(BaseRunner):
                     )
                     break
             except Exception as e:
-                self.logger.debug(f"Login probe failed for payload {payload}: {e}")
+                # En warning, pas en debug : sans ca on ne voit pas la
+                # difference entre "refuse" et "n'a jamais repondu".
+                self.logger.warning(
+                    f"Requete /login en echec ({type(e).__name__}): {str(e)[:120]}"
+                )
 
         if not results["login_passed"]:
             self.logger.error(
