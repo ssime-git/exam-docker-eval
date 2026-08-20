@@ -1198,7 +1198,15 @@ class BentoMLRunner(BaseRunner):
             return results
         results["tests_present"] = True
 
-        requirements_path = os.path.join(self.eval_dir, "requirements.txt")
+        # Le requirements.txt vit dans le projet de l'apprenant, qui est
+        # rarement a la racine du repertoire d'evaluation : le chercher
+        # seulement a la racine revenait a lancer les tests sans leurs
+        # dependances.
+        requirements_path = os.path.join(
+            self._project_root_for_tests(tests_path), "requirements.txt"
+        )
+        if not os.path.isfile(requirements_path):
+            requirements_path = os.path.join(self.eval_dir, "requirements.txt")
         output_file = os.path.join(self.eval_dir, "test_results.log")
         results["output_file"] = output_file
 
@@ -1220,6 +1228,13 @@ class BentoMLRunner(BaseRunner):
             "pyjwt",
             "--with",
             "setuptools",
+            # httpx est le client standard pour tester une application ASGI.
+            # Les apprenants l'importent dans conftest.py sans toujours le
+            # declarer : sans lui, la collecte echoue avant le premier test.
+            "--with",
+            "httpx",
+            "--with",
+            "pytest-asyncio",
         ]
         if os.path.isfile(requirements_path):
             command.extend(["--with-requirements", requirements_path])
