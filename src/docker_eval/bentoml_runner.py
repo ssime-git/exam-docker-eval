@@ -786,17 +786,21 @@ class BentoMLRunner(BaseRunner):
         # d'abord, les tests ensuite. Un apprenant qui les ecrit en dur dans son
         # test a quand meme droit a une correction -- et a le savoir.
         texts = list(self._iter_submission_texts())
-        ordered = sorted(texts, key=lambda item: looks_like_test_file(item[0]))
-        found = find_credentials_in_texts(ordered)
-        if not found:
-            # Le rendu ne livre parfois que l'image : le source n'est nulle part
-            # sur le disque. On va le lire dedans plutot que d'echouer au login.
+
+        # Un rendu qui ne livre que l'image n'expose aucun source sur le disque.
+        # Sans lui, ni les identifiants ni la forme des payloads ne sont
+        # connus, et le correcteur teste a cote : mauvais noms de champs,
+        # mauvais nom de parametre. On lit donc le service dans l'image.
+        if not any(re.search(r"def\s+predict\s*\(", text) for _, text in texts):
             in_image = self._read_service_from_image()
             if in_image:
                 self.logger.info(
-                    f"Aucun source sur le disque ; lecture de {len(in_image)} fichier(s) dans l'image"
+                    f"Aucun service sur le disque ; lecture de {len(in_image)} fichier(s) dans l'image"
                 )
-                found = find_credentials_in_texts(in_image)
+                texts = list(texts) + in_image
+
+        ordered = sorted(texts, key=lambda item: looks_like_test_file(item[0]))
+        found = find_credentials_in_texts(ordered)
         if found:
             contract['usernames'] = [found['username']]
             contract['passwords'] = [found['password']]
