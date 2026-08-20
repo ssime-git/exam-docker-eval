@@ -776,6 +776,15 @@ class BentoMLRunner(BaseRunner):
         texts = list(self._iter_submission_texts())
         ordered = sorted(texts, key=lambda item: looks_like_test_file(item[0]))
         found = find_credentials_in_texts(ordered)
+        if not found:
+            # Le rendu ne livre parfois que l'image : le source n'est nulle part
+            # sur le disque. On va le lire dedans plutot que d'echouer au login.
+            in_image = self._read_service_from_image()
+            if in_image:
+                self.logger.info(
+                    f"Aucun source sur le disque ; lecture de {len(in_image)} fichier(s) dans l'image"
+                )
+                found = find_credentials_in_texts(in_image)
         if found:
             contract['usernames'] = [found['username']]
             contract['passwords'] = [found['password']]
@@ -1288,6 +1297,50 @@ class BentoMLRunner(BaseRunner):
             return "apprenant"
 
         return "indetermine"
+
+    def _read_service_from_image(self):
+        """Lire le code du service a l'interieur de l'image.
+
+        Un rendu qui ne livre que l'image Docker -- cas frequent en BentoML --
+        n'expose aucun source sur le disque. Les identifiants y sont pourtant,
+        et sans eux le correcteur echoue au login sur une copie qui fonctionne.
+
+        Rend une liste de (chemin, contenu), vide si rien n'est lisible.
+        """
+        if not self.image_name:
+            return []
+
+        command = [
+            "docker", "run", "--rm", "--entrypoint", "sh",
+        ]
+        platform = self._platform_for_image()
+        if platform:
+            command += ["--platform", platform]
+        command += [
+            self.image_name,
+            "-c",
+            # Un fichier a la fois, precede de son chemin, pour rester lisible.
+            "find /home/bentoml/bento/src -name '*.py' -size -200k "
+            "-exec sh -c 'echo \"===FILE:$1\"; cat \"$1\"' _ {} \\; 2>/dev/null",
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        except Exception as exc:
+            self.logger.debug(f"Lecture du service dans l'image impossible : {exc}")
+            return []
+
+        texts = []
+        current_path, buffer = None, []
+        for line in (result.stdout or "").splitlines():
+            if line.startswith("===FILE:"):
+                if current_path:
+                    texts.append((f"{current_path} (dans l'image)", "\n".join(buffer)))
+                current_path, buffer = line[len("===FILE:"):], []
+            elif current_path:
+                buffer.append(line)
+        if current_path:
+            texts.append((f"{current_path} (dans l'image)", "\n".join(buffer)))
+        return texts
 
     def _host_arch(self) -> str:
         """Architecture de la machine, dans le vocabulaire de Docker."""

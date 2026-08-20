@@ -190,6 +190,10 @@ CREDENTIAL_PATTERNS = (
     (r"""USERNAME\s*=\s*["']([^"']+)["'][\s\S]{0,400}?PASSWORD\s*=\s*["']([^"']+)["']""", "USERNAME/PASSWORD"),
     (r"""auth\s*=\s*\(\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']\s*\)""", "auth=()"),
     (r"""["']username["']\s*:\s*["']([^"']+)["'][\s\S]{0,200}?["']password["']\s*:\s*["']([^"']+)["']""", "payload json"),
+    # APP_USERNAME = os.getenv("APP_USERNAME", "user123") -- declaration propre
+    # par variable d'environnement, avec un defaut. Frequent, et jusqu'ici rate.
+    (r"""(?:APP_|)USERNAME\s*=\s*os\.getenv\([^,]+,\s*["']([^"']+)["']\)[\s\S]{0,400}?(?:APP_|)PASSWORD\s*=\s*os\.getenv\([^,]+,\s*["']([^"']+)["']\)""", "os.getenv"),
+    (r"""(?:APP_|)USERNAME\s*=\s*os\.environ\.get\([^,]+,\s*["']([^"']+)["']\)[\s\S]{0,400}?(?:APP_|)PASSWORD\s*=\s*os\.environ\.get\([^,]+,\s*["']([^"']+)["']\)""", "os.environ.get"),
 )
 
 
