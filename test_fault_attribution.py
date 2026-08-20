@@ -7,7 +7,7 @@ Lancer depuis ce repertoire :
 """
 import os, sys, logging
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 from docker_eval.bentoml_runner import BentoMLRunner
 
 r = BentoMLRunner("x", "/tmp", 300, logging.getLogger("t"))

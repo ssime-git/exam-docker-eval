@@ -6,7 +6,7 @@ Lancer depuis ce repertoire :
         python test_container_death_reporting.py
 """
 import os, sys, types, logging
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from docker_eval.bentoml_runner import BentoMLRunner
 
@@ -30,7 +30,7 @@ class _Client:
 fake.from_env = lambda: _Client()
 sys.modules["docker"] = fake
 
-r = BentoMLRunner("457363", "/tmp", 300, logging.getLogger("t"))
+r = BentoMLRunner("copie-test", "/tmp", 300, logging.getLogger("t"))
 r.container_name = "peu-importe"
 r.image_name = "admission_prediction_service:latest"
 

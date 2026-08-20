@@ -7,7 +7,7 @@ Lancer depuis ce repertoire :
 """
 import os, sys, types, logging
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from docker_eval.compose_runner import ComposeRunner
 from docker_eval.bentoml_runner import BentoMLRunner
@@ -26,7 +26,7 @@ assert only({"target": 80}) == {"target": 80}
 print("OK : seul le port du conteneur est conserve")
 
 # --- choix de la plateforme ------------------------------------------------
-r = BentoMLRunner("457363", "/tmp", 300, log)
+r = BentoMLRunner("copie-test", "/tmp", 300, log)
 r.image_name = "peu:importe"
 
 r._host_arch = lambda: "amd64"
