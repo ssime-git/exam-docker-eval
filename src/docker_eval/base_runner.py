@@ -119,6 +119,24 @@ class BaseRunner(ABC):
             ),
         )
 
+    def echec(self, message: str, exit_code: int = 2, **extra) -> dict:
+        """Résultat d'échec qui n'oublie pas la trace.
+
+        Les retours anticipés du runner rendaient un dict sans `steps`. Le
+        scratchpad se retrouvait vide, et un relecteur ne voyait ni ce que
+        l'apprenant avait rendu ni pourquoi on s'était arrêté — au moment
+        précis où il en a le plus besoin.
+        """
+        self.record_step("L'évaluation s'interrompt", output=message, exit_code=exit_code)
+        resultat = {
+            "success": False,
+            "error": message,
+            "exit_code": exit_code,
+            "steps": self.steps,
+        }
+        resultat.update(extra)
+        return resultat
+
     def record_step(
         self,
         title: str,

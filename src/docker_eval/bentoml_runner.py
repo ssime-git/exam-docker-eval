@@ -124,24 +124,32 @@ class BentoMLRunner(BaseRunner):
                             f"✓ Auto-containerized .bento file: {self.image_name}"
                         )
                     else:
-                        return {
-                            "success": False,
-                            "error": bento_result.get(
-                                "error", "Failed to auto-containerize .bento file"
-                            ),
-                            "exit_code": 2,
-                            "image_loaded": False,
-                        }
+                        return self.echec(
+                            bento_result.get("error", "Failed to auto-containerize .bento file"),
+                            image_loaded=False,
+                        )
                 else:
                     # Fallback to existing local BentoML image.
                     self.image_name = self._find_bentoml_image()
                     if not self.image_name:
-                        return {
-                            "success": False,
-                            "error": "No BentoML image or .bento file found",
-                            "exit_code": 2,
-                            "image_loaded": False,
-                        }
+                        source_root = self._find_bento_source()
+                        if source_root:
+                            construit = self._build_bento_from_source(source_root)
+                            if construit.get("success"):
+                                bento_result = self._auto_containerize_bento()
+                                if bento_result.get("success"):
+                                    self.image_name = bento_result["image_name"]
+                                    auto_containerized = True
+                                    image_loaded = True
+                                    self.logger.info(f"✓ Image construite depuis la source : {self.image_name}")
+                            else:
+                                self.logger.warning(construit.get("error", "construction en échec"))
+                    if not self.image_name:
+                        return self.echec(
+                            "Aucune image Docker, aucun .bento, et aucune source constructible "
+                            "dans le rendu",
+                            image_loaded=False,
+                        )
                     image_loaded = True
 
             # Step 2: Create and start container
@@ -1615,6 +1623,99 @@ class BentoMLRunner(BaseRunner):
             return bento_file
 
         self.logger.warning("No .bento file found")
+        return None
+
+    def _find_bento_source(self) -> Optional[str]:
+        """Racine d'un rendu livré en source : `bentofile.yaml` à côté du code.
+
+        C'est une forme de rendu légitime — l'apprenant livre ce qu'il a écrit
+        plutôt qu'un artefact construit. Le runner ne savait que charger une
+        image ou un `.bento` déjà compilé, et abandonnait en une seconde.
+        """
+        for current, dirs, files in os.walk(self.eval_dir):
+            dirs[:] = [d for d in dirs if d not in {".git", ".venv", "__pycache__", "node_modules"}]
+            if "bentofile.yaml" in files:
+                return current
+        return None
+
+    def _build_bento_from_source(self, source_root: str) -> Dict[str, Any]:
+        """Construire le `.bento` depuis la source, puis l'image.
+
+        `bentoml build` tourne dans un conteneur jetable : la machine de
+        correction n'a pas à porter bentoml ni les dépendances de l'apprenant.
+        Le `.bento` produit est déposé dans le rendu, où le chemin existant
+        sait le conteneuriser.
+        """
+        self.record_step(
+            "Construire le service depuis la source",
+            command=f"bentoml build  # dans {os.path.relpath(source_root, self.eval_dir)}",
+            note=(
+                "Le rendu livre la source plutôt qu'une image. On la construit pour "
+                "pouvoir l'évaluer, au lieu de refuser la copie."
+            ),
+        )
+
+        image = os.environ.get("EXAM_BENTOML_BUILDER_IMAGE", "python:3.11-slim")
+        script = (
+            "set -e; cd /src; "
+            "pip install --quiet --disable-pip-version-check bentoml >/dev/null 2>&1; "
+            "if [ -f requirements.txt ]; then "
+            "pip install --quiet --disable-pip-version-check -r requirements.txt >/dev/null 2>&1 || true; fi; "
+            "export BENTOML_HOME=/src/.bentoml_home; "
+            "bentoml build 2>&1 | tail -20; "
+            "bentoml list -o json 2>/dev/null | head -40"
+        )
+        resultat = subprocess.run(
+            ["docker", "run", "--rm", "-v", f"{source_root}:/src", image, "sh", "-c", script],
+            capture_output=True, text=True, timeout=1800,
+        )
+        sortie = (resultat.stdout or "") + (resultat.stderr or "")
+        self.steps[-1]["output"] = sortie[-3000:]
+        self.steps[-1]["exit_code"] = resultat.returncode
+
+        if resultat.returncode != 0:
+            return {"success": False, "error": f"bentoml build a échoué : {sortie[-400:]}"}
+
+        # `bentoml build` dépose le bento dans BENTOML_HOME, qu'on a placé dans
+        # le rendu pour qu'il survive au conteneur.
+        exporte = self._exporter_bento(source_root, image)
+        if not exporte:
+            return {"success": False, "error": "aucun .bento produit par la construction"}
+        return {"success": True, "bento": exporte}
+
+    def _exporter_bento(self, source_root: str, image: str) -> Optional[str]:
+        """Sortir le `.bento` construit vers le rendu, où le chemin existant le trouvera.
+
+        Le tag se lit en JSON plutôt qu'au `sed` : une expression rationnelle
+        dans un script shell imbriqué est illisible et casse au premier
+        changement de format.
+        """
+        liste = subprocess.run(
+            ["docker", "run", "--rm", "-v", f"{source_root}:/src", image, "sh", "-c",
+             "cd /src; export BENTOML_HOME=/src/.bentoml_home; bentoml list -o json 2>/dev/null"],
+            capture_output=True, text=True, timeout=300,
+        )
+        try:
+            bentos = json.loads(liste.stdout or "[]")
+        except json.JSONDecodeError:
+            self.logger.warning("`bentoml list` n'a pas rendu de JSON exploitable")
+            return None
+        tags = [b.get("tag") for b in bentos if isinstance(b, dict) and b.get("tag")]
+        if not tags:
+            self.logger.warning("aucun bento listé après la construction")
+            return None
+
+        export = subprocess.run(
+            ["docker", "run", "--rm", "-v", f"{source_root}:/src", image, "sh", "-c",
+             f"cd /src; export BENTOML_HOME=/src/.bentoml_home; "
+             f"bentoml export '{tags[0]}' /src/service.bento"],
+            capture_output=True, text=True, timeout=300,
+        )
+        chemin = os.path.join(source_root, "service.bento")
+        if export.returncode == 0 and os.path.exists(chemin):
+            self.logger.info(f"✓ .bento construit ({tags[0]}) : {chemin}")
+            return chemin
+        self.logger.warning(f"Export du .bento en échec : {(export.stderr or '')[:200]}")
         return None
 
     def _auto_containerize_bento(self) -> Dict[str, Any]:
