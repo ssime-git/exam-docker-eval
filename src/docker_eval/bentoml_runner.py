@@ -1656,14 +1656,27 @@ class BentoMLRunner(BaseRunner):
         )
 
         image = os.environ.get("EXAM_BENTOML_BUILDER_IMAGE", "python:3.11-slim")
+        # `bentoml build` exige que le modele soit enregistre dans le Model
+        # Store. Les rendus livrent le modele en fichier et documentent un
+        # script qui l'enregistre : on suit leur procedure plutot que d'echouer
+        # sur « Model could not be found locally ».
+        prealables = " ".join(
+            f"if [ -f {script} ]; then echo '--- {script}'; python {script} 2>&1 | tail -5 || true; fi;"
+            for script in ("src/prepare_data.py", "src/train_model.py",
+                           "src/save_model_joblib.py", "train_model.py")
+        )
         script = (
-            "set -e; cd /src; "
+            "cd /src; "
             "pip install --quiet --disable-pip-version-check bentoml >/dev/null 2>&1; "
             "if [ -f requirements.txt ]; then "
             "pip install --quiet --disable-pip-version-check -r requirements.txt >/dev/null 2>&1 || true; fi; "
             "export BENTOML_HOME=/src/.bentoml_home; "
-            "bentoml build 2>&1 | tail -20; "
-            "bentoml list -o json 2>/dev/null | head -40"
+            f"{prealables} "
+            "echo '--- bentoml build'; bentoml build 2>&1 | tail -20; "
+            "bentoml list -o json 2>/dev/null | head -40; "
+            # Le conteneur ecrit en root dans un repertoire monte : sans ca, le
+            # nettoyage cote hote echoue en EACCES et laisse le rendu derriere.
+            f"chown -R {os.getuid()}:{os.getgid()} /src 2>/dev/null || true"
         )
         resultat = subprocess.run(
             ["docker", "run", "--rm", "-v", f"{source_root}:/src", image, "sh", "-c", script],
@@ -1708,7 +1721,8 @@ class BentoMLRunner(BaseRunner):
         export = subprocess.run(
             ["docker", "run", "--rm", "-v", f"{source_root}:/src", image, "sh", "-c",
              f"cd /src; export BENTOML_HOME=/src/.bentoml_home; "
-             f"bentoml export '{tags[0]}' /src/service.bento"],
+             f"bentoml export '{tags[0]}' /src/service.bento; "
+             f"chown -R {os.getuid()}:{os.getgid()} /src 2>/dev/null || true"],
             capture_output=True, text=True, timeout=300,
         )
         chemin = os.path.join(source_root, "service.bento")
