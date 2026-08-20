@@ -64,3 +64,13 @@ try:
 except RuntimeError:
     pass
 print("OK : port publie relu, et erreur claire s'il manque")
+
+
+# --- delais HTTP sous emulation ---------------------------------------------
+r3 = BentoMLRunner("copie-test", "/tmp", 300, log)
+r3._emulating = False
+assert r3._http_timeout(10) == 10, "sans emulation, le delai ne bouge pas"
+r3._emulating = True
+assert r3._http_timeout(10) == 60, r3._http_timeout(10)
+assert r3._http_timeout(3) == 18, r3._http_timeout(3)
+print("OK : delais HTTP allonges seulement quand on emule")

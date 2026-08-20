@@ -23,7 +23,7 @@ from testcontainers.core.container import DockerContainer
 
 from .base_runner import BaseRunner
 from .utils import find_credentials_in_texts, looks_like_test_file
-from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT
+from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT, EMULATION_TIMEOUT_FACTOR
 
 
 class BentoMLRunner(BaseRunner):
@@ -77,6 +77,7 @@ class BentoMLRunner(BaseRunner):
         self._log_execution_start()
 
         run_started = time.time()
+        self._emulating = False
         self.credentials_source = None
         self.credentials_in_tests = False
         # Ce que l'apprenant a rendu ouvre la trace : c'est la premiere chose
@@ -166,6 +167,7 @@ class BentoMLRunner(BaseRunner):
                 self.logger.info(f"Image d'une autre architecture : execution en {platform}")
                 self.container = self.container.with_kwargs(platform=platform)
                 emulated_platform = platform
+                self._emulating = True
                 self.record_step(
                     "Adapter l'execution a l'architecture de l'image",
                     command=f"docker run --platform {platform} ...",
@@ -626,7 +628,7 @@ class BentoMLRunner(BaseRunner):
 
             for readiness_path in readiness_paths:
                 try:
-                    response = requests.get(f"{base_url}{readiness_path}", timeout=3)
+                    response = requests.get(f"{base_url}{readiness_path}", timeout=self._http_timeout(3))
                     if response.status_code in accepted_statuses:
                         self.logger.info(
                             f"✓ API readiness probe succeeded on {readiness_path} with status {response.status_code}"
@@ -873,7 +875,7 @@ class BentoMLRunner(BaseRunner):
                 login_response = requests.post(
                     f"{base_url}/login",
                     json=payload,
-                    timeout=10,
+                    timeout=self._http_timeout(10),
                 )
                 results["login_attempt_statuses"].append(login_response.status_code)
                 if login_response.status_code != 200:
@@ -940,7 +942,7 @@ class BentoMLRunner(BaseRunner):
                             f"{base_url}/predict",
                             json=body,
                             headers=headers,
-                            timeout=10,
+                            timeout=self._http_timeout(10),
                         )
                         results["predict_attempt_statuses"].append(
                             predict_response.status_code
@@ -1297,6 +1299,18 @@ class BentoMLRunner(BaseRunner):
             return "apprenant"
 
         return "indetermine"
+
+    def _http_timeout(self, base: int) -> int:
+        """Delai d'une requete HTTP, allonge quand on emule.
+
+        Sous QEMU une image d'une autre architecture repond plusieurs fois plus
+        lentement. Mesure sur une copie reelle : un /login qui repond en 9s
+        emule expirait sur un delai de 10s, et la copie etait notee 0 sur le
+        comportement de l'API alors que son endpoint fonctionne.
+        """
+        if getattr(self, "_emulating", False):
+            return base * EMULATION_TIMEOUT_FACTOR
+        return base
 
     def _read_service_from_image(self):
         """Lire le code du service a l'interieur de l'image.

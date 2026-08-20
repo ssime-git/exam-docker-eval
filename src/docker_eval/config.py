@@ -28,6 +28,9 @@ BENTOML_TIMEOUT = _seconds("EXAM_BENTOML_TIMEOUT", 300)
 SERVICE_READY_TIMEOUT = _seconds("EXAM_SERVICE_READY_TIMEOUT", 60)
 # Attente de la sonde de disponibilite avant de conclure a une API muette.
 API_STARTUP_TIMEOUT = _seconds("EXAM_API_STARTUP_TIMEOUT", 60)
+# Sous QEMU, une image d'une autre architecture repond plusieurs fois plus
+# lentement. Les delais HTTP sont multiplies par ce facteur quand on emule.
+EMULATION_TIMEOUT_FACTOR = _seconds("EXAM_EMULATION_TIMEOUT_FACTOR", 6)
 
 # Resource limits
 MAX_MEMORY = "2g"  # 2GB memory limit per container
