@@ -1656,10 +1656,10 @@ class BentoMLRunner(BaseRunner):
         )
 
         image = os.environ.get("EXAM_BENTOML_BUILDER_IMAGE", "python:3.11-slim")
-        # `bentoml build` exige que le modele soit enregistre dans le Model
-        # Store. Les rendus livrent le modele en fichier et documentent un
-        # script qui l'enregistre : on suit leur procedure plutot que d'echouer
-        # sur « Model could not be found locally ».
+        # Tout dans un seul conteneur : installer, suivre la procedure de
+        # l'apprenant, construire, exporter. Un second conteneur repartirait
+        # sans bentoml -- l'export echouait ainsi sur une commande introuvable,
+        # et le message disait « aucun bento liste » plutot que la verite.
         prealables = " ".join(
             f"if [ -f {script} ]; then echo '--- {script}'; python {script} 2>&1 | tail -5 || true; fi;"
             for script in ("src/prepare_data.py", "src/train_model.py",
@@ -1673,7 +1673,11 @@ class BentoMLRunner(BaseRunner):
             "export BENTOML_HOME=/src/.bentoml_home; "
             f"{prealables} "
             "echo '--- bentoml build'; bentoml build 2>&1 | tail -20; "
-            "bentoml list -o json 2>/dev/null | head -40; "
+            "echo '--- export'; "
+            "tag=$(bentoml list -o json 2>/dev/null | python -c "
+            "'import json,sys; b=json.load(sys.stdin); print(b[0][\"tag\"] if b else \"\")' 2>/dev/null); "
+            "if [ -n \"$tag\" ]; then bentoml export \"$tag\" /src/service.bento && "
+            "echo \"exporte: $tag\"; else echo 'aucun bento construit'; fi; "
             # Le conteneur ecrit en root dans un repertoire monte : sans ca, le
             # nettoyage cote hote echoue en EACCES et laisse le rendu derriere.
             f"chown -R {os.getuid()}:{os.getgid()} /src 2>/dev/null || true"
@@ -1686,51 +1690,12 @@ class BentoMLRunner(BaseRunner):
         self.steps[-1]["output"] = sortie[-3000:]
         self.steps[-1]["exit_code"] = resultat.returncode
 
-        if resultat.returncode != 0:
-            return {"success": False, "error": f"bentoml build a échoué : {sortie[-400:]}"}
-
-        # `bentoml build` dépose le bento dans BENTOML_HOME, qu'on a placé dans
-        # le rendu pour qu'il survive au conteneur.
-        exporte = self._exporter_bento(source_root, image)
-        if not exporte:
-            return {"success": False, "error": "aucun .bento produit par la construction"}
-        return {"success": True, "bento": exporte}
-
-    def _exporter_bento(self, source_root: str, image: str) -> Optional[str]:
-        """Sortir le `.bento` construit vers le rendu, où le chemin existant le trouvera.
-
-        Le tag se lit en JSON plutôt qu'au `sed` : une expression rationnelle
-        dans un script shell imbriqué est illisible et casse au premier
-        changement de format.
-        """
-        liste = subprocess.run(
-            ["docker", "run", "--rm", "-v", f"{source_root}:/src", image, "sh", "-c",
-             "cd /src; export BENTOML_HOME=/src/.bentoml_home; bentoml list -o json 2>/dev/null"],
-            capture_output=True, text=True, timeout=300,
-        )
-        try:
-            bentos = json.loads(liste.stdout or "[]")
-        except json.JSONDecodeError:
-            self.logger.warning("`bentoml list` n'a pas rendu de JSON exploitable")
-            return None
-        tags = [b.get("tag") for b in bentos if isinstance(b, dict) and b.get("tag")]
-        if not tags:
-            self.logger.warning("aucun bento listé après la construction")
-            return None
-
-        export = subprocess.run(
-            ["docker", "run", "--rm", "-v", f"{source_root}:/src", image, "sh", "-c",
-             f"cd /src; export BENTOML_HOME=/src/.bentoml_home; "
-             f"bentoml export '{tags[0]}' /src/service.bento; "
-             f"chown -R {os.getuid()}:{os.getgid()} /src 2>/dev/null || true"],
-            capture_output=True, text=True, timeout=300,
-        )
         chemin = os.path.join(source_root, "service.bento")
-        if export.returncode == 0 and os.path.exists(chemin):
-            self.logger.info(f"✓ .bento construit ({tags[0]}) : {chemin}")
-            return chemin
-        self.logger.warning(f"Export du .bento en échec : {(export.stderr or '')[:200]}")
-        return None
+        if not os.path.exists(chemin):
+            return {"success": False,
+                    "error": f"aucun .bento produit par la construction : {sortie[-400:]}"}
+        self.logger.info(f"✓ .bento construit : {chemin}")
+        return {"success": True, "bento": chemin}
 
     def _auto_containerize_bento(self) -> Dict[str, Any]:
         """
