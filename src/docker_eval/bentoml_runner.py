@@ -987,10 +987,14 @@ class BentoMLRunner(BaseRunner):
                         if predict_response.status_code != 200:
                             continue
                         data = predict_response.json()
-                        if "prediction" in data or "cnt" in data or "probability" in data:
-                            results["predict_passed"] = True
-                            self.logger.info("✓ Prediction successful")
-                            break
+                        # Un 200 sur /predict est une reponse valide. Exiger une
+                        # cle precise revient a deviner comment l'apprenant a
+                        # nomme son champ : un service qui repond correctement
+                        # avec un autre nom etait recale pour rien.
+                        results["predict_passed"] = True
+                        results["predict_response"] = str(data)[:400]
+                        self.logger.info(f"✓ Prediction successful : {str(data)[:200]}")
+                        break
                     except Exception as e:
                         self.logger.debug(
                             f"Predict probe failed for payload variant: {e}"
