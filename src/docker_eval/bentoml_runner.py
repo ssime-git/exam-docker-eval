@@ -15,6 +15,7 @@ import tarfile
 from urllib.parse import urlparse
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 import time
 from typing import Dict, Any, Optional
 
@@ -1072,6 +1073,19 @@ class BentoMLRunner(BaseRunner):
 
         return None
 
+    def _project_root_for_tests(self, tests_path: str) -> str:
+        """Le dossier depuis lequel les tests de l'apprenant peuvent s'importer."""
+        normalise = os.path.normpath(tests_path)
+        if os.path.isdir(tests_path):
+            parent = os.path.dirname(normalise)
+        else:
+            parent = os.path.dirname(os.path.dirname(normalise))
+        # `parent == normalise` arrive à la racine du système : plus rien à
+        # remonter, on reste dans le répertoire d'évaluation.
+        if not parent or parent == normalise or not os.path.isdir(parent):
+            return self.eval_dir
+        return parent
+
     def _prepare_tests_for_dynamic_base_url(
         self, tests_path: str, base_url: str
     ) -> str:
@@ -1079,9 +1093,13 @@ class BentoMLRunner(BaseRunner):
         Copy tests to a temp directory and rewrite hardcoded BASE_URL values
         to use BENTOML_BASE_URL when present.
         """
-        patched_tests_root = tempfile.mkdtemp(
-            prefix="bentoml_tests_", dir=self.eval_dir
-        )
+        # Le conftest d'un apprenant remonte presque toujours vers `../src`
+        # pour importer son propre code. Copier les tests dans un répertoire
+        # détaché casse cette remontée : la collecte échoue et pytest ne trouve
+        # zéro test — ce qui se lisait comme « l'apprenant n'a pas de tests ».
+        # La copie patchée reste donc à côté du dossier d'origine.
+        projet = self._project_root_for_tests(tests_path)
+        patched_tests_root = tempfile.mkdtemp(prefix="bentoml_tests_", dir=projet)
 
         if os.path.isdir(tests_path):
             dst_tests_path = os.path.join(
@@ -1132,6 +1150,30 @@ class BentoMLRunner(BaseRunner):
         )
         return dst_tests_path
 
+    def _read_junit_report(self, chemin: str):
+        """Lire le compte réel des tests dans le rapport JUnit de pytest.
+
+        Compter à la regex sur la sortie texte se trompe dès que la collecte
+        échoue : pytest n'écrit alors aucun « N passed » et le total tombe à
+        zéro, ce qui se confond avec une copie sans tests.
+        """
+        if not os.path.isfile(chemin):
+            return None
+        try:
+            racine = ET.parse(chemin).getroot()
+        except ET.ParseError:
+            return None
+
+        suites = [racine] if racine.tag == "testsuite" else racine.findall("testsuite")
+        total = failed = errors = skipped = 0
+        for suite in suites:
+            total += int(suite.get("tests", 0))
+            failed += int(suite.get("failures", 0))
+            errors += int(suite.get("errors", 0))
+            skipped += int(suite.get("skipped", 0))
+        passed = max(0, total - failed - errors - skipped)
+        return passed, failed, errors, total
+
     def _run_pytest(self, base_url: str) -> Dict[str, Any]:
         """Run pytest suite against the running API."""
         results: Dict[str, Any] = {
@@ -1148,15 +1190,22 @@ class BentoMLRunner(BaseRunner):
 
         tests_path = self._find_tests_path()
         if not tests_path:
+            # L'apprenant n'a pas rendu de tests. C'est un constat sur la copie,
+            # pas une limite de l'évaluation : la note 0 est méritée.
             results["reason"] = "No tests directory found"
+            results["tests_present"] = False
+            results["evaluable"] = True
             return results
+        results["tests_present"] = True
 
         requirements_path = os.path.join(self.eval_dir, "requirements.txt")
         output_file = os.path.join(self.eval_dir, "test_results.log")
         results["output_file"] = output_file
 
         if not shutil.which("uvx"):
+            # Notre outillage manque : l'apprenant n'y est pour rien.
             results["reason"] = "uvx not available"
+            results["evaluable"] = False
             return results
 
         command = [
@@ -1178,16 +1227,26 @@ class BentoMLRunner(BaseRunner):
             tests_path, base_url
         )
         results["tests_path"] = patched_tests_path
-        command.extend(["pytest", patched_tests_path, "-v", "--tb=short"])
+        projet = self._project_root_for_tests(tests_path)
+        junit_path = os.path.join(self.eval_dir, "pytest_report.xml")
+        if os.path.exists(junit_path):
+            os.remove(junit_path)
+        command.extend(
+            ["pytest", patched_tests_path, "-v", "--tb=short", f"--junit-xml={junit_path}"]
+        )
 
         self.logger.info("Running pytest against running API...")
         env = os.environ.copy()
         env["BENTOML_BASE_URL"] = base_url
         env["BENTOML_PORT"] = base_url.rsplit(":", 1)[-1]
+        # Les tests importent le code de l'apprenant, qui vit dans le projet.
+        env["PYTHONPATH"] = os.pathsep.join(
+            [p for p in (projet, env.get("PYTHONPATH")) if p]
+        )
 
         result = subprocess.run(
             command,
-            cwd=self.eval_dir,
+            cwd=projet,
             capture_output=True,
             text=True,
             env=env,
@@ -1201,14 +1260,20 @@ class BentoMLRunner(BaseRunner):
                     if filename.endswith(".py"):
                         discovered_files.append(os.path.join(root, filename))
             if discovered_files:
-                retry_command = command[:]
-                retry_command = retry_command[:-4] + ["pytest", *discovered_files, "-v", "--tb=short"]
+                prefixe = command[: command.index("pytest")]
+                retry_command = prefixe + [
+                    "pytest",
+                    *discovered_files,
+                    "-v",
+                    "--tb=short",
+                    f"--junit-xml={junit_path}",
+                ]
                 self.logger.info(
                     "Pytest collected no tests by default pattern; retrying with explicit test files"
                 )
                 result = subprocess.run(
                     retry_command,
-                    cwd=self.eval_dir,
+                    cwd=projet,
                     capture_output=True,
                     text=True,
                     env=env,
@@ -1218,15 +1283,34 @@ class BentoMLRunner(BaseRunner):
         with open(output_file, "w", encoding="utf-8") as handle:
             handle.write(output)
 
-        passed = sum(int(match) for match in re.findall(r"(\d+)\s+passed", output))
-        failed = sum(int(match) for match in re.findall(r"(\d+)\s+failed", output))
-        errors = sum(int(match) for match in re.findall(r"(\d+)\s+error", output))
-        total = passed + failed + errors
+        compte = self._read_junit_report(junit_path)
+        if compte is None:
+            # Le rapport machine n'existe pas : pytest s'est arrêté avant
+            # d'écrire quoi que ce soit. On retombe sur la prose, en sachant
+            # qu'elle ment quand la collecte échoue.
+            passed = sum(int(match) for match in re.findall(r"(\d+)\s+passed", output))
+            failed = sum(int(match) for match in re.findall(r"(\d+)\s+failed", output))
+            errors = sum(int(match) for match in re.findall(r"(\d+)\s+error", output))
+            total = passed + failed + errors
+        else:
+            passed, failed, errors, total = compte
         pass_rate = int((passed * 100 / total)) if total else 0
+
+        # Zéro test collecté sur une copie qui en contient veut dire que la
+        # collecte a échoué chez nous. Noter 0 dans ce cas punit l'apprenant
+        # pour notre panne : la catégorie devient non évaluable.
+        evaluable = total > 0
+        if not evaluable:
+            queue = "\n".join(output.strip().splitlines()[-15:])
+            results["reason"] = (
+                f"pytest n'a collecté aucun test (code {result.returncode}). "
+                f"Fin de sortie :\n{queue}"
+            )
 
         results.update(
             {
                 "executed": True,
+                "evaluable": evaluable,
                 "passed": passed,
                 "failed": failed,
                 "errors": errors,
