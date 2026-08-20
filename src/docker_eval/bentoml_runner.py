@@ -1612,15 +1612,21 @@ class BentoMLRunner(BaseRunner):
         Returns:
             Path to .bento file if found, None otherwise
         """
-        import glob
+        # Récursif : les rendus arrivent presque toujours dans un dossier
+        # (`examen_bentoml/`), et une recherche limitée à la racine ne voyait
+        # ni le .bento livré par l'apprenant ni celui qu'on vient de construire.
+        trouves = []
+        for current, dirs, files in os.walk(self.eval_dir):
+            dirs[:] = [d for d in dirs
+                       if d not in {".git", ".venv", "venv", "__pycache__", ".bentoml_home"}]
+            trouves += [os.path.join(current, f) for f in sorted(files) if f.endswith(".bento")]
 
-        # Search for .bento files
-        bento_files = glob.glob(os.path.join(self.eval_dir, "*.bento"))
-
-        if bento_files:
-            bento_file = bento_files[0]
-            self.logger.info(f"Found .bento file: {bento_file}")
-            return bento_file
+        if trouves:
+            # Le moins profond d'abord : un .bento à la racine du rendu prime
+            # sur un artefact enfoui.
+            trouves.sort(key=lambda chemin: chemin.count(os.sep))
+            self.logger.info(f"Found .bento file: {trouves[0]}")
+            return trouves[0]
 
         self.logger.warning("No .bento file found")
         return None

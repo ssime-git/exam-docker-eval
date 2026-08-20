@@ -45,3 +45,22 @@ with tempfile.TemporaryDirectory() as d:
     assert titres == ["Une etape avant l'echec", "L'évaluation s'interrompt"], titres
     assert resultat["steps"][-1]["output"] == "rien de constructible"
     print("OK : un echec rend la trace, l'interruption comprise")
+
+
+# --- le .bento est cherche recursivement -------------------------------------
+with tempfile.TemporaryDirectory() as d:
+    r = BentoMLRunner("copie-test", d, 300, log)
+    assert r._find_bento_file() is None
+
+    # cas reel : le rendu arrive dans un dossier
+    ecrire(d, "examen_bentoml/service.bento", "x")
+    assert r._find_bento_file().endswith("examen_bentoml/service.bento"), r._find_bento_file()
+
+    # un .bento a la racine prime sur un artefact enfoui
+    ecrire(d, "racine.bento", "x")
+    assert r._find_bento_file().endswith("racine.bento"), r._find_bento_file()
+
+    # le magasin bentoml interne ne doit pas etre confondu avec un rendu
+    ecrire(d, "examen_bentoml/.bentoml_home/bentos/interne.bento", "x")
+    assert ".bentoml_home" not in r._find_bento_file()
+    print("OK : .bento trouve dans un sous-dossier, sans confondre le magasin interne")
