@@ -138,7 +138,9 @@ class BentoMLRunner(BaseRunner):
                         if source_root:
                             construit = self._build_bento_from_source(source_root)
                             if construit.get("success"):
-                                bento_result = self._auto_containerize_bento()
+                                bento_result = self._auto_containerize_bento(
+                                    bento_file_path=construit.get("bento")
+                                )
                                 if bento_result.get("success"):
                                     self.image_name = bento_result["image_name"]
                                     auto_containerized = True
@@ -1910,12 +1912,15 @@ class BentoMLRunner(BaseRunner):
         self.logger.info(f"✓ .bento construit : {chemin}")
         return {"success": True, "bento": chemin}
 
-    def _auto_containerize_bento(self) -> Dict[str, Any]:
+    def _auto_containerize_bento(self, bento_file_path: Optional[str] = None) -> Dict[str, Any]:
         """
         Auto-containerize a .bento file using Docker build.
 
         The .bento file is a tar.gz archive containing a Dockerfile.
         We extract it and build the Docker image directly.
+
+        Args:
+            bento_file_path: Explicit path to .bento file. If None, search for it.
 
         Returns:
             Dictionary with success status and image name
@@ -1923,8 +1928,8 @@ class BentoMLRunner(BaseRunner):
         import tarfile
         import shutil
 
-        # Find .bento file
-        bento_file = self._find_bento_file()
+        # Use provided path or search for .bento file
+        bento_file = bento_file_path or self._find_bento_file()
 
         if not bento_file:
             return {
