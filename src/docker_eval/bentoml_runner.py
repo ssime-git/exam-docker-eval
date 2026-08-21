@@ -1218,13 +1218,21 @@ class BentoMLRunner(BaseRunner):
             "pyjwt",
             "--with",
             "setuptools",
-            # httpx est le client standard pour tester une application ASGI.
-            # Les apprenants l'importent dans conftest.py sans toujours le
-            # declarer : sans lui, la collecte echoue avant le premier test.
+            # L'outillage standard qu'un apprenant importe sans toujours le
+            # declarer dans requirements.txt : httpx pour appeler l'API depuis
+            # les tests, fastapi et uvicorn quand son conftest lance un serveur
+            # de test local. Sur 458784, les 7 tests d'integration echouaient
+            # sur `No module named 'fastapi'` — leur serveur ne demarrait
+            # jamais. Fournir les manquants standards note ce que les tests
+            # valent ; la declaration manquante se corrige dans le feedback.
             "--with",
             "httpx",
             "--with",
             "pytest-asyncio",
+            "--with",
+            "fastapi",
+            "--with",
+            "uvicorn",
         ]
         if os.path.isfile(requirements_path):
             command.extend(["--with-requirements", requirements_path])
