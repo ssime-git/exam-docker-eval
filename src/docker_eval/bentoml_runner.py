@@ -1089,26 +1089,16 @@ class BentoMLRunner(BaseRunner):
     def _prepare_tests_for_dynamic_base_url(
         self, tests_path: str, base_url: str
     ) -> str:
-        """
-        Copy tests to a temp directory and rewrite hardcoded BASE_URL values
-        to use BENTOML_BASE_URL when present.
-        """
-        # Le conftest d'un apprenant remonte presque toujours vers `../src`
-        # pour importer son propre code. Copier les tests dans un répertoire
-        # détaché casse cette remontée : la collecte échoue et pytest ne trouve
-        # zéro test — ce qui se lisait comme « l'apprenant n'a pas de tests ».
-        # La copie patchée reste donc à côté du dossier d'origine.
-        projet = self._project_root_for_tests(tests_path)
-        patched_tests_root = tempfile.mkdtemp(prefix="bentoml_tests_", dir=projet)
+        """Rewrite hardcoded BASE_URL values in place to honour BENTOML_BASE_URL.
 
-        if os.path.isdir(tests_path):
-            dst_tests_path = os.path.join(
-                patched_tests_root, os.path.basename(os.path.normpath(tests_path))
-            )
-            shutil.copytree(tests_path, dst_tests_path)
-        else:
-            dst_tests_path = patched_tests_root
-            shutil.copy2(tests_path, os.path.join(dst_tests_path, os.path.basename(tests_path)))
+        Sur place, et non dans une copie : les tests d'un apprenant se situent
+        par rapport a `__file__` — un conftest qui remonte vers `../src` pour
+        importer son code, ou qui lance `PROJECT_ROOT/src/simple_server.py`,
+        casse des que les fichiers changent de dossier. Le repertoire
+        d'evaluation est deja une copie de travail extraite de l'archive et
+        supprimee a la fin ; la modifier ne touche a rien de l'apprenant.
+        """
+        dst_tests_path = tests_path if os.path.isdir(tests_path) else os.path.dirname(tests_path)
 
         base_url_pattern = re.compile(
             r'(^\s*BASE_URL\s*=\s*)(["\'])http://(?:127\.0\.0\.1|localhost):\d+(["\'])',
@@ -1146,7 +1136,7 @@ class BentoMLRunner(BaseRunner):
                     )
 
         self.logger.info(
-            f"Prepared dynamic-port pytest copy at {dst_tests_path} (base_url={base_url})"
+            f"Tests patched in place at {dst_tests_path} (base_url={base_url})"
         )
         return dst_tests_path
 
@@ -1367,11 +1357,6 @@ class BentoMLRunner(BaseRunner):
             for ref in problem_lines[:20]:
                 self.logger.error("  - %s", ref)
         results["problem_lines"] = problem_lines[:50]
-
-        try:
-            shutil.rmtree(os.path.dirname(patched_tests_path))
-        except Exception as e:
-            self.logger.debug(f"Failed to cleanup temporary test directory: {e}")
 
         return results
 
