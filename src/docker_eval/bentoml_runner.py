@@ -1265,6 +1265,13 @@ class BentoMLRunner(BaseRunner):
         env = os.environ.copy()
         env["BENTOML_BASE_URL"] = base_url
         env["BENTOML_PORT"] = base_url.rsplit(":", 1)[-1]
+        # Les apprenants propres lisent une variable d'environnement — mais
+        # chacun la sienne. 459404 lisait BASE_URL, on n'exportait que
+        # BENTOML_BASE_URL : son repli localhost:3000 partait en connexion
+        # refusée et ses 7 tests « échouaient ». Exporter les conventions
+        # courantes ne coûte rien et note ce que les tests valent vraiment.
+        for nom in ("BASE_URL", "API_URL", "SERVICE_URL"):
+            env.setdefault(nom, base_url)
         # Les tests importent le code de l'apprenant, qui vit dans le projet.
         env["PYTHONPATH"] = os.pathsep.join(
             [p for p in (projet, env.get("PYTHONPATH")) if p]
@@ -1328,7 +1335,21 @@ class BentoMLRunner(BaseRunner):
         # collecte a échoué chez nous. Noter 0 dans ce cas punit l'apprenant
         # pour notre panne : la catégorie devient non évaluable.
         evaluable = total > 0
-        if not evaluable:
+        # Tous les tests en échec ET des erreurs de connexion dans la sortie :
+        # les tests n'ont jamais atteint le service. C'est le harnais (port,
+        # URL, service pas prêt), pas la copie — noter 0 serait un mensonge.
+        if (
+            evaluable
+            and passed == 0
+            and (failed + errors) == total
+            and re.search(r"ConnectionError|Connection refused|NewConnectionError|ConnectionRefused", output)
+        ):
+            evaluable = False
+            results["reason"] = (
+                f"les {total} tests échouent tous en erreur de connexion : ils n'ont "
+                "jamais atteint le service. Harnais en cause (URL/port), pas la copie."
+            )
+        if not evaluable and results.get("reason") is None:
             queue = "\n".join(output.strip().splitlines()[-15:])
             results["reason"] = (
                 f"pytest n'a collecté aucun test (code {result.returncode}). "
