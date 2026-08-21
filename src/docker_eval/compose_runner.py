@@ -8,6 +8,9 @@ docker-compose.yml configurations.
 import logging
 import os
 import time
+import urllib.request
+import urllib.error
+import ssl
 from typing import Dict, Any
 
 from testcontainers.compose import DockerCompose
@@ -159,6 +162,18 @@ class ComposeRunner(BaseRunner):
                 # Wait for services to be ready
                 self._wait_for_services()
 
+                # Deux formes d'examen. Un service `pipeline` declare = un
+                # traitement qui se termine (linux-bash) : on attend sa fin.
+                # Sans lui (nginx, prometheus-grafana), rien ne finit jamais —
+                # attendre un conteneur pipeline-1 inexistant faisait tourner
+                # 600s de boucle NotFound avant un timeout impute a la copie.
+                services = self._services_du_compose(os.path.join(self.eval_dir, compose_name))
+                if "pipeline" not in services:
+                    self.logger.info(f"Pas de service pipeline ({services}) : stack servante")
+                    result = self._evaluer_services_persistants()
+                    self._log_execution_end(result)
+                    return result
+
                 # Wait for pipeline container to complete
                 self.logger.info(f"Waiting for pipeline completion (timeout: {self.timeout}s)...")
                 exit_code = self._wait_for_pipeline_completion()
@@ -195,6 +210,110 @@ class ComposeRunner(BaseRunner):
         finally:
             # Guaranteed cleanup (even on crash)
             self.cleanup(force=True)
+
+    @staticmethod
+    def _services_du_compose(compose_file: str) -> list:
+        import yaml
+        with open(compose_file, encoding="utf-8") as handle:
+            contenu = yaml.safe_load(handle) or {}
+        return sorted((contenu.get("services") or {}).keys())
+
+    @staticmethod
+    def _classer_services(etats: dict) -> tuple:
+        """(succes, morts) depuis {nom: (status, exit_code)}.
+
+        Un service encore debout est sain. Un service sorti en 0 est un
+        one-shot qui a fini son travail (init de certificats, migration).
+        Un service sorti autrement est mort.
+        """
+        morts = {n: e for n, e in etats.items()
+                 if e[0] == "exited" and e[1] != 0 or e[0] == "dead"}
+        return (not morts, morts)
+
+    def _etats_du_projet(self) -> dict:
+        import docker
+        client = docker.from_env()
+        etats = {}
+        for c in client.containers.list(
+            all=True, filters={"label": f"com.docker.compose.project={self.project_name}"}
+        ):
+            c.reload()
+            etats[c.name] = (c.status, c.attrs.get("State", {}).get("ExitCode", 0))
+        return etats
+
+    def _sonder_ports_publies(self) -> list:
+        """GET sur chaque port publié du projet, en HTTP puis HTTPS.
+
+        On ne juge pas les codes ici : un 401 sur une racine protégée est un
+        bon signe, un refus TLS sur le port HTTP est normal. On enregistre ce
+        qui répond, l'agent et le barème en font ce qu'ils savent.
+        """
+        import docker
+        client = docker.from_env()
+        sondes = []
+        contexte_tls = ssl.create_default_context()
+        contexte_tls.check_hostname = False
+        contexte_tls.verify_mode = ssl.CERT_NONE
+        for c in client.containers.list(
+            filters={"label": f"com.docker.compose.project={self.project_name}"}
+        ):
+            ports = c.attrs.get("NetworkSettings", {}).get("Ports") or {}
+            for interne, publications in ports.items():
+                for pub in publications or []:
+                    hote = pub.get("HostPort")
+                    if not hote:
+                        continue
+                    for schema in ("http", "https"):
+                        url = f"{schema}://127.0.0.1:{hote}/"
+                        try:
+                            reponse = urllib.request.urlopen(
+                                url, timeout=10,
+                                context=contexte_tls if schema == "https" else None,
+                            )
+                            sondes.append({"service": c.name, "port": interne, "url": url,
+                                           "code": reponse.status,
+                                           "extrait": reponse.read(200).decode("utf-8", "replace")})
+                            break
+                        except urllib.error.HTTPError as erreur:
+                            corps = erreur.read(300).decode("utf-8", "replace")
+                            sondes.append({"service": c.name, "port": interne, "url": url,
+                                           "code": erreur.code,
+                                           "entetes": dict(erreur.headers) if "WWW-Authenticate" in erreur.headers else None,
+                                           "extrait": corps})
+                            break
+                        except Exception as erreur:
+                            if schema == "https":
+                                sondes.append({"service": c.name, "port": interne, "url": url,
+                                               "erreur": str(erreur)[:150]})
+        return sondes
+
+    def _evaluer_services_persistants(self) -> Dict[str, Any]:
+        """Évaluer un examen dont les services servent au lieu de se terminer.
+
+        nginx, prometheus-grafana : rien ne « finit », le succès c'est une
+        stack debout qui répond sur ses ports.
+        """
+        etats = self._etats_du_projet()
+        self.record_step(
+            "État des services",
+            output="\n".join(f"{n} : {s} (code {c})" for n, (s, c) in sorted(etats.items())),
+        )
+        sondes = self._sonder_ports_publies()
+        for sonde in sondes:
+            resume = (f"code {sonde['code']}" if "code" in sonde else f"erreur {sonde.get('erreur')}")
+            self.record_step(f"Sonde {sonde['url']}", output=f"{resume}\n{sonde.get('extrait', '')}"[:500])
+
+        succes, morts = self._classer_services(etats)
+        logs = self._capture_logs()
+        return {
+            "success": succes,
+            "exit_code": 0 if succes else 1,
+            "error": None if succes else f"service(s) en échec : {sorted(morts)}",
+            "services": {n: {"status": e[0], "exit_code": e[1]} for n, e in etats.items()},
+            "probes": sondes,
+            "logs": logs,
+            "steps": self.steps,
+        }
 
     def _wait_for_services(self):
         """
