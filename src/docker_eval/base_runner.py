@@ -189,6 +189,31 @@ class BaseRunner(ABC):
         """
         pass
 
+    def record_exam_image(self, image: str) -> None:
+        """Marquer une image comme venant de la copie : à supprimer au ménage."""
+        if image:
+            self._exam_images = getattr(self, "_exam_images", set())
+            self._exam_images.add(image)
+
+    def remove_exam_images(self) -> None:
+        """Supprimer les images chargées ou construites pour cette correction.
+
+        Sur une machine de correction partagée, chaque copie laisse sinon des
+        centaines de Mo d'images derrière elle — les conteneurs sont nettoyés,
+        pas ce qui a servi à les lancer.
+        """
+        import docker
+        images = getattr(self, "_exam_images", set())
+        if not images:
+            return
+        client = docker.from_env()
+        for image in sorted(images):
+            try:
+                client.images.remove(image, force=True)
+                self.logger.info(f"✓ Image d'examen supprimée : {image}")
+            except Exception as erreur:
+                self.logger.warning(f"Image {image} non supprimée : {erreur}")
+
     def _log_execution_start(self):
         """Log evaluation start with context."""
         self.logger.info("=" * 80)

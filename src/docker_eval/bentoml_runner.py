@@ -101,6 +101,7 @@ class BentoMLRunner(BaseRunner):
             if self.image_tar:
                 self.logger.info(f"Loading Docker image from {self.image_tar}")
                 self.image_name = self._load_docker_image()
+                self.record_exam_image(self.image_name)
                 if not self.image_name:
                     return {
                         "success": False,
@@ -414,6 +415,7 @@ class BentoMLRunner(BaseRunner):
 
         try:
             self.image_name = self._load_docker_image_cli()
+            self.record_exam_image(self.image_name)
             if not self.image_name:
                 if self.image_tar and self.image_tar.endswith(".bento"):
                     self.logger.warning(
@@ -1682,6 +1684,7 @@ class BentoMLRunner(BaseRunner):
 
         # Additional manual cleanup
         self._force_cleanup_container()
+        self.remove_exam_images()
 
         if self.cli_container_id:
             try:

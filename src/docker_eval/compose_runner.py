@@ -158,6 +158,20 @@ class ComposeRunner(BaseRunner):
             self.logger.info("Starting Docker Compose services...")
             with self.compose:
                 self.logger.info("Services started successfully")
+                # Retenir les images construites pour cette copie : le ménage
+                # les supprimera. Celles de l'apprenant portent le préfixe du
+                # projet compose ; les images publiques (nginx, prometheus)
+                # restent, elles resserviront.
+                try:
+                    prefixe = os.path.basename(self.eval_dir).lstrip(".-_").lower()
+                    for image in self._images_du_projet():
+                        # Seules les images construites pour cette copie : le
+                        # préfixe du projet compose. `nginx:latest` et autres
+                        # images publiques restent, elles resserviront.
+                        if image.lower().startswith(prefixe):
+                            self.record_exam_image(image)
+                except Exception as erreur:
+                    self.logger.debug(f"images non recensées : {erreur}")
 
                 # Wait for services to be ready
                 self._wait_for_services()
@@ -247,6 +261,15 @@ class ComposeRunner(BaseRunner):
             if identifiant:
                 conteneurs.append(client.containers.get(identifiant))
         return conteneurs
+
+    def _images_du_projet(self) -> list:
+        import docker
+        client = docker.from_env()
+        images = set()
+        for c in self._conteneurs_du_projet():
+            for tag in (c.image.tags or []):
+                images.add(tag)
+        return sorted(images)
 
     def _etats_du_projet(self) -> dict:
         etats = {}
@@ -458,6 +481,7 @@ class ComposeRunner(BaseRunner):
 
         # Additional manual cleanup using docker client
         self._force_cleanup_docker_resources()
+        self.remove_exam_images()
 
     def _force_cleanup_docker_resources(self):
         """Force cleanup of any remaining Docker resources for this project."""
