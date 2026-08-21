@@ -271,10 +271,12 @@ class ComposeRunner(BaseRunner):
                 continue
             ports = c.attrs.get("NetworkSettings", {}).get("Ports") or {}
             for interne, publications in ports.items():
-                for pub in publications or []:
-                    hote = pub.get("HostPort")
-                    if not hote:
-                        continue
+                # IPv4 et IPv6 publient le même port hôte : une seule sonde.
+                hotes = sorted({pub.get("HostPort") for pub in publications or [] if pub.get("HostPort")})
+                for hote in hotes:
+                    # Les deux schémas, toujours : « HTTPS joignable » est au
+                    # barème nginx, et un port TLS répond 400 au HTTP nu — ce
+                    # qui est déjà une réponse, pas une raison de s'arrêter.
                     for schema in ("http", "https"):
                         url = f"{schema}://127.0.0.1:{hote}/"
                         try:
@@ -285,18 +287,15 @@ class ComposeRunner(BaseRunner):
                             sondes.append({"service": c.name, "port": interne, "url": url,
                                            "code": reponse.status,
                                            "extrait": reponse.read(200).decode("utf-8", "replace")})
-                            break
                         except urllib.error.HTTPError as erreur:
                             corps = erreur.read(300).decode("utf-8", "replace")
                             sondes.append({"service": c.name, "port": interne, "url": url,
                                            "code": erreur.code,
                                            "entetes": dict(erreur.headers) if "WWW-Authenticate" in erreur.headers else None,
                                            "extrait": corps})
-                            break
                         except Exception as erreur:
-                            if schema == "https":
-                                sondes.append({"service": c.name, "port": interne, "url": url,
-                                               "erreur": str(erreur)[:150]})
+                            sondes.append({"service": c.name, "port": interne, "url": url,
+                                           "erreur": str(erreur)[:150]})
         return sondes
 
     def _evaluer_services_persistants(self) -> Dict[str, Any]:
