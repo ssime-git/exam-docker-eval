@@ -816,6 +816,29 @@ class BentoMLRunner(BaseRunner):
                 )
                 texts = list(texts) + in_image
 
+        # Le contrat le plus fiable est celui que l'apprenant documente
+        # lui-meme : un exemple curl vers /predict dans le README donne les
+        # noms de champs exacts. 459145 (FastAPI, pas de `def predict(self`)
+        # documentait GRE_Score/TOEFL_Score... et recevait quand meme les
+        # payloads generiques — 422 sur toute la ligne.
+        for source_path, text in texts:
+            for bloc in re.findall(
+                r"/predict[\s\S]{0,300}?-d\s+'(\{[\s\S]*?\})'", text
+            ):
+                try:
+                    corps = json.loads(bloc)
+                except ValueError:
+                    continue
+                # Un corps enveloppe (ex. {"request": {...}}) porte aussi le
+                # nom du wrapper.
+                if isinstance(corps, dict) and corps:
+                    contract['predict_bodies'].insert(0, corps)
+                    contract['predict_documented_source'] = source_path
+                    self.logger.info(f"Payload /predict lu dans {source_path}")
+                break
+            if contract.get('predict_documented_source'):
+                break
+
         ordered = sorted(texts, key=lambda item: looks_like_test_file(item[0]))
         found = find_credentials_in_texts(ordered)
         if found:
@@ -869,7 +892,12 @@ class BentoMLRunner(BaseRunner):
                                 continue
                         request_payload[field_name] = self._sample_value_for_field(field_name)
                     if request_payload:
-                        contract['predict_bodies'] = [request_payload]
+                        if contract.get('predict_documented_source'):
+                            # Le payload documente par l'apprenant prime sur
+                            # celui reconstruit depuis les types.
+                            contract['predict_bodies'].append(request_payload)
+                        else:
+                            contract['predict_bodies'] = [request_payload]
 
         return contract
 
