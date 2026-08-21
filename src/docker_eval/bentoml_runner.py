@@ -1338,7 +1338,14 @@ class BentoMLRunner(BaseRunner):
         # Le fichier de sortie vit dans le repertoire de travail, qui est
         # supprime a la fin. Sans cet extrait, la revue n'a plus rien a lire
         # pour juger si un echec vient de la copie ou de nous.
-        results["output_tail"] = "\n".join(output.strip().splitlines()[-60:])
+        # stderr (téléchargements uv) est concaténé après stdout : sans
+        # filtre, la queue ne montre que des « Downloading » et cache les
+        # échecs de tests que la revue doit lire.
+        lignes_utiles = [
+            l for l in output.strip().splitlines()
+            if not re.match(r"\s*(Downloading|Downloaded|Installed \d|Resolved \d|Prepared \d|Built |Audited )", l)
+        ]
+        results["output_tail"] = "\n".join(lignes_utiles[-60:])
 
         results.update(
             {
