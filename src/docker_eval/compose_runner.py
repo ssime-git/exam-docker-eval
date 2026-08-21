@@ -230,13 +230,27 @@ class ComposeRunner(BaseRunner):
                  if e[0] == "exited" and e[1] != 0 or e[0] == "dead"}
         return (not morts, morts)
 
-    def _etats_du_projet(self) -> dict:
+    def _conteneurs_du_projet(self) -> list:
+        """Les conteneurs de la stack, via testcontainers lui-même.
+
+        Filtrer par label com.docker.compose.project=<self.project_name> rend
+        une liste vide : testcontainers nomme le projet d'après le dossier du
+        compose, pas d'après notre project_name. Une liste vide ferait un
+        succès par vacuité — zéro service mort parce que zéro service tout
+        court.
+        """
         import docker
         client = docker.from_env()
+        conteneurs = []
+        for info in self.compose.get_containers(include_all=True):
+            identifiant = getattr(info, "ID", None) or getattr(info, "id", None)
+            if identifiant:
+                conteneurs.append(client.containers.get(identifiant))
+        return conteneurs
+
+    def _etats_du_projet(self) -> dict:
         etats = {}
-        for c in client.containers.list(
-            all=True, filters={"label": f"com.docker.compose.project={self.project_name}"}
-        ):
+        for c in self._conteneurs_du_projet():
             c.reload()
             etats[c.name] = (c.status, c.attrs.get("State", {}).get("ExitCode", 0))
         return etats
@@ -248,15 +262,13 @@ class ComposeRunner(BaseRunner):
         bon signe, un refus TLS sur le port HTTP est normal. On enregistre ce
         qui répond, l'agent et le barème en font ce qu'ils savent.
         """
-        import docker
-        client = docker.from_env()
         sondes = []
         contexte_tls = ssl.create_default_context()
         contexte_tls.check_hostname = False
         contexte_tls.verify_mode = ssl.CERT_NONE
-        for c in client.containers.list(
-            filters={"label": f"com.docker.compose.project={self.project_name}"}
-        ):
+        for c in self._conteneurs_du_projet():
+            if c.status != "running":
+                continue
             ports = c.attrs.get("NetworkSettings", {}).get("Ports") or {}
             for interne, publications in ports.items():
                 for pub in publications or []:
@@ -304,6 +316,10 @@ class ComposeRunner(BaseRunner):
             self.record_step(f"Sonde {sonde['url']}", output=f"{resume}\n{sonde.get('extrait', '')}"[:500])
 
         succes, morts = self._classer_services(etats)
+        if not etats:
+            # Ne jamais réussir sur du vide : si on ne voit aucun conteneur,
+            # c'est notre lecture qui est cassée, pas la copie qui est bonne.
+            succes, morts = False, {"(aucun conteneur visible)": ("absent", -1)}
         logs = self._capture_logs()
         return {
             "success": succes,
