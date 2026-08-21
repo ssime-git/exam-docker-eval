@@ -167,9 +167,14 @@ class BentoMLRunner(BaseRunner):
             # processus, alors que le bind se fait sur l'hote Docker. En mode
             # dockerise les deux different, et le repli ne se declenchait jamais.
             port_mode = "ephemere"
+            # Le port du service se lit dans l'image, pas dans une convention.
+            # 459145 livrait un uvicorn sur 8000 : la sonde interrogeait le
+            # 3000 de BentoML et l'API etait declaree muette alors qu'elle
+            # tournait tres bien.
+            service_port = self._service_port_from_image()
             self.container = (
                 DockerContainer(self.image_name)
-                .with_exposed_ports(BENTOML_PORT)
+                .with_exposed_ports(service_port)
                 .with_name(self.container_name)
             )
             platform = self._platform_for_image()
@@ -194,7 +199,7 @@ class BentoMLRunner(BaseRunner):
             container_started = True
             self.logger.info("Container started successfully")
 
-            host_port = self.container.get_exposed_port(BENTOML_PORT)
+            host_port = self.container.get_exposed_port(service_port)
             published_host = self._resolve_published_host()
             base_url = f"http://{published_host}:{host_port}"
             self.logger.info(f"BentoML API available at {base_url}")
@@ -458,16 +463,17 @@ class BentoMLRunner(BaseRunner):
             if platform:
                 self.logger.info(f"Image d'une autre architecture : execution en {platform}")
                 run_cmd += ["--platform", platform]
+            service_port = self._service_port_from_image()
             run_cmd += [
                 "-p",
-                f"{BENTOML_PORT}",
+                f"{service_port}",
                 self.image_name,
             ]
             run_result = subprocess.run(
                 run_cmd, capture_output=True, text=True, timeout=60
             )
             if run_result.returncode == 0:
-                host_port = self._published_host_port_cli(BENTOML_PORT)
+                host_port = self._published_host_port_cli(service_port)
                 self.logger.info(f"Port hote publie : {host_port}")
             if run_result.returncode != 0:
                 output = (run_result.stdout or "") + "\n" + (run_result.stderr or "")
@@ -1588,6 +1594,34 @@ class BentoMLRunner(BaseRunner):
             )
             return None
         return f"linux/{image_arch}"
+
+    def _service_port_from_image(self) -> int:
+        """Le port qu'ecoute reellement le service de l'image.
+
+        Ordre de lecture : `--port N` dans le Cmd (uvicorn, bentoml serve),
+        puis ExposedPorts de la config, puis le 3000 conventionnel de BentoML.
+        """
+        try:
+            import docker
+            config = docker.from_env().images.get(self.image_name).attrs.get("Config") or {}
+        except Exception:
+            return BENTOML_PORT
+        cmd = config.get("Cmd") or []
+        for i, morceau in enumerate(cmd):
+            if morceau == "--port" and i + 1 < len(cmd) and str(cmd[i + 1]).isdigit():
+                return int(cmd[i + 1])
+            if isinstance(morceau, str) and morceau.startswith("--port="):
+                valeur = morceau.split("=", 1)[1]
+                if valeur.isdigit():
+                    return int(valeur)
+        exposes = sorted(
+            int(port.split("/")[0])
+            for port in (config.get("ExposedPorts") or {})
+            if port.split("/")[0].isdigit()
+        )
+        if exposes:
+            return exposes[0]
+        return BENTOML_PORT
 
     def _published_host_port_cli(self, container_port: int) -> int:
         """Port hote reellement publie, lu aupres de Docker."""
