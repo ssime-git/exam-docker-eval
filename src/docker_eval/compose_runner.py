@@ -129,10 +129,20 @@ class ComposeRunner(BaseRunner):
         run_started = time.time()
         self.record_submission_step()
         try:
-            # Verify docker-compose.yml exists
-            compose_file = os.path.join(self.eval_dir, "docker-compose.yml")
-            if not os.path.exists(compose_file):
-                error_msg = f"docker-compose.yml not found in {self.eval_dir}"
+            # Les quatre noms que docker compose accepte lui-meme, dans son
+            # ordre de priorite : compose.yaml > compose.yml > docker-compose.yaml
+            # > docker-compose.yml (on garde ce dernier en tete, c'est le nom
+            # demande par les enonces).
+            compose_file = next(
+                (
+                    candidate
+                    for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yaml", "compose.yml")
+                    if os.path.exists(candidate := os.path.join(self.eval_dir, name))
+                ),
+                None,
+            )
+            if compose_file is None:
+                error_msg = f"docker-compose.yml (ou variante compose.yaml) not found in {self.eval_dir}"
                 self.logger.error(error_msg)
                 return {"success": False, "error": error_msg, "exit_code": 2}
 
