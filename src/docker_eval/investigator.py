@@ -35,7 +35,9 @@ Tu réponds UNIQUEMENT par un objet JSON, sans texte autour. Actions disponibles
 {"action":"verdict","cause":"<cause établie ou 'non établie'>","faute":"apprenant|harnais|indetermine","revelable":"<ce que le feedback peut dire : symptôme, où chercher>","non_revelable":"<ce qu'il ne faut pas donner : la solution>"}
 Méthode : formule une hypothèse, teste-la par UNE action, lis l'observation, itère. Termine par "verdict"
 dès que la cause est établie ou qu'aucune action ne peut plus trancher. C'est un examen : le verdict guide
-sans jamais donner la correction. Budget strict : {actions_max} actions.
+sans jamais donner la correction. Cohérence exigée : "faute" ne peut valoir "apprenant" ou "harnais" QUE si
+"cause" est établie par une observation ; une cause non établie impose "faute":"indetermine" et un
+"revelable" qui dit seulement le symptôme observé. Budget strict : {actions_max} actions.
 """
 
 
@@ -53,7 +55,9 @@ class Investigator:
                          or os.environ.get("LIORA_GATEWAY_URL", "")).rstrip("/")
         self.api_key = (os.environ.get("PI_CORRECTOR_INVESTIGATE_API_KEY")
                         or os.environ.get("LIORA_API_KEY", ""))
-        self.model = os.environ.get("PI_CORRECTOR_INVESTIGATE_MODEL", "gpt-4o-mini")
+        # Jamais de modèle en dur : la variable d'env prime, sinon la gateway
+        # elle-même dit ce qu'elle sert (hot-swap côté gateway sans redéploiement).
+        self.model = os.environ.get("PI_CORRECTOR_INVESTIGATE_MODEL", "")
 
     def disponible(self) -> bool:
         return bool(self.base_url and self.api_key)
@@ -105,7 +109,21 @@ class Investigator:
 
     # --- boucle ------------------------------------------------------------
 
+    def _resoudre_modele(self) -> str:
+        if not self.model:
+            requete = urllib.request.Request(
+                f"{self.base_url}/models",
+                headers={"Authorization": f"Bearer {self.api_key}"})
+            with urllib.request.urlopen(requete, timeout=20) as reponse:
+                modeles = json.load(reponse).get("data", [])
+            chats = [m["id"] for m in modeles if m.get("mode", "chat") == "chat"]
+            if not chats:
+                raise RuntimeError("la gateway n'expose aucun modèle chat")
+            self.model = chats[0]
+        return self.model
+
     def _appeler_llm(self, messages: list) -> str:
+        self._resoudre_modele()
         charge = json.dumps({"model": self.model, "messages": messages,
                              "temperature": 0}).encode()
         requete = urllib.request.Request(
@@ -124,7 +142,8 @@ class Investigator:
         messages = [
             {"role": "system", "content": PROMPT_SYSTEME.replace("{actions_max}", str(ACTIONS_MAX))},
             {"role": "user", "content": f"Étapes en échec (non attendues) :\n{resume_echecs}\n"
-                                        f"Conteneurs debout : {self._conteneurs()}\nCommence."},
+                                        f"Conteneurs debout : {self._conteneurs()}\n"
+                                        f"Fichiers de la copie :\n{self._inventaire()}\nCommence."},
         ]
         for numero in range(1, ACTIONS_MAX + 1):
             if time.time() - debut > TIMEOUT_TOTAL_SECONDES:
@@ -173,6 +192,17 @@ class Investigator:
         self.runner.record_step("Investigation — verdict",
                                 output="budget d'actions épuisé sans verdict : cause non établie",
                                 exit_code=1, duration=time.time() - debut)
+
+    def _inventaire(self) -> str:
+        """Les chemins réels de la copie : l'action « fichier » ne devine pas."""
+        chemins = []
+        for racine, dossiers, fichiers in os.walk(self.eval_dir):
+            dossiers[:] = [d for d in dossiers if d not in (".git", ".venv", "__pycache__", "node_modules")]
+            for nom in fichiers:
+                chemins.append(os.path.relpath(os.path.join(racine, nom), self.eval_dir))
+                if len(chemins) >= 60:
+                    return "\n".join(chemins) + "\n(tronqué)"
+        return "\n".join(chemins)
 
     def _conteneurs(self) -> str:
         return ", ".join(self.services) or "(aucun)"
