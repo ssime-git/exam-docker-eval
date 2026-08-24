@@ -617,6 +617,38 @@ class ComposeRunner(BaseRunner):
                     duration=sonde["duration_seconds"],
                 )
                 resultats.append(sonde)
+                # Un 401 prouve le défi d'authentification ; il ne dit rien de
+                # l'API derrière. On rejoue avec les identifiants de l'énoncé
+                # (par env, jamais en dur dans ce dépôt public) : seul un 2xx
+                # authentifié prouve une API fonctionnelle.
+                identifiants = os.environ.get("EXAM_DOCKER_EVAL_BASIC_AUTH", "")
+                if code == 401 and identifiants:
+                    import base64
+                    jeton = base64.b64encode(identifiants.encode()).decode()
+                    started = time.time()
+                    sonde_auth = {"service": base["service"], "port": base["port"],
+                                  "url": url, "auth": True}
+                    try:
+                        requete = urllib.request.Request(
+                            url, headers={"Authorization": f"Basic {jeton}"})
+                        reponse = urllib.request.urlopen(requete, timeout=10, context=contexte)
+                        sonde_auth.update(code=reponse.status,
+                                          extrait=reponse.read(200).decode("utf-8", "replace"))
+                    except urllib.error.HTTPError as erreur:
+                        sonde_auth.update(code=erreur.code,
+                                          extrait=erreur.read(300).decode("utf-8", "replace"))
+                    except Exception as erreur:
+                        sonde_auth.update(code="non reçu", erreur=str(erreur), extrait=str(erreur))
+                    sonde_auth["duration_seconds"] = time.time() - started
+                    code_auth = sonde_auth.get("code")
+                    self.record_step(
+                        f"Sonde authentifiée {url} (identifiants de l'énoncé)",
+                        command=f"GET {url} avec Authorization: Basic (identifiants de l'énoncé)",
+                        output=f"code {code_auth}\n{sonde_auth.get('extrait', '')}"[:500],
+                        exit_code=0 if isinstance(code_auth, int) else 1,
+                        duration=sonde_auth["duration_seconds"],
+                    )
+                    resultats.append(sonde_auth)
         return resultats
 
     def _record_service_states(self) -> dict:
