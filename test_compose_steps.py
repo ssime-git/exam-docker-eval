@@ -321,3 +321,46 @@ def test_annotation_du_bruit_de_sondes():
     assert "note" not in sondes[0]
     assert "note" not in sondes[3]
     assert "note" not in sondes[4] and "note" not in sondes[5]
+
+
+def test_investigator_garde_fous(tmp_path):
+    from docker_eval.investigator import Investigator
+
+    class RunnerFactice:
+        def __init__(self): self.steps = []
+        def record_step(self, title, command="", output="", exit_code=0, duration=0):
+            self.steps.append({"title": title, "output": output, "exit_code": exit_code})
+
+    (tmp_path / "note.txt").write_text("contenu de la copie")
+    inv = Investigator(RunnerFactice(), str(tmp_path), services=["copie-nginx-1"])
+
+    assert inv._sonde("http://example.com/") .startswith("refusé")
+    assert inv._logs("autre-stack-postgres", 50).startswith("refusé")
+    assert inv._exec("autre-stack-postgres", "cat /etc/passwd").startswith("refusé")
+    assert inv._exec("copie-nginx-1", "rm -rf /").startswith("refusé")
+    assert inv._fichier("../../etc/passwd").startswith("refusé")
+    assert inv._fichier("note.txt") == "contenu de la copie"
+
+
+def test_investigator_verdict_enregistre(monkeypatch, tmp_path):
+    from docker_eval import investigator as mod
+
+    class RunnerFactice:
+        def __init__(self): self.steps = []
+        def record_step(self, title, command="", output="", exit_code=0, duration=0):
+            self.steps.append({"title": title, "output": output, "exit_code": exit_code})
+
+    runner = RunnerFactice()
+    inv = mod.Investigator(runner, str(tmp_path), services=["s1"])
+    inv.base_url, inv.api_key = "https://gw.example", "clef"
+    reponses = iter([
+        '{"action":"fichier","chemin":"absent.txt"}',
+        '{"action":"verdict","cause":"port 80 jamais lié","faute":"apprenant","revelable":"le port 80 refuse la connexion","non_revelable":"la directive à ajouter"}',
+    ])
+    monkeypatch.setattr(inv, "_appeler_llm", lambda messages: next(reponses))
+    inv.investiguer([{"title": "Sonde http://127.0.0.1:80/", "output": "non reçu"}])
+
+    assert runner.steps[0]["title"].startswith("Investigation 1")
+    assert runner.steps[-1]["title"] == "Investigation — verdict"
+    assert "port 80 jamais lié" in runner.steps[-1]["output"]
+    assert runner.steps[-1]["exit_code"] == 0

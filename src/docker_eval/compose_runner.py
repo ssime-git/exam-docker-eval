@@ -500,6 +500,28 @@ class ComposeRunner(BaseRunner):
             # Ne jamais réussir sur du vide : si on ne voit aucun conteneur,
             # c'est notre lecture qui est cassée, pas la copie qui est bonne.
             succes, morts = False, {"(aucun conteneur visible)": ("absent", -1)}
+
+        # Investigation outillée (#78) : tant que la stack tourne, un vrai
+        # échec (étape non annotée « attendu ») mérite un debug actif. Après
+        # le teardown, plus rien n'est testable.
+        echecs = [s for s in self.steps if s.get("exit_code") not in (0, None)]
+        if echecs:
+            from .investigator import Investigator
+            enqueteur = Investigator(self, self.eval_dir, list(etats.keys()))
+            if enqueteur.disponible():
+                self.logger.info(f"Investigation outillée : {len(echecs)} étape(s) en échec")
+                try:
+                    enqueteur.investiguer(echecs)
+                except Exception as erreur:
+                    self.record_step("Investigation interrompue",
+                                     output=f"erreur interne : {erreur}", exit_code=1)
+            else:
+                self.record_step(
+                    "Investigation non configurée",
+                    output="étapes en échec mais pas de gateway LLM "
+                           "(LIORA_GATEWAY_URL/LIORA_API_KEY ou PI_CORRECTOR_INVESTIGATE_*)",
+                    exit_code=0,
+                )
         logs = self._capture_logs()
         return {
             "success": succes,
