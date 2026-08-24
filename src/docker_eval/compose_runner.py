@@ -40,6 +40,11 @@ class ComposeRunner(BaseRunner):
         super().__init__(student_name, eval_dir, timeout, logger)
         self.compose = None
         self.project_name = f"eval_{student_name}".replace(" ", "_").lower()
+        # Testcontainers choisit le nom de projet Compose à partir du dossier,
+        # pas à partir de ``project_name``. On mémorise les labels réellement
+        # observés tant que les conteneurs existent afin de pouvoir nettoyer
+        # fidèlement après la sortie du context manager.
+        self._compose_project_names = set()
 
     def _relax_host_ports(self, compose_file: str) -> str:
         """Ecrit une copie du compose sans port hote fige, et rend son nom.
@@ -56,6 +61,8 @@ class ComposeRunner(BaseRunner):
             import yaml
         except ImportError:
             self.logger.warning("pyyaml absent : ports hote laisses tels quels")
+            self._port_relaxation_outcome = "Échec explicite : pyyaml est indisponible."
+            self._port_relaxation_exit_code = 2
             return os.path.basename(compose_file)
 
         try:
@@ -63,9 +70,13 @@ class ComposeRunner(BaseRunner):
                 doc = yaml.safe_load(handle)
         except Exception as exc:
             self.logger.warning(f"docker-compose.yml illisible ({exc}) : ports laisses tels quels")
+            self._port_relaxation_outcome = f"Échec explicite : compose illisible ({exc})."
+            self._port_relaxation_exit_code = 2
             return os.path.basename(compose_file)
 
         if not isinstance(doc, dict) or not isinstance(doc.get("services"), dict):
+            self._port_relaxation_outcome = "Absence explicite : aucun service Compose exploitable."
+            self._port_relaxation_exit_code = 0
             return os.path.basename(compose_file)
 
         changed = False
@@ -80,6 +91,8 @@ class ComposeRunner(BaseRunner):
             service["ports"] = relaxed
 
         if not changed:
+            self._port_relaxation_outcome = "Absence explicite : aucun port hôte fixe à relâcher."
+            self._port_relaxation_exit_code = 0
             return os.path.basename(compose_file)
 
         relaxed_name = "docker-compose.eval.yml"
@@ -89,9 +102,13 @@ class ComposeRunner(BaseRunner):
                 yaml.safe_dump(doc, handle, sort_keys=False)
         except Exception as exc:
             self.logger.warning(f"Copie du compose impossible ({exc}) : ports laisses tels quels")
+            self._port_relaxation_outcome = f"Échec explicite : copie impossible ({exc})."
+            self._port_relaxation_exit_code = 2
             return os.path.basename(compose_file)
 
         self.logger.info("Ports hote relaches : Docker en attribuera de libres")
+        self._port_relaxation_outcome = f"Ports hôte relâchés dans {relaxed_name}."
+        self._port_relaxation_exit_code = 0
         return relaxed_name
 
     @staticmethod
@@ -133,6 +150,7 @@ class ComposeRunner(BaseRunner):
             # ordre de priorite : compose.yaml > compose.yml > docker-compose.yaml
             # > docker-compose.yml (on garde ce dernier en tete, c'est le nom
             # demande par les enonces).
+            compose_resolution_started = time.time()
             compose_file = next(
                 (
                     candidate
@@ -144,7 +162,21 @@ class ComposeRunner(BaseRunner):
             if compose_file is None:
                 error_msg = f"docker-compose.yml (ou variante compose.yaml) not found in {self.eval_dir}"
                 self.logger.error(error_msg)
-                return {"success": False, "error": error_msg, "exit_code": 2}
+                self.record_step(
+                    "Fichier Compose résolu",
+                    command="recherche d'un fichier Compose",
+                    output=error_msg,
+                    exit_code=2,
+                    duration=time.time() - compose_resolution_started,
+                )
+                return self.echec(error_msg)
+            self.record_step(
+                "Fichier Compose résolu",
+                command="recherche d'un fichier Compose",
+                output=compose_file,
+                exit_code=0,
+                duration=time.time() - compose_resolution_started,
+            )
 
             # Liberer les ports hote declares par l'apprenant. Deux copies du
             # meme examen, ou n'importe quel conteneur deja lance sur la
@@ -152,7 +184,15 @@ class ComposeRunner(BaseRunner):
             # une copie du fichier, et seulement au port cote hote : le service
             # ecoute toujours sur le meme port dans son conteneur, donc ce qui
             # est evalue ne change pas.
+            port_relaxation_started = time.time()
             compose_name = self._relax_host_ports(compose_file)
+            self.record_step(
+                "Ports hôte relâchés",
+                command=f"réécriture YAML des ports de {os.path.basename(compose_file)}",
+                output=getattr(self, "_port_relaxation_outcome", "État inconnu."),
+                exit_code=getattr(self, "_port_relaxation_exit_code", 2),
+                duration=time.time() - port_relaxation_started,
+            )
 
             # Create testcontainers Compose instance
             self.logger.info(f"Creating Docker Compose instance with project name: {self.project_name}")
@@ -166,68 +206,116 @@ class ComposeRunner(BaseRunner):
 
             # Start services with context manager (auto-cleanup on exit)
             self.logger.info("Starting Docker Compose services...")
-            with self.compose:
-                self.logger.info("Services started successfully")
-                # Retenir les images construites pour cette copie : le ménage
-                # les supprimera. Celles de l'apprenant portent le préfixe du
-                # projet compose ; les images publiques (nginx, prometheus)
-                # restent, elles resserviront.
-                try:
-                    prefixe = os.path.basename(self.eval_dir).lstrip(".-_").lower()
-                    for image in self._images_du_projet():
-                        # Seules les images construites pour cette copie : le
-                        # préfixe du projet compose. `nginx:latest` et autres
-                        # images publiques restent, elles resserviront.
-                        if image.lower().startswith(prefixe):
-                            self.record_exam_image(image)
-                except Exception as erreur:
-                    self.logger.debug(f"images non recensées : {erreur}")
+            compose_started = time.time()
+            try:
+                with self.compose:
+                    self.record_step(
+                        "Build et démarrage Compose",
+                        command=f"docker compose -f {compose_name} up --build",
+                        output="Entrée dans le contexte testcontainers réussie (stdout non disponible).",
+                        exit_code=0,
+                        duration=time.time() - compose_started,
+                    )
+                    self.logger.info("Services started successfully")
+                    # Retenir les images construites pour cette copie : le ménage
+                    # les supprimera. Celles de l'apprenant portent le préfixe du
+                    # projet compose ; les images publiques (nginx, prometheus)
+                    # restent, elles resserviront.
+                    try:
+                        prefixe = os.path.basename(self.eval_dir).lstrip(".-_").lower()
+                        for image in self._images_du_projet():
+                            # Seules les images construites pour cette copie : le
+                            # préfixe du projet compose. `nginx:latest` et autres
+                            # images publiques restent, elles resserviront.
+                            if image.lower().startswith(prefixe):
+                                self.record_exam_image(image)
+                    except Exception as erreur:
+                        self.logger.debug(f"images non recensées : {erreur}")
 
-                # Wait for services to be ready
-                self._wait_for_services()
+                    # Wait for services to be ready
+                    self._wait_for_services()
 
-                # Deux formes d'examen. Un service `pipeline` declare = un
-                # traitement qui se termine (linux-bash) : on attend sa fin.
-                # Sans lui (nginx, prometheus-grafana), rien ne finit jamais —
-                # attendre un conteneur pipeline-1 inexistant faisait tourner
-                # 600s de boucle NotFound avant un timeout impute a la copie.
-                services = self._services_du_compose(os.path.join(self.eval_dir, compose_name))
-                if "pipeline" not in services:
-                    self.logger.info(f"Pas de service pipeline ({services}) : stack servante")
-                    result = self._evaluer_services_persistants()
+                    # Deux formes d'examen. Un service `pipeline` declare = un
+                    # traitement qui se termine (linux-bash) : on attend sa fin.
+                    # Sans lui (nginx, prometheus-grafana), rien ne finit jamais —
+                    # attendre un conteneur pipeline-1 inexistant faisait tourner
+                    # 600s de boucle NotFound avant un timeout impute a la copie.
+                    services = self._services_du_compose(os.path.join(self.eval_dir, compose_name))
+                    if "pipeline" not in services:
+                        self.logger.info(f"Pas de service pipeline ({services}) : stack servante")
+                        result = self._evaluer_services_persistants()
+                        self._log_execution_end(result)
+                        return result
+
+                    # Wait for pipeline container to complete
+                    self.logger.info(f"Waiting for pipeline completion (timeout: {self.timeout}s)...")
+                    try:
+                        exit_code = self._wait_for_pipeline_completion()
+                    except TimeoutError:
+                        # Le context manager supprime les conteneurs en sortant.
+                        # L'état doit donc être capturé avant de relancer le
+                        # timeout vers le gestionnaire d'erreur extérieur.
+                        try:
+                            self._record_service_states()
+                        except Exception as state_error:
+                            self.record_step(
+                                "État des services",
+                                command="docker inspect des conteneurs Compose",
+                                output=f"État non reçu : {state_error}",
+                                exit_code=2,
+                                duration=0,
+                            )
+                        raise
+                    self._record_service_states()
+
+                    # Capture logs before cleanup
+                    self.logger.info("Capturing container logs...")
+                    logs = self._capture_logs()
+
+                    # Evaluate result
+                    success = exit_code == 0
+                    result = {
+                        "success": success,
+                        "exit_code": exit_code,
+                        "logs": logs,
+                        "steps": self.steps,
+                    }
+
                     self._log_execution_end(result)
                     return result
-
-                # Wait for pipeline container to complete
-                self.logger.info(f"Waiting for pipeline completion (timeout: {self.timeout}s)...")
-                exit_code = self._wait_for_pipeline_completion()
-
-                # Capture logs before cleanup
-                self.logger.info("Capturing container logs...")
-                logs = self._capture_logs()
-
-                # Evaluate result
-                success = exit_code == 0
-                result = {
-                    "success": success,
-                    "exit_code": exit_code,
-                    "logs": logs
-                }
-
-                self._log_execution_end(result)
-                return result
+            except Exception as exc:
+                if not any(step["title"] == "Build et démarrage Compose" for step in self.steps):
+                    self.record_step(
+                        "Build et démarrage Compose",
+                        command=f"docker compose -f {compose_name} up --build",
+                        output=str(exc),
+                        exit_code=2,
+                        duration=time.time() - compose_started,
+                    )
+                raise
 
         except TimeoutError as e:
             error_msg = f"Timeout apres {time.time() - run_started:.1f}s (limite {self.timeout}s)"
             self.logger.error(error_msg)
-            result = {"success": False, "error": error_msg, "exit_code": 3}
+            if not any(step["title"] == "État des services" for step in self.steps):
+                try:
+                    self._record_service_states()
+                except Exception as state_error:
+                    self.record_step(
+                        "État des services",
+                        command="docker inspect des conteneurs Compose",
+                        output=f"État non reçu : {state_error}",
+                        exit_code=2,
+                        duration=0,
+                    )
+            result = {"success": False, "error": error_msg, "exit_code": 3, "steps": self.steps}
             self._log_execution_end(result)
             return result
 
         except Exception as e:
             error_msg = f"Execution error: {str(e)}"
             self.logger.error(error_msg, exc_info=True)
-            result = {"success": False, "error": error_msg, "exit_code": 2}
+            result = {"success": False, "error": error_msg, "exit_code": 2, "steps": self.steps}
             self._log_execution_end(result)
             return result
 
@@ -269,7 +357,11 @@ class ComposeRunner(BaseRunner):
         for info in self.compose.get_containers(include_all=True):
             identifiant = getattr(info, "ID", None) or getattr(info, "id", None)
             if identifiant:
-                conteneurs.append(client.containers.get(identifiant))
+                container = client.containers.get(identifiant)
+                project = container.labels.get("com.docker.compose.project")
+                if project:
+                    self._compose_project_names.add(project)
+                conteneurs.append(container)
         return conteneurs
 
     def _images_du_projet(self) -> list:
@@ -287,6 +379,13 @@ class ComposeRunner(BaseRunner):
             c.reload()
             etats[c.name] = (c.status, c.attrs.get("State", {}).get("ExitCode", 0))
         return etats
+
+    def _pipeline_container(self):
+        """Le conteneur pipeline réellement créé par Compose, s'il existe."""
+        for container in self._conteneurs_du_projet():
+            if container.labels.get("com.docker.compose.service") == "pipeline":
+                return container
+        return None
 
     def _sonder_ports_publies(self) -> list:
         """GET sur chaque port publié du projet, en HTTP puis HTTPS.
@@ -312,6 +411,7 @@ class ComposeRunner(BaseRunner):
                     # qui est déjà une réponse, pas une raison de s'arrêter.
                     for schema in ("http", "https"):
                         url = f"{schema}://127.0.0.1:{hote}/"
+                        started = time.time()
                         try:
                             reponse = urllib.request.urlopen(
                                 url, timeout=10,
@@ -319,16 +419,20 @@ class ComposeRunner(BaseRunner):
                             )
                             sondes.append({"service": c.name, "port": interne, "url": url,
                                            "code": reponse.status,
-                                           "extrait": reponse.read(200).decode("utf-8", "replace")})
+                                           "extrait": reponse.read(200).decode("utf-8", "replace"),
+                                           "duration_seconds": time.time() - started})
                         except urllib.error.HTTPError as erreur:
                             corps = erreur.read(300).decode("utf-8", "replace")
                             sondes.append({"service": c.name, "port": interne, "url": url,
                                            "code": erreur.code,
                                            "entetes": dict(erreur.headers) if "WWW-Authenticate" in erreur.headers else None,
-                                           "extrait": corps})
+                                           "extrait": corps,
+                                           "duration_seconds": time.time() - started})
                         except Exception as erreur:
                             sondes.append({"service": c.name, "port": interne, "url": url,
-                                           "erreur": str(erreur)[:150]})
+                                           "code": "non reçu", "erreur": str(erreur),
+                                           "extrait": str(erreur)})
+                            sondes[-1]["duration_seconds"] = time.time() - started
         return sondes
 
     def _evaluer_services_persistants(self) -> Dict[str, Any]:
@@ -337,15 +441,19 @@ class ComposeRunner(BaseRunner):
         nginx, prometheus-grafana : rien ne « finit », le succès c'est une
         stack debout qui répond sur ses ports.
         """
-        etats = self._etats_du_projet()
-        self.record_step(
-            "État des services",
-            output="\n".join(f"{n} : {s} (code {c})" for n, (s, c) in sorted(etats.items())),
-        )
+        etats = self._record_service_states()
+
         sondes = self._sonder_ports_publies()
         for sonde in sondes:
-            resume = (f"code {sonde['code']}" if "code" in sonde else f"erreur {sonde.get('erreur')}")
-            self.record_step(f"Sonde {sonde['url']}", output=f"{resume}\n{sonde.get('extrait', '')}"[:500])
+            code = sonde.get("code", "non reçu")
+            resume = f"code {code}"
+            self.record_step(
+                f"Sonde {sonde['url']}",
+                command=f"GET {sonde['url']}",
+                output=f"{resume}\n{sonde.get('extrait', '')}"[:500],
+                exit_code=0 if isinstance(code, int) and 200 <= code < 400 else 1,
+                duration=sonde.get("duration_seconds", 0),
+            )
 
         succes, morts = self._classer_services(etats)
         if not etats:
@@ -362,6 +470,19 @@ class ComposeRunner(BaseRunner):
             "logs": logs,
             "steps": self.steps,
         }
+
+    def _record_service_states(self) -> dict:
+        """Lire et consigner l'état de chaque conteneur du projet."""
+        states_started = time.time()
+        etats = self._etats_du_projet()
+        self.record_step(
+            "État des services",
+            command="docker inspect des conteneurs Compose",
+            output="\n".join(f"{n} : {s} (code {c})" for n, (s, c) in sorted(etats.items())),
+            exit_code=0,
+            duration=time.time() - states_started,
+        )
+        return etats
 
     def _wait_for_services(self):
         """
@@ -385,11 +506,6 @@ class ComposeRunner(BaseRunner):
         Raises:
             TimeoutError: If execution exceeds timeout
         """
-        import docker
-
-        client = docker.from_env()
-        pipeline_container_name = f"{self.project_name}-pipeline-1"
-
         start_time = time.time()
         check_interval = 2  # Check every 2 seconds
 
@@ -402,8 +518,11 @@ class ComposeRunner(BaseRunner):
                 raise TimeoutError(f"Execution exceeded {self.timeout} seconds")
 
             try:
-                # Find pipeline container
-                container = client.containers.get(pipeline_container_name)
+                container = self._pipeline_container()
+                if container is None:
+                    self.logger.debug(f"Pipeline container not found yet (elapsed: {elapsed:.1f}s)")
+                    time.sleep(check_interval)
+                    continue
 
                 # Check container status
                 container.reload()
@@ -423,11 +542,6 @@ class ComposeRunner(BaseRunner):
                     self.logger.error(f"Pipeline container in unexpected state: {status}")
                     return 2  # Critical error
 
-            except docker.errors.NotFound:
-                # Container doesn't exist yet or was removed
-                self.logger.debug(f"Pipeline container not found yet (elapsed: {elapsed:.1f}s)")
-                time.sleep(check_interval)
-
             except Exception as e:
                 self.logger.error(f"Error checking pipeline status: {e}")
                 time.sleep(check_interval)
@@ -439,19 +553,10 @@ class ComposeRunner(BaseRunner):
         Returns:
             Combined logs from all containers
         """
-        import docker
-
-        client = docker.from_env()
         all_logs = []
 
         try:
-            # Get all containers for this project
-            containers = client.containers.list(
-                all=True,
-                filters={"label": f"com.docker.compose.project={self.project_name}"}
-            )
-
-            for container in containers:
+            for container in self._conteneurs_du_projet():
                 service_name = container.labels.get("com.docker.compose.service", container.name)
                 all_logs.append(f"\n{'=' * 80}")
                 all_logs.append(f"Logs from {service_name}")
@@ -476,6 +581,8 @@ class ComposeRunner(BaseRunner):
         Args:
             force: If True, ignore errors and force cleanup
         """
+        started = time.time()
+        errors = []
         if self.compose:
             try:
                 self.logger.info("Cleaning up Docker Compose resources...")
@@ -483,47 +590,66 @@ class ComposeRunner(BaseRunner):
                 self.compose.stop()
                 self.logger.info("✓ Docker Compose cleanup completed")
             except Exception as e:
+                errors.append(str(e))
                 if force:
                     self.logger.warning(f"Cleanup error (forced): {e}")
                 else:
                     self.logger.error(f"Cleanup error: {e}")
-                    raise
 
         # Additional manual cleanup using docker client
-        self._force_cleanup_docker_resources()
-        self.remove_exam_images()
+        for operation in (self._force_cleanup_docker_resources, self.remove_exam_images):
+            try:
+                operation_errors = operation()
+                if operation_errors:
+                    errors.extend(str(error) for error in operation_errors)
+            except Exception as e:
+                errors.append(str(e))
+                self.logger.warning(f"Cleanup error: {e}")
+        self.record_step(
+            "Nettoyage Compose",
+            command="docker compose down et suppression des ressources d'examen",
+            output="ok" if not errors else " ; ".join(errors),
+            exit_code=0 if not errors else 1,
+            duration=time.time() - started,
+        )
 
     def _force_cleanup_docker_resources(self):
-        """Force cleanup of any remaining Docker resources for this project."""
+        """Supprimer les ressources portant les labels Compose réellement vus.
+
+        Toutes les erreurs sont regroupées et remontées à ``cleanup`` : la step
+        de ménage doit refléter un échec réel au lieu d'annoncer ``ok``.
+        """
         import docker
 
-        try:
-            client = docker.from_env()
+        if not self._compose_project_names:
+            return
 
-            # Remove containers
-            containers = client.containers.list(
-                all=True,
-                filters={"label": f"com.docker.compose.project={self.project_name}"}
-            )
-
+        client = docker.from_env()
+        errors = []
+        for project in sorted(self._compose_project_names):
+            label = f"com.docker.compose.project={project}"
+            try:
+                containers = client.containers.list(all=True, filters={"label": label})
+            except Exception as exc:
+                errors.append(f"liste conteneurs {project}: {exc}")
+                containers = []
             for container in containers:
                 try:
                     self.logger.info(f"Force removing container: {container.name}")
                     container.remove(force=True, v=True)
-                except Exception as e:
-                    self.logger.warning(f"Error removing container {container.name}: {e}")
-
-            # Remove networks
-            networks = client.networks.list(
-                filters={"label": f"com.docker.compose.project={self.project_name}"}
-            )
-
+                except Exception as exc:
+                    errors.append(f"conteneur {container.name}: {exc}")
+            try:
+                networks = client.networks.list(filters={"label": label})
+            except Exception as exc:
+                errors.append(f"liste réseaux {project}: {exc}")
+                networks = []
             for network in networks:
                 try:
                     self.logger.info(f"Force removing network: {network.name}")
                     network.remove()
-                except Exception as e:
-                    self.logger.warning(f"Error removing network {network.name}: {e}")
+                except Exception as exc:
+                    errors.append(f"réseau {network.name}: {exc}")
 
-        except Exception as e:
-            self.logger.warning(f"Error in force cleanup: {e}")
+        if errors:
+            raise RuntimeError(" ; ".join(errors))
