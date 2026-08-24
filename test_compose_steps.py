@@ -364,3 +364,27 @@ def test_investigator_verdict_enregistre(monkeypatch, tmp_path):
     assert runner.steps[-1]["title"] == "Investigation — verdict"
     assert "port 80 jamais lié" in runner.steps[-1]["output"]
     assert runner.steps[-1]["exit_code"] == 0
+
+
+def test_chemins_nginx_declares(tmp_path):
+    from docker_eval.compose_runner import chemins_nginx_declares
+
+    conf = tmp_path / "deployments" / "nginx"
+    conf.mkdir(parents=True)
+    (conf / "nginx.conf").write_text("""
+    server {
+        listen 443 ssl;
+        location / { return 200; }
+        location /api/v1/ { proxy_pass http://api_v1/; }
+        location = /api/v2/predict { proxy_pass http://api_v2; }
+        location /metrics { auth_basic "restricted"; }
+        location ~ \\.php$ { deny all; }
+    }
+    """)
+    chemins = chemins_nginx_declares(str(tmp_path))
+    assert chemins == ["/api/v1/", "/api/v2/predict", "/metrics"]
+
+    assert chemins_nginx_declares(str(tmp_path / "deployments")) == chemins
+    vide = tmp_path / "vide"
+    vide.mkdir()
+    assert chemins_nginx_declares(str(vide)) == []

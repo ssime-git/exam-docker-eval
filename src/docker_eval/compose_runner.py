@@ -19,6 +19,39 @@ from .base_runner import BaseRunner
 from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN
 
 
+def chemins_nginx_declares(eval_dir: str, maxi: int = 8) -> list:
+    """Les chemins que la copie déclare dans son nginx.conf.
+
+    Sonder seulement la racine `/` note 0/10 en API une copie qui met ses
+    services derrière le reverse proxy sans publier leurs ports — ce qui est
+    précisément l'architecture attendue (vu sur 458925). On lit les
+    `location` pour sonder ce que la copie promet de servir.
+    """
+    import re
+    conf = None
+    for racine, dossiers, fichiers in os.walk(eval_dir):
+        dossiers[:] = [d for d in dossiers if d not in (".git", ".venv", "__pycache__", "node_modules")]
+        for nom in fichiers:
+            if nom.lower() == "nginx.conf":
+                conf = os.path.join(racine, nom)
+                break
+        if conf:
+            break
+    if not conf:
+        return []
+    try:
+        with open(conf, encoding="utf-8", errors="replace") as lecteur:
+            texte = lecteur.read()
+    except OSError:
+        return []
+    chemins = []
+    for correspondance in re.finditer(r"location\s+(?:=\s*)?(/[^\s{]*)", texte):
+        chemin = correspondance.group(1)
+        if chemin != "/" and chemin not in chemins:
+            chemins.append(chemin)
+    return chemins[:maxi]
+
+
 def annoter_bruit_de_sondes(sondes: list) -> None:
     """Qualifier le bruit mécanique du double sondage http/https.
 
@@ -495,6 +528,11 @@ class ComposeRunner(BaseRunner):
                 duration=sonde.get("duration_seconds", 0),
             )
 
+        # Les chemins que la copie déclare (location du nginx.conf), sondés à
+        # travers le port TLS : une API derrière le reverse proxy sans port
+        # publié est l'architecture attendue, pas une API absente.
+        sondes.extend(self._sonder_chemins_declares(sondes))
+
         succes, morts = self._classer_services(etats)
         if not etats:
             # Ne jamais réussir sur du vide : si on ne voit aucun conteneur,
@@ -532,6 +570,54 @@ class ComposeRunner(BaseRunner):
             "logs": logs,
             "steps": self.steps,
         }
+
+    def _sonder_chemins_declares(self, sondes_racine: list) -> list:
+        """Sonder, à travers le port TLS du reverse proxy, les chemins que la
+        copie déclare. Seulement sur les ports où le TLS termine déjà (code
+        HTTP reçu en https à la racine) : zéro bruit de schéma."""
+        chemins = chemins_nginx_declares(self.eval_dir)
+        if not chemins:
+            return []
+        import ssl
+        import urllib.request
+        import urllib.error
+        contexte = ssl.create_default_context()
+        contexte.check_hostname = False
+        contexte.verify_mode = ssl.CERT_NONE
+        bases = [
+            s for s in sondes_racine
+            if "nginx" in str(s.get("service", "")).lower()
+            and s["url"].startswith("https")
+            and isinstance(s.get("code"), int)
+        ]
+        resultats = []
+        for base in bases:
+            racine_url = base["url"].rstrip("/")
+            for chemin in chemins:
+                url = f"{racine_url}{chemin}"
+                started = time.time()
+                sonde = {"service": base["service"], "port": base["port"], "url": url}
+                try:
+                    reponse = urllib.request.urlopen(url, timeout=10, context=contexte)
+                    sonde.update(code=reponse.status,
+                                 extrait=reponse.read(200).decode("utf-8", "replace"))
+                except urllib.error.HTTPError as erreur:
+                    sonde.update(code=erreur.code,
+                                 entetes=dict(erreur.headers) if "WWW-Authenticate" in erreur.headers else None,
+                                 extrait=erreur.read(300).decode("utf-8", "replace"))
+                except Exception as erreur:
+                    sonde.update(code="non reçu", erreur=str(erreur), extrait=str(erreur))
+                sonde["duration_seconds"] = time.time() - started
+                code = sonde.get("code")
+                self.record_step(
+                    f"Sonde {url}",
+                    command=f"GET {url}",
+                    output=f"code {code}\n{sonde.get('extrait', '')}"[:500],
+                    exit_code=0 if isinstance(code, int) else 1,
+                    duration=sonde["duration_seconds"],
+                )
+                resultats.append(sonde)
+        return resultats
 
     def _record_service_states(self) -> dict:
         """Lire et consigner l'état de chaque conteneur du projet."""
