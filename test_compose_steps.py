@@ -296,3 +296,28 @@ def test_build_step_honestly_describes_testcontainers_without_stdout(tmp_path, l
 
     build = next(step for step in result["steps"] if step["title"] == "Build et démarrage Compose")
     assert "stdout non disponible" in build["output"]
+
+
+def test_annotation_du_bruit_de_sondes():
+    from docker_eval.compose_runner import annoter_bruit_de_sondes
+
+    sondes = [
+        # port en clair : http répond, https échoue mécaniquement
+        {"service": "grafana", "port": "3000/tcp", "url": "http://127.0.0.1:1/", "code": 200, "extrait": "<html>"},
+        {"service": "grafana", "port": "3000/tcp", "url": "https://127.0.0.1:1/",
+         "code": "non reçu", "erreur": "WRONG_VERSION_NUMBER", "extrait": "WRONG_VERSION_NUMBER"},
+        # port TLS : le refus du HTTP en clair prouve la terminaison TLS
+        {"service": "nginx", "port": "443/tcp", "url": "http://127.0.0.1:2/", "code": 400,
+         "extrait": "The plain HTTP request was sent to HTTPS port"},
+        {"service": "nginx", "port": "443/tcp", "url": "https://127.0.0.1:2/", "code": 404, "extrait": "Not Found"},
+        # port muet : aucun schéma ne répond, vrai échec, pas de note
+        {"service": "api", "port": "8000/tcp", "url": "http://127.0.0.1:3/", "code": "non reçu", "extrait": "refused"},
+        {"service": "api", "port": "8000/tcp", "url": "https://127.0.0.1:3/", "code": "non reçu", "extrait": "refused"},
+    ]
+    annoter_bruit_de_sondes(sondes)
+
+    assert sondes[1]["note"].startswith("échec attendu")
+    assert sondes[2]["note"].startswith("preuve TLS")
+    assert "note" not in sondes[0]
+    assert "note" not in sondes[3]
+    assert "note" not in sondes[4] and "note" not in sondes[5]

@@ -19,6 +19,39 @@ from .base_runner import BaseRunner
 from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN
 
 
+def annoter_bruit_de_sondes(sondes: list) -> None:
+    """Qualifier le bruit mécanique du double sondage http/https.
+
+    Chaque port publié est sondé dans les deux schémas : sur un port en clair
+    l'échec HTTPS est structurel (WRONG_VERSION_NUMBER), sur un port TLS le
+    400 « plain HTTP request sent to HTTPS port » prouve au contraire que le
+    TLS termine. Sans cette annotation, la revue prend ce bruit pour une
+    faute de la copie — vu sur la tentative 459038.
+    """
+    def _ok(sonde) -> bool:
+        code = sonde.get("code")
+        return isinstance(code, int) and 200 <= code < 400
+
+    par_cible: dict = {}
+    for sonde in sondes:
+        schema = sonde["url"].split(":", 1)[0]
+        par_cible.setdefault((sonde.get("service"), sonde.get("port")), {})[schema] = sonde
+
+    for sonde in sondes:
+        schema = sonde["url"].split(":", 1)[0]
+        autre = par_cible.get((sonde.get("service"), sonde.get("port")), {}).get(
+            "https" if schema == "http" else "http"
+        )
+        extrait = str(sonde.get("extrait", ""))
+        if schema == "http" and "sent to HTTPS port" in extrait:
+            sonde["note"] = "preuve TLS : ce port refuse le HTTP en clair, le TLS termine bien ici"
+        elif not _ok(sonde) and autre is not None and _ok(autre):
+            sonde["note"] = (
+                f"échec attendu : ce port répond en {'https' if schema == 'http' else 'http'} — "
+                "sonder l'autre schéma échoue mécaniquement et ne prouve rien contre la copie"
+            )
+
+
 class ComposeRunner(BaseRunner):
     """
     Runner for evaluations using Docker Compose.
@@ -444,14 +477,21 @@ class ComposeRunner(BaseRunner):
         etats = self._record_service_states()
 
         sondes = self._sonder_ports_publies()
+        annoter_bruit_de_sondes(sondes)
         for sonde in sondes:
             code = sonde.get("code", "non reçu")
             resume = f"code {code}"
+            note = sonde.get("note")
+            bruit = bool(note and note.startswith("échec attendu"))
             self.record_step(
                 f"Sonde {sonde['url']}",
                 command=f"GET {sonde['url']}",
-                output=f"{resume}\n{sonde.get('extrait', '')}"[:500],
-                exit_code=0 if isinstance(code, int) and 200 <= code < 400 else 1,
+                output=(f"{resume}\n{note + chr(10) if note else ''}{sonde.get('extrait', '')}")[:500],
+                # Une sonde qui reçoit un code HTTP a atteint le service : la
+                # qualité de la réponse est l'affaire du barème, pas de l'étape.
+                # Un échec attendu (mauvais schéma sur ce port) ne compte pas
+                # non plus : il ne prouve rien contre la copie.
+                exit_code=0 if bruit or isinstance(code, int) else 1,
                 duration=sonde.get("duration_seconds", 0),
             )
 
