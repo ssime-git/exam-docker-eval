@@ -116,7 +116,9 @@ def requetes_declarees(eval_dir: str, maxi: int = 6) -> list:
                 entetes = dict(re.findall(r"-H\s+['\"]([^:'\"]+):\s*([^'\"]+)['\"]", ligne))
                 requete = {
                     "methode": (methode.group(1) if methode else "GET").upper(),
-                    "chemin": url.group(1),
+                    # Les curl vivent souvent dans un $(...) : ne pas avaler
+                    # la parenthèse ou la quote de fermeture.
+                    "chemin": url.group(1).rstrip(")\"'"),
                     "corps": corps.group(1) if corps else None,
                     "entetes": entetes,
                     "identifiants": user.group(1) if user else None,
