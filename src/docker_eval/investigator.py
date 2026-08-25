@@ -28,12 +28,16 @@ _EXEC_INTERDITS = (">", ">>", "rm ", "mv ", "cp ", "chmod", "chown", "kill",
 
 PROMPT_SYSTEME = """Tu investigues l'échec d'une évaluation d'examen pendant que la stack Docker tourne encore.
 Tu réponds UNIQUEMENT par un objet JSON, sans texte autour. Actions disponibles :
-{"action":"sonde","url":"http(s)://127.0.0.1:<port>/<chemin>"} — refaire une requête, chemins et schémas libres
+{"action":"sonde","url":"http(s)://127.0.0.1:<port>/<chemin>","identifiants":"user:pass"} — refaire une requête, chemins et schémas libres ; "identifiants" (optionnel) ajoute une authentification Basic
 {"action":"logs","service":"<nom de conteneur>","lignes":50} — lire la fin des logs
 {"action":"exec","service":"<nom de conteneur>","commande":"<commande de LECTURE>"} — ex. cat d'une config effective
 {"action":"fichier","chemin":"<chemin relatif dans la copie>"} — lire un fichier rendu par l'apprenant
 {"action":"verdict","cause":"<cause établie ou 'non établie'>","faute":"apprenant|harnais|indetermine","revelable":"<ce que le feedback peut dire : symptôme, où chercher>","non_revelable":"<ce qu'il ne faut pas donner : la solution>"}
-Méthode : formule une hypothèse, teste-la par UNE action, lis l'observation, itère. Termine par "verdict"
+Méthode : formule une hypothèse, teste-la par UNE action, lis l'observation, itère. Comble les trous
+de la soumission avant de conclure : une route qui répond 401 se traite en CHERCHANT les identifiants
+que l'apprenant a fournis (ses tests, son README, ses scripts — action "fichier") puis en re-sondant
+avec ("sonde" + "identifiants"). Ne conclus jamais « identifiants absents ou refusés » sans avoir lu
+les fichiers où ils pourraient être. Termine par "verdict"
 dès que la cause est établie ou qu'aucune action ne peut plus trancher. C'est un examen : le verdict guide
 sans jamais donner la correction. Cohérence exigée : "faute" ne peut valoir "apprenant" ou "harnais" QUE si
 "cause" est établie par une observation ; une cause non établie impose "faute":"indetermine" et un
@@ -64,16 +68,21 @@ class Investigator:
 
     # --- actions -----------------------------------------------------------
 
-    def _sonde(self, url: str) -> str:
+    def _sonde(self, url: str, identifiants: str = "") -> str:
         if "127.0.0.1" not in url and "localhost" not in url:
             return "refusé : seules les URLs locales (127.0.0.1) sont sondables"
         import ssl
         contexte = ssl.create_default_context()
         contexte.check_hostname = False
         contexte.verify_mode = ssl.CERT_NONE
+        entetes = {}
+        if identifiants:
+            import base64
+            entetes["Authorization"] = "Basic " + base64.b64encode(identifiants.encode()).decode()
         try:
+            requete = urllib.request.Request(url, headers=entetes)
             reponse = urllib.request.urlopen(
-                url, timeout=10, context=contexte if url.startswith("https") else None)
+                requete, timeout=10, context=contexte if url.startswith("https") else None)
             return f"code {reponse.status}\n{reponse.read(400).decode('utf-8', 'replace')}"
         except urllib.error.HTTPError as erreur:
             return f"code {erreur.code}\n{erreur.read(400).decode('utf-8', 'replace')}"
@@ -169,8 +178,8 @@ class Investigator:
                 return
             try:
                 if action == "sonde":
-                    observation = self._sonde(demande["url"])
-                    commande = f"GET {demande['url']}"
+                    observation = self._sonde(demande["url"], demande.get("identifiants", ""))
+                    commande = f"GET {demande['url']}" + (" avec Authorization: Basic" if demande.get("identifiants") else "")
                 elif action == "logs":
                     observation = self._logs(demande["service"], demande.get("lignes", 50))
                     commande = f"docker logs --tail {demande.get('lignes', 50)} {demande['service']}"

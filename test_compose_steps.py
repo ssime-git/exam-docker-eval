@@ -388,3 +388,19 @@ def test_chemins_nginx_declares(tmp_path):
     vide = tmp_path / "vide"
     vide.mkdir()
     assert chemins_nginx_declares(str(vide)) == []
+
+
+def test_identifiants_declares(tmp_path):
+    from docker_eval.compose_runner import identifiants_declares
+
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "run_tests.sh").write_text(
+        "curl -k https://localhost/predict \\\n     --user admin:admin \\\n     -d @request.json\n"
+        "curl -k https://localhost/predict \\\n     --user admin:wrongpassword \\\n"
+    )
+    (tmp_path / "README.md").write_text("Utiliser `-u alice:s3cret` pour la route protégée.")
+    couples = identifiants_declares(str(tmp_path))
+    assert ("admin:admin", "tests/run_tests.sh") in couples
+    assert any(c == "alice:s3cret" for c, _ in couples)
+    assert all("wrong" not in c for c, _ in couples)
