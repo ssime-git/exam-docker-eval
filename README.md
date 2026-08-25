@@ -64,3 +64,19 @@ La variable est consultée avant les dépôts frères, mais **après** un paquet
 ## Comment les skills le trouvent
 
 `pi-corrector` clone les dépôts déclarés dans son `skills.registry.json` côte à côte, puis place ce dépôt sur le `PYTHONPATH` du script d'évaluation. Un skill lancé à la main le cherche dans un dépôt frère.
+
+
+## Où atterrit un correctif ? Les trois familles (scriptorium #49)
+
+1. **Invariant du moteur** — vrai pour tous les examens, pour toujours (ports
+   hôte éphémères, émulation QEMU, attribution de faute, qualification du
+   bruit de sondes…) → code partagé ici, avec un test.
+2. **Convention d'examen** — vraie pour un type d'examen → **frontmatter du
+   SKILL.md**, jamais le moteur. Clés servies en environnement :
+   `pi_default_service_port` → `EXAM_DEFAULT_SERVICE_PORT`,
+   `pi_test_packages` → `EXAM_TEST_PACKAGES`,
+   `pi_test_env` → `EXAM_TEST_ENV`,
+   `pi_stack_mode` (serving|pipeline|auto) → `EXAM_STACK_MODE`.
+   Clé absente = défaut historique du moteur.
+3. **Cas unique d'une copie** — aucun code. C'est le travail de
+   l'investigation outillée et de `revueRequise` : la revue humaine tranche.

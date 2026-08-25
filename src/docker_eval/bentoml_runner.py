@@ -1263,15 +1263,10 @@ class BentoMLRunner(BaseRunner):
             # sur `No module named 'fastapi'` — leur serveur ne demarrait
             # jamais. Fournir les manquants standards note ce que les tests
             # valent ; la declaration manquante se corrige dans le feedback.
-            "--with",
-            "httpx",
-            "--with",
-            "pytest-asyncio",
-            "--with",
-            "fastapi",
-            "--with",
-            "uvicorn",
-        ]
+            # Convention d'examen declarable (pi_test_packages, #49).
+        ] + [arg for paquet in (os.environ.get("EXAM_TEST_PACKAGES")
+                                or "httpx,pytest-asyncio,fastapi,uvicorn").split(",")
+             if paquet.strip() for arg in ("--with", paquet.strip())]
         if os.path.isfile(requirements_path):
             command.extend(["--with-requirements", requirements_path])
         patched_tests_path = self._prepare_tests_for_dynamic_base_url(
@@ -1306,7 +1301,10 @@ class BentoMLRunner(BaseRunner):
         # BENTOML_BASE_URL : son repli localhost:3000 partait en connexion
         # refusée et ses 7 tests « échouaient ». Exporter les conventions
         # courantes ne coûte rien et note ce que les tests valent vraiment.
-        for nom in ("BASE_URL", "API_URL", "SERVICE_URL"):
+        # Convention d'examen declarable (pi_test_env, #49).
+        noms_env = [n.strip() for n in (os.environ.get("EXAM_TEST_ENV")
+                                        or "BASE_URL,API_URL,SERVICE_URL").split(",") if n.strip()]
+        for nom in noms_env:
             env.setdefault(nom, base_url)
         # Les tests importent le code de l'apprenant, qui vit dans le projet.
         env["PYTHONPATH"] = os.pathsep.join(

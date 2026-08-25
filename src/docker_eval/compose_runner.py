@@ -338,8 +338,13 @@ class ComposeRunner(BaseRunner):
                     # attendre un conteneur pipeline-1 inexistant faisait tourner
                     # 600s de boucle NotFound avant un timeout impute a la copie.
                     services = self._services_du_compose(os.path.join(self.eval_dir, compose_name))
-                    if "pipeline" not in services:
-                        self.logger.info(f"Pas de service pipeline ({services}) : stack servante")
+                    # Convention d'examen declarable (pi_stack_mode, #49) :
+                    # serving | pipeline | auto (defaut : deviner par la
+                    # presence d'un service `pipeline`).
+                    mode = os.environ.get("EXAM_STACK_MODE", "auto")
+                    servante = mode == "serving" or (mode != "pipeline" and "pipeline" not in services)
+                    if servante:
+                        self.logger.info(f"Stack servante ({'déclarée' if mode == 'serving' else services})")
                         result = self._evaluer_services_persistants()
                         self._log_execution_end(result)
                         return result

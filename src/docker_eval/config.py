@@ -42,7 +42,9 @@ MAX_FILE_DESCRIPTORS = 1024  # File descriptor limit
 MIN_DISK_SPACE_GB = 2  # Minimum free disk space required
 
 # Port mappings
-BENTOML_PORT = 3000
+# Convention d'examen déclarable par le skill (pi_default_service_port,
+# scriptorium #49) ; le défaut historique reste 3000.
+BENTOML_PORT = int(os.environ.get("EXAM_DEFAULT_SERVICE_PORT", "3000"))
 PROMETHEUS_PORT = 9090
 GRAFANA_PORT = 3000
 NGINX_PORT = 443
