@@ -270,11 +270,23 @@ class BentoCompiledRunner(BaseRunner):
                 )
                 return extract_dir
 
-            self.logger.warning(
-                "Aucun identifiant trouve dans le rendu ; essai avec le defaut de l'enonce"
-            )
-            self.credentials = {"username": "admin", "password": "admin123"}
-            self.credentials_source = "defaut de l'enonce"
+            # Le defaut de l'enonce vient de l'environnement, jamais du code :
+            # ce depot est public (scriptorium #45).
+            repli = os.environ.get("EXAM_DOCKER_EVAL_BASIC_AUTH", "")
+            if ":" in repli:
+                user, _, mdp = repli.partition(":")
+                self.logger.warning(
+                    "Aucun identifiant trouve dans le rendu ; essai avec le defaut de l'enonce"
+                )
+                self.credentials = {"username": user, "password": mdp}
+                self.credentials_source = "defaut de l'enonce"
+            else:
+                self.logger.warning(
+                    "Aucun identifiant trouve dans le rendu et pas de defaut d'enonce "
+                    "(EXAM_DOCKER_EVAL_BASIC_AUTH) : les routes protegees resteront non testees"
+                )
+                self.credentials = None
+                self.credentials_source = "aucun"
             self.credentials_in_tests = False
             return extract_dir
 
