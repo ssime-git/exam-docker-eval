@@ -404,3 +404,26 @@ def test_identifiants_declares(tmp_path):
     assert ("admin:admin", "tests/run_tests.sh") in couples
     assert any(c == "alice:s3cret" for c, _ in couples)
     assert all("wrong" not in c for c, _ in couples)
+
+
+def test_requetes_declarees(tmp_path):
+    from docker_eval.compose_runner import requetes_declarees
+
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "run_tests.sh").write_text(
+        'response_v1=$(curl -s -o /dev/null -w "%{http_code}" -X POST "https://localhost/predict" \\\n'
+        '     -H "Content-Type: application/json" \\\n'
+        "     -d '{\"sentence\": \"cool\"}' \\\n"
+        '     --user admin:admin \\\n'
+        '     --cacert ./certs/nginx.crt)\n'
+        'curl -s "https://localhost:443/health"\n'
+    )
+    reqs = requetes_declarees(str(tmp_path))
+    assert {"methode", "chemin", "corps", "entetes", "identifiants", "source"} <= set(reqs[0])
+    predict = [r for r in reqs if r["chemin"] == "/predict"][0]
+    assert predict["methode"] == "POST"
+    assert predict["identifiants"] == "admin:admin"
+    assert "sentence" in predict["corps"]
+    assert predict["entetes"].get("Content-Type") == "application/json"
+    assert any(r["chemin"] == "/health" and r["methode"] == "GET" for r in reqs)

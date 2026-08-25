@@ -83,6 +83,52 @@ def identifiants_declares(eval_dir: str, maxi: int = 3) -> list:
     return candidats[:maxi]
 
 
+def requetes_declarees(eval_dir: str, maxi: int = 6) -> list:
+    """Les requêtes que la copie déclare dans ses propres tests (curl).
+
+    Sonder en GET une route POST rend 405 : le moteur concluait « API non
+    fonctionnelle » sur une API parfaitement saine (458925 : son run_tests.sh
+    fait POST /predict avec payload et identifiants → 200). La seule preuve
+    de fonction, c'est de rejouer ce que l'apprenant déclare : méthode,
+    chemin, corps, en-têtes, identifiants.
+    """
+    import re
+    requetes = []
+    for racine, dossiers, fichiers in os.walk(eval_dir):
+        dossiers[:] = [d for d in dossiers if d not in (".git", ".venv", "__pycache__", "node_modules")]
+        for nom in fichiers:
+            if not (nom.endswith(".sh") or nom == "Makefile"):
+                continue
+            try:
+                with open(os.path.join(racine, nom), encoding="utf-8", errors="replace") as lecteur:
+                    texte = lecteur.read().replace("\\\n", " ")
+            except OSError:
+                continue
+            for appel in re.finditer(r"curl\s+[^\n]+", texte):
+                ligne = appel.group(0)
+                url = re.search(r"https?://(?:localhost|127\.0\.0\.1)(?::\d+)?(/[^\s\"']*)", ligne)
+                if not url:
+                    continue
+                methode = re.search(r"-X\s+(\w+)", ligne)
+                corps = re.search(r"(?:-d|--data(?:-raw)?)\s+'([^']*)'", ligne) or \
+                        re.search(r"(?:-d|--data(?:-raw)?)\s+\"([^\"]*)\"", ligne)
+                user = re.search(r"--user[= ]([^\s'\"]+)", ligne)
+                entetes = dict(re.findall(r"-H\s+['\"]([^:'\"]+):\s*([^'\"]+)['\"]", ligne))
+                requete = {
+                    "methode": (methode.group(1) if methode else "GET").upper(),
+                    "chemin": url.group(1),
+                    "corps": corps.group(1) if corps else None,
+                    "entetes": entetes,
+                    "identifiants": user.group(1) if user else None,
+                    "source": os.path.relpath(os.path.join(racine, nom), eval_dir),
+                }
+                if requete not in requetes:
+                    requetes.append(requete)
+                if len(requetes) >= maxi:
+                    return requetes
+    return requetes
+
+
 def annoter_bruit_de_sondes(sondes: list) -> None:
     """Qualifier le bruit mécanique du double sondage http/https.
 
@@ -700,6 +746,47 @@ class ComposeRunner(BaseRunner):
                         # traversée, inutile d'essayer les suivants.
                         if isinstance(code_auth, int) and code_auth != 401:
                             break
+
+        # La preuve de fonction : rejouer les requêtes que la copie déclare
+        # (méthode, corps, en-têtes, identifiants), sur les mêmes bases TLS.
+        import base64
+        for base in bases:
+            racine_url = base["url"].rstrip("/")
+            for requete in requetes_declarees(self.eval_dir):
+                url = f"{racine_url}{requete['chemin']}"
+                entetes = dict(requete["entetes"])
+                if requete["identifiants"]:
+                    entetes["Authorization"] = "Basic " + base64.b64encode(
+                        requete["identifiants"].encode()).decode()
+                corps = requete["corps"].encode() if requete["corps"] else None
+                if corps and "Content-Type" not in entetes:
+                    entetes["Content-Type"] = "application/json"
+                started = time.time()
+                sonde = {"service": base["service"], "port": base["port"], "url": url,
+                         "auth": bool(requete["identifiants"]), "declared": True}
+                try:
+                    req = urllib.request.Request(url, data=corps, headers=entetes,
+                                                 method=requete["methode"])
+                    reponse = urllib.request.urlopen(req, timeout=15, context=contexte)
+                    sonde.update(code=reponse.status,
+                                 extrait=reponse.read(200).decode("utf-8", "replace"))
+                except urllib.error.HTTPError as erreur:
+                    sonde.update(code=erreur.code,
+                                 extrait=erreur.read(300).decode("utf-8", "replace"))
+                except Exception as erreur:
+                    sonde.update(code="non reçu", erreur=str(erreur), extrait=str(erreur))
+                sonde["duration_seconds"] = time.time() - started
+                code = sonde.get("code")
+                self.record_step(
+                    f"Requête déclarée ({requete['source']}) : {requete['methode']} {requete['chemin']}",
+                    command=f"{requete['methode']} {url}"
+                            + (" + corps JSON" if corps else "")
+                            + (" + Authorization Basic" if requete["identifiants"] else ""),
+                    output=f"code {code}\n{sonde.get('extrait', '')}"[:500],
+                    exit_code=0 if isinstance(code, int) else 1,
+                    duration=sonde["duration_seconds"],
+                )
+                resultats.append(sonde)
         return resultats
 
     def _record_service_states(self) -> dict:
