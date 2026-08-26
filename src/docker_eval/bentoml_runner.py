@@ -641,6 +641,17 @@ class BentoMLRunner(BaseRunner):
                         container_logs = str(raw_logs)
                 except Exception:
                     container_logs = ""
+            elif getattr(self, "cli_container_id", None):
+                # Mode CLI : `self.container` n'est pose que par le chemin
+                # testcontainers, il reste None ici. Sans cette branche
+                # `saw_startup_signal` ne peut jamais devenir vrai, et le repli
+                # ci-dessous -- ecrit precisement pour les demarrages lents sous
+                # emulation -- est du code mort sur ce chemin. La copie 459884 a
+                # ete notee 0/25 en « Live API behavior » sur un « API not ready
+                # after 60s » que ce repli devait absorber.
+                # Les logs se lisent par NOM de conteneur, ce qui marche dans les
+                # deux modes : `docker run` recoit `--name self.container_name`.
+                container_logs = self._capture_container_logs()
 
             if BENTOML_READY_PATTERN in container_logs or "Service loaded from Bento directory" in container_logs:
                 saw_startup_signal = True
