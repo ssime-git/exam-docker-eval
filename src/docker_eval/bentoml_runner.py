@@ -179,6 +179,8 @@ class BentoMLRunner(BaseRunner):
                 .with_exposed_ports(service_port)
                 .with_name(self.container_name)
             )
+            for nom, valeur in self._env_required_by_image().items():
+                self.container = self.container.with_env(nom, valeur)
             platform = self._platform_for_image()
             if platform:
                 self.logger.info(f"Image d'une autre architecture : execution en {platform}")
@@ -465,6 +467,8 @@ class BentoMLRunner(BaseRunner):
             if platform:
                 self.logger.info(f"Image d'une autre architecture : execution en {platform}")
                 run_cmd += ["--platform", platform]
+            for nom, valeur in self._env_required_by_image().items():
+                run_cmd += ["-e", f"{nom}={valeur}"]
             service_port = self._service_port_from_image()
             run_cmd += [
                 "-p",
@@ -1317,6 +1321,11 @@ class BentoMLRunner(BaseRunner):
                                         or "BASE_URL,API_URL,SERVICE_URL").split(",") if n.strip()]
         for nom in noms_env:
             env.setdefault(nom, base_url)
+        # Le meme secret que le conteneur : des tests qui forgent leur propre
+        # jeton (459884 : JWT_SECRET_KEY partage via .env) doivent signer avec
+        # la cle que le service verifie.
+        for nom, valeur in self._env_required_by_image().items():
+            env.setdefault(nom, valeur)
         # Les tests importent le code de l'apprenant, qui vit dans le projet.
         env["PYTHONPATH"] = os.pathsep.join(
             [p for p in (projet, env.get("PYTHONPATH")) if p]
@@ -1581,6 +1590,46 @@ class BentoMLRunner(BaseRunner):
         if current_path:
             texts.append((f"{current_path} (dans l'image)", "\n".join(buffer)))
         return texts
+
+    def _env_required_by_image(self) -> Dict[str, str]:
+        """Variables d'environnement que le service exige pour demarrer.
+
+        459884 : service.py fait os.environ["JWT_SECRET_KEY"] a l'import —
+        lance sans la variable, le conteneur meurt avant d'ouvrir le port et
+        une copie qui fonctionne est notee muette. Le nom se lit dans le code
+        du service (deja extrait de l'image), la valeur dans le rendu
+        (README/.env d'exemple), sinon une valeur aleatoire : le service veut
+        une cle, pas une cle particuliere.
+        """
+        if getattr(self, "_container_env", None) is not None:
+            return self._container_env
+
+        requis = set()
+        for _, texte in self._read_service_from_image():
+            requis.update(re.findall(
+                r'os\.environ\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*\]', texte))
+
+        env: Dict[str, str] = {}
+        if requis:
+            declares: Dict[str, str] = {}
+            for _, texte in self._iter_submission_texts():
+                for nom, valeur in re.findall(
+                        r'^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*([^\s#]+)\s*$',
+                        texte, re.M):
+                    valeur = valeur.strip('"\'')
+                    # « JWT_SECRET_KEY=<YOUR_GENERATED_SECRET> » est une
+                    # consigne, pas une valeur.
+                    if any(c in valeur for c in "<>$"):
+                        continue
+                    declares.setdefault(nom, valeur)
+            import secrets
+            for nom in sorted(requis):
+                env[nom] = declares.get(nom) or secrets.token_hex(32)
+            self.logger.info(
+                "Variables exigees par le service : " + ", ".join(sorted(requis)))
+
+        self._container_env = env
+        return env
 
     def _host_arch(self) -> str:
         """Architecture de la machine, dans le vocabulaire de Docker."""
