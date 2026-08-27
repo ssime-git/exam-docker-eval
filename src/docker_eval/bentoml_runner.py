@@ -467,6 +467,10 @@ class BentoMLRunner(BaseRunner):
             if platform:
                 self.logger.info(f"Image d'une autre architecture : execution en {platform}")
                 run_cmd += ["--platform", platform]
+                # Le chemin testcontainers posait ce drapeau, pas celui-ci :
+                # les delais adaptes a l'emulation (_http_timeout, sonde de
+                # demarrage) restaient aux valeurs natives en mode CLI.
+                self._emulating = True
             for nom, valeur in self._env_required_by_image().items():
                 run_cmd += ["-e", f"{nom}={valeur}"]
             service_port = self._service_port_from_image()
@@ -616,8 +620,14 @@ class BentoMLRunner(BaseRunner):
         observed in container logs. Endpoint correctness is still verified by
         the API tests that follow.
         """
+        # Sous QEMU tout est plusieurs fois plus lent, demarrage compris :
+        # 459845 emule repondait en ~52s en local et depassait les 60s sur la
+        # VM. Le meme facteur que _http_timeout etend la fenetre de demarrage.
+        startup_timeout = API_STARTUP_TIMEOUT * (
+            EMULATION_TIMEOUT_FACTOR if getattr(self, "_emulating", False) else 1
+        )
         self.logger.info(
-            f"Waiting for API to be ready (timeout: {API_STARTUP_TIMEOUT}s)..."
+            f"Waiting for API to be ready (timeout: {startup_timeout}s)..."
         )
 
         parsed = urlparse(base_url)
@@ -632,8 +642,8 @@ class BentoMLRunner(BaseRunner):
         while True:
             elapsed = time.time() - start_time
 
-            if elapsed > API_STARTUP_TIMEOUT:
-                raise TimeoutError(f"API not ready after {API_STARTUP_TIMEOUT}s")
+            if elapsed > startup_timeout:
+                raise TimeoutError(f"API not ready after {startup_timeout}s")
 
             container_logs = ""
             if getattr(self, "container", None) is not None:
@@ -685,7 +695,7 @@ class BentoMLRunner(BaseRunner):
             # On ne retient donc ce repli que dans le dernier quart du delai,
             # quand aucune reponse HTTP n'est venue -- pour ne pas bloquer un
             # service qui refuserait vraiment toutes les routes sondees.
-            if tcp_ready and saw_startup_signal and elapsed > API_STARTUP_TIMEOUT * 0.75:
+            if tcp_ready and saw_startup_signal and elapsed > startup_timeout * 0.75:
                 self.logger.warning(
                     "Aucune reponse HTTP, mais le port est ouvert et le demarrage "
                     "observe : on tente les tests malgre tout"
