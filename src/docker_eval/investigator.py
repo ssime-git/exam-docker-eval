@@ -7,9 +7,49 @@ une commande de lecture, lire un fichier de la copie. Chaque action et son
 observation deviennent des étapes du contrat — visibles au scratchpad,
 citables par la revue. Après le teardown, plus rien n'est testable : c'est
 ici que le vrai debug se joue (scriptorium #78).
+
+Verdict vérifié (scriptorium #307). Un verdict qui impute une faute
+(`faute` ≠ `indetermine`) n'est pas accepté sur la parole du LLM : sa `cause`
+est scorée par un vérificateur indépendant contre les seules preuves de
+l'investigation (sorties des étapes en échec et observations « Investigation
+N »). Le vérificateur est un scoring de logprobs sur quatre verdicts, même
+prompt que `score_claim` de scriptorium/tools/verification.py ; le banc #304
+a retenu Qwen3.5-4B Q4_K_M derrière llama-server.
+
+- P(soutenu) ≥ seuil : verdict accepté, la distribution est consignée.
+- Sous le seuil, avec des actions et du temps restants et moins de
+  MAX_ITERATIONS challenges : le LLM reçoit « la cause n'est pas établie par
+  tes observations » et doit agir. Un verdict rendu sans observation nouvelle
+  depuis le challenge ne compte pas (#306) : il est déclassé.
+- Sinon, et sur toute sortie de boucle avec un verdict contesté en attente
+  (budget, réponse inexploitable, vérificateur en erreur) : verdict déclassé,
+  cause préfixée « hypothèse : », `faute: indetermine`, `revelable` réduit au
+  symptôme observé.
+
+Environnement (contrat de scriptorium #311) : PI_CORRECTOR_VERIFY_BASE_URL
+(base OpenAI-compatible, `/v1` compris ; absente = vérification désactivée,
+et l'étape « Vérification du verdict non configurée » le dit),
+PI_CORRECTOR_VERIFY_API_KEY (Bearer, optionnel), PI_CORRECTOR_VERIFY_MODEL
+(optionnel, ignoré par llama-server), PI_CORRECTOR_VERIFY_THRESHOLD (0.55),
+PI_CORRECTOR_VERIFY_MAX_ITERATIONS (2).
+
+Budget. ACTIONS_MAX borne les actions ; les tours de verdict ne le
+consomment plus (au plus 1 + MAX_ITERATIONS). TIMEOUT_TOTAL_SECONDES borne
+les actions et les ré-investigations, pas le scoring : le verdict final est
+toujours scoré. Budget additionnel assumé : au plus 1 + MAX_ITERATIONS appels
+au vérificateur, chacun borné par VERIFICATION_TIMEOUT_SECONDES (le banc
+mesure 15 à 26 s par appel sur CPU).
+
+Trou connu, non comblé ici : l'investigateur ne tourne que dans le runner
+compose (ComposeRunner, services persistants), et seulement quand des étapes
+sont en échec. Une extraction ratée de la copie, ou les autres runners
+(conteneur unique, image, bentoml…), ne sont jamais investigués : leurs
+causes runtime restent sans verdict, donc sans vérification.
 """
 
+import functools
 import json
+import math
 import os
 import subprocess
 import time
@@ -19,6 +59,21 @@ import urllib.request
 ACTIONS_MAX = 6
 TIMEOUT_TOTAL_SECONDES = 240
 SORTIE_MAX = 2000
+
+# Vérificateur du verdict (#307). Prompt et verdicts recopiés de
+# scriptorium/tools/verification.py : le seuil vient d'un banc mesuré avec eux.
+VERDICTS = {
+    "A": ("soutenu", "une preuve établit directement l'affirmation, aucune ne la contredit"),
+    "B": ("non_soutenu", "une preuve contredit l'affirmation, aucune ne la soutient"),
+    "C": ("conflit_de_preuves", "une preuve la soutient ET une autre la contredit"),
+    "D": ("inverifiable", "fait que les preuves ne couvrent pas"),
+}
+SEUIL_VERIFICATION = 0.55
+ITERATIONS_VERIFICATION = 2
+VERIFICATION_TIMEOUT_SECONDES = 120
+# Le contexte du banc : la fin des preuves, 6000 caractères.
+PREUVES_MAX = 6000
+PREFIXE_HYPOTHESE = "hypothèse : "
 
 # ponytail: liste noire lexicale, pas un sandbox — le vrai garde-fou est
 # l'exec sans écriture possible sur la copie (elle vit hors conteneur) et
@@ -45,10 +100,66 @@ sans jamais donner la correction. Cohérence exigée : "faute" ne peut valoir "a
 """
 
 
-class Investigator:
-    """Boucle d'investigation adossée au runner (record_step, conteneurs)."""
+def scorer_affirmation(preuves: str, affirmation: str, *, base_url: str,
+                       api_key: str = "", model: str = "",
+                       timeout: float = VERIFICATION_TIMEOUT_SECONDES) -> dict:
+    """Distribution sur les quatre verdicts, lue dans les logprobs du premier
+    token de réponse (softmax restreint aux lettres présentes). Aucune lettre
+    dans le top 20 : distribution vide, donc P(soutenu) nulle."""
+    options = "\n".join(f"{lettre}. {nom} : {description}"
+                        for lettre, (nom, description) in VERDICTS.items())
+    charge = {
+        "messages": [{"role": "user", "content":
+            f"Preuves d'exécution d'une correction d'examen :\n\n{preuves}\n\n"
+            f"Affirmation du feedback à vérifier : {affirmation}\n\n"
+            f"Choisis le verdict :\n{options}\n\n"
+            "Réponds par une seule lettre."}],
+        "max_tokens": 1,
+        "temperature": 0,
+        "logprobs": True,
+        "top_logprobs": 20,
+        # Sans quoi un modèle à raisonnement ouvre par « Thinking » et les
+        # logprobs ne portent plus sur le verdict.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    if model:
+        charge["model"] = model
+    entetes = {"Content-Type": "application/json"}
+    if api_key:
+        entetes["Authorization"] = f"Bearer {api_key}"
+    requete = urllib.request.Request(
+        f"{base_url.rstrip('/')}/chat/completions",
+        data=json.dumps(charge).encode(), headers=entetes)
+    with urllib.request.urlopen(requete, timeout=timeout) as reponse:
+        contenu = json.load(reponse)
+    tops = contenu["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+    lp = {}
+    for t in tops:
+        lettre = t["token"].strip()
+        if lettre in VERDICTS and lettre not in lp:
+            lp[lettre] = t["logprob"]
+    if not lp:
+        return {}
+    m = max(lp.values())
+    z = sum(math.exp(v - m) for v in lp.values())
+    return {VERDICTS[l][0]: math.exp(v - m) / z for l, v in lp.items()}
 
-    def __init__(self, runner, eval_dir: str, services: list):
+
+def _nombre_env(nom: str, defaut, conversion):
+    try:
+        return conversion(os.environ.get(nom, "").strip() or defaut)
+    except ValueError:
+        return defaut
+
+
+class Investigator:
+    """Boucle d'investigation adossée au runner (record_step, conteneurs).
+
+    `scoreur(preuves, affirmation) -> {verdict: probabilité}` s'injecte pour
+    les contrôles ; par défaut, `scorer_affirmation` sur
+    PI_CORRECTOR_VERIFY_BASE_URL, ou aucun si la variable est absente."""
+
+    def __init__(self, runner, eval_dir: str, services: list, scoreur=None):
         self.runner = runner
         self.eval_dir = os.path.realpath(eval_dir)
         # Seuls les conteneurs de la copie évaluée sont accessibles : sans ce
@@ -62,6 +173,16 @@ class Investigator:
         # Jamais de modèle en dur : la variable d'env prime, sinon la gateway
         # elle-même dit ce qu'elle sert (hot-swap côté gateway sans redéploiement).
         self.model = os.environ.get("PI_CORRECTOR_INVESTIGATE_MODEL", "")
+        base_verification = os.environ.get("PI_CORRECTOR_VERIFY_BASE_URL", "").strip()
+        if scoreur is None and base_verification:
+            scoreur = functools.partial(
+                scorer_affirmation, base_url=base_verification,
+                api_key=os.environ.get("PI_CORRECTOR_VERIFY_API_KEY", "").strip(),
+                model=os.environ.get("PI_CORRECTOR_VERIFY_MODEL", "").strip())
+        self.scoreur = scoreur
+        self.seuil = _nombre_env("PI_CORRECTOR_VERIFY_THRESHOLD", SEUIL_VERIFICATION, float)
+        self.iterations_max = _nombre_env("PI_CORRECTOR_VERIFY_MAX_ITERATIONS",
+                                          ITERATIONS_VERIFICATION, int)
 
     def disponible(self) -> bool:
         return bool(self.base_url and self.api_key)
@@ -154,27 +275,77 @@ class Investigator:
                                         f"Conteneurs debout : {self._conteneurs()}\n"
                                         f"Fichiers de la copie :\n{self._inventaire()}\nCommence."},
         ]
-        for numero in range(1, ACTIONS_MAX + 1):
+        observations = []       # (titre, commande, sortie) des actions menées
+        iterations = 0          # challenges du vérificateur déjà renvoyés au LLM
+        en_attente = None       # dernier verdict contesté : jamais perdu en sortie
+        observations_au_challenge = 0
+        # Chaque tour est une action ou un verdict ; les verdicts sont au plus
+        # 1 + iterations_max, les actions au plus ACTIONS_MAX.
+        for _tour in range(ACTIONS_MAX + 1 + self.iterations_max):
             if time.time() - debut > TIMEOUT_TOTAL_SECONDES:
-                self.runner.record_step("Investigation interrompue",
-                                        output="budget temps épuisé", exit_code=1)
+                self._interrompre("budget temps épuisé", en_attente, echecs, debut)
                 return
             try:
                 brut = self._appeler_llm(messages)
                 demande = json.loads(brut.strip().removeprefix("```json").removeprefix("```").removesuffix("```"))
             except Exception as erreur:
-                self.runner.record_step("Investigation interrompue",
-                                        output=f"réponse LLM inexploitable : {erreur}", exit_code=1)
+                self._interrompre(f"réponse LLM inexploitable : {erreur}", en_attente, echecs, debut)
                 return
             action = demande.get("action")
             if action == "verdict":
-                self.runner.record_step(
-                    "Investigation — verdict",
-                    output=(f"cause : {demande.get('cause')}\n"
-                            f"faute : {demande.get('faute')}\n"
-                            f"révélable au feedback : {demande.get('revelable')}\n"
-                            f"à ne pas révéler : {demande.get('non_revelable')}"),
-                    exit_code=0, duration=time.time() - debut)
+                if self.scoreur is None:
+                    self.runner.record_step(
+                        "Vérification du verdict non configurée",
+                        output="PI_CORRECTOR_VERIFY_BASE_URL absente : verdict accepté "
+                               "sans vérification indépendante de la cause",
+                        exit_code=0)
+                    self._consigner_verdict(demande, debut)
+                    return
+                if str(demande.get("faute", "")).strip().lower() == "indetermine":
+                    self.runner.record_step(
+                        "Investigation — vérification du verdict",
+                        output="faute indetermine : cause non scorée, le verdict est déjà prudent",
+                        exit_code=0)
+                    self._consigner_verdict(demande, debut)
+                    return
+                if en_attente is not None and len(observations) == observations_au_challenge:
+                    self._declasser(demande, echecs, debut,
+                                    "verdict rendu sans observation nouvelle depuis le "
+                                    "challenge : reformuler avec la même preuve ne compte pas")
+                    return
+                try:
+                    distribution = self.scoreur(self._preuves(echecs, observations),
+                                                str(demande.get("cause", "")))
+                except Exception as erreur:
+                    self._declasser(demande, echecs, debut, f"vérificateur en erreur : {erreur}")
+                    return
+                p = float(distribution.get("soutenu", 0.0))
+                lecture = (f"affirmation : {demande.get('cause')}\n"
+                           f"P(soutenu)={p:.2f}, seuil {self.seuil:.2f}\n"
+                           f"distribution : {self._distribution(distribution)}")
+                if p >= self.seuil:
+                    self.runner.record_step("Investigation — vérification du verdict",
+                                            output=f"{lecture}\ncause établie : verdict accepté",
+                                            exit_code=0)
+                    self._consigner_verdict(demande, debut)
+                    return
+                if (iterations < self.iterations_max and len(observations) < ACTIONS_MAX
+                        and time.time() - debut <= TIMEOUT_TOTAL_SECONDES):
+                    iterations += 1
+                    en_attente, observations_au_challenge = demande, len(observations)
+                    self.runner.record_step(
+                        "Investigation — vérification du verdict",
+                        output=f"{lecture}\ncause non établie : réinvestigation "
+                               f"{iterations}/{self.iterations_max}",
+                        exit_code=0)
+                    messages.append({"role": "assistant", "content": brut})
+                    messages.append({"role": "user", "content":
+                        f"La cause n'est pas établie par tes observations (P={p:.2f}). "
+                        "Fais une action qui la prouve ou la réfute, puis rends un nouveau "
+                        "verdict. Reformuler la même cause sans observation nouvelle ne compte pas."})
+                    continue
+                self._declasser(demande, echecs, debut,
+                                f"{lecture}\ncause non établie, budget de vérification épuisé")
                 return
             try:
                 if action == "sonde":
@@ -194,13 +365,83 @@ class Investigator:
                     commande = str(demande)[:200]
             except Exception as erreur:
                 observation, commande = f"échec de l'action : {erreur}", str(demande)[:200]
-            self.runner.record_step(f"Investigation {numero} : {action}",
-                                    command=commande, output=observation[:SORTIE_MAX], exit_code=0)
+            titre = f"Investigation {len(observations) + 1} : {action}"
+            self.runner.record_step(titre, command=commande,
+                                    output=observation[:SORTIE_MAX], exit_code=0)
+            observations.append((titre, commande, observation[:SORTIE_MAX]))
             messages.append({"role": "assistant", "content": brut})
             messages.append({"role": "user", "content": f"Observation :\n{observation[:SORTIE_MAX]}"})
+            if len(observations) >= ACTIONS_MAX:
+                break
+        if en_attente is not None:
+            self._declasser(en_attente, echecs, debut,
+                            "budget d'actions épuisé avant un nouveau verdict")
+            return
         self.runner.record_step("Investigation — verdict",
                                 output="budget d'actions épuisé sans verdict : cause non établie",
                                 exit_code=1, duration=time.time() - debut)
+
+    # --- verdict -------------------------------------------------------------
+
+    def _consigner_verdict(self, verdict: dict, debut: float) -> None:
+        self.runner.record_step(
+            "Investigation — verdict",
+            output=(f"cause : {verdict.get('cause')}\n"
+                    f"faute : {verdict.get('faute')}\n"
+                    f"révélable au feedback : {verdict.get('revelable')}\n"
+                    f"à ne pas révéler : {verdict.get('non_revelable')}"),
+            exit_code=0, duration=time.time() - debut)
+
+    def _declasser(self, verdict: dict, echecs: list, debut: float, raison: str) -> None:
+        """Une cause que le vérificateur n'a pas vue établie devient une
+        hypothèse, et le feedback n'en dit que le symptôme."""
+        cause = str(verdict.get("cause", ""))
+        if not cause.startswith(PREFIXE_HYPOTHESE):
+            cause = PREFIXE_HYPOTHESE + cause
+        self.runner.record_step("Investigation — vérification du verdict",
+                                output=f"{raison}\nverdict déclassé en hypothèse, faute indetermine",
+                                exit_code=0)
+        self._consigner_verdict({"cause": cause, "faute": "indetermine",
+                                 "revelable": self._symptome(echecs),
+                                 "non_revelable": verdict.get("non_revelable")}, debut)
+
+    def _interrompre(self, raison: str, en_attente, echecs: list, debut: float) -> None:
+        self.runner.record_step("Investigation interrompue", output=raison, exit_code=1)
+        if en_attente is not None:
+            self._declasser(en_attente, echecs, debut, f"investigation interrompue : {raison}")
+
+    @staticmethod
+    def _symptome(echecs: list) -> str:
+        lignes = []
+        for e in echecs[:3]:
+            sortie = str(e.get("output") or e.get("sortie") or "").strip()
+            premiere = sortie.splitlines()[0][:160] if sortie else "(sans sortie)"
+            lignes.append(f"{e.get('title') or e.get('titre')} → {premiere}")
+        return "symptôme observé : " + " ; ".join(lignes)
+
+    @staticmethod
+    def _preuves(echecs: list, observations: list) -> str:
+        """Contexte étroit du vérificateur : les échecs, puis ce que
+        l'investigation a observé. Au-delà de PREUVES_MAX, on garde la tête
+        des échecs et la fin des observations, les plus récentes."""
+        def tronquer_fin(texte, n):
+            return texte if len(texte) <= n else "[…]" + texte[-n:]
+
+        partie_echecs = "\n\n".join(
+            f"### {e.get('title') or e.get('titre')} (exit {e.get('exit_code')})\n"
+            f"{tronquer_fin(str(e.get('output') or e.get('sortie') or ''), 1000)}"
+            for e in echecs)[:PREUVES_MAX // 3]
+        partie_observations = "\n\n".join(
+            f"### {titre}\n$ {commande}\n{sortie}" for titre, commande, sortie in observations)
+        return (partie_echecs + "\n\n"
+                + tronquer_fin(partie_observations, PREUVES_MAX - len(partie_echecs))).strip()
+
+    @staticmethod
+    def _distribution(distribution: dict) -> str:
+        if not distribution:
+            return "(aucune lettre de verdict dans les logprobs)"
+        return " · ".join(f"{nom} {p:.2f}" for nom, p in
+                          sorted(distribution.items(), key=lambda item: -item[1]))
 
     def _inventaire(self) -> str:
         """Les chemins réels de la copie : l'action « fichier » ne devine pas."""
