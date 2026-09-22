@@ -345,6 +345,8 @@ def test_investigator_garde_fous(tmp_path):
 def test_investigator_verdict_enregistre(monkeypatch, tmp_path):
     from docker_eval import investigator as mod
 
+    monkeypatch.delenv("PI_CORRECTOR_VERIFY_BASE_URL", raising=False)
+
     class RunnerFactice:
         def __init__(self): self.steps = []
         def record_step(self, title, command="", output="", exit_code=0, duration=0):
