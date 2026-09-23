@@ -163,6 +163,52 @@ class BaseRunner(ABC):
             }
         )
 
+    def _host_arch(self) -> str:
+        """Architecture de la machine, dans le vocabulaire de Docker."""
+        import platform as _platform
+
+        return {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "arm"}.get(
+            _platform.machine(), _platform.machine()
+        )
+
+    def _qemu_available(self) -> bool:
+        """binfmt_misc expose-t-il des gestionnaires QEMU ?
+
+        Sans eux, une image d'une autre architecture ne peut pas s'executer,
+        quel que soit le --platform demande.
+        """
+        try:
+            entries = os.listdir("/proc/sys/fs/binfmt_misc")
+        except OSError:
+            return False
+        return any(name.startswith("qemu-") for name in entries)
+
+    def consigner_environnement(self, python_tests, runner_installe: bool = True) -> None:
+        """Consigner les faits d'environnement connus avant de lancer quoi que
+        ce soit : quel Python installe et teste la copie, lequel elle déclare,
+        ses images de base, la machine. Une étape qui sort en 0 : ce sont des
+        faits, pas un verdict (#322)."""
+        from . import environnement
+        self.record_step(
+            "Environnement du harnais",
+            command="lecture de la configuration du harnais et des déclarations de la copie",
+            output="\n".join(environnement.lignes_de_depart(
+                self.eval_dir, python_tests, self._host_arch(), self._qemu_available(),
+                runner_installe=runner_installe)),
+            exit_code=0,
+            note=("Faits d'environnement qui peuvent décider d'une attribution : "
+                  "un échec qui tient au Python ou à la plateforme du harnais n'est pas "
+                  "une faute de la copie."),
+        )
+        self._etape_environnement = self.steps[-1]
+
+    def completer_environnement(self, lignes: list) -> None:
+        """Ajouter à l'étape d'environnement ce qu'on n'apprend qu'au démarrage
+        (image exécutée, émulation, limites des conteneurs)."""
+        etape = getattr(self, "_etape_environnement", None)
+        if etape is not None and lignes:
+            etape["output"] = etape["output"] + "\n" + "\n".join(lignes)
+
     @abstractmethod
     def run_evaluation(self) -> Dict[str, Any]:
         """

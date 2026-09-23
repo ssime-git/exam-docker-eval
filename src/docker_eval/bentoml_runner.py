@@ -24,7 +24,7 @@ from testcontainers.core.container import DockerContainer
 
 from .base_runner import BaseRunner
 from .utils import find_credentials_in_texts, looks_like_test_file
-from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT, EMULATION_TIMEOUT_FACTOR
+from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT, EMULATION_TIMEOUT_FACTOR, PYTHON_TESTS
 
 
 class BentoMLRunner(BaseRunner):
@@ -84,6 +84,7 @@ class BentoMLRunner(BaseRunner):
         # Ce que l'apprenant a rendu ouvre la trace : c'est la premiere chose
         # qu'un relecteur regarde.
         self.record_submission_step()
+        self.consigner_environnement(PYTHON_TESTS)
         emulated_platform = None
         auto_containerized = False
         image_loaded = False
@@ -95,7 +96,11 @@ class BentoMLRunner(BaseRunner):
                 self.logger.info(
                     "Detected image+tests only submission; using docker CLI fallback mode"
                 )
-                return self._run_image_only_evaluation()
+                # Ce chemin (461638) rendait un résultat sans `steps` : la
+                # trace, environnement compris, n'arrivait jamais au relecteur.
+                resultat = self._run_image_only_evaluation()
+                resultat.setdefault("steps", self.steps)
+                return resultat
 
             # Step 1: Load Docker image or auto-containerize .bento
             if self.image_tar:
@@ -202,6 +207,11 @@ class BentoMLRunner(BaseRunner):
             self.container.start()
             container_started = True
             self.logger.info("Container started successfully")
+            try:
+                attrs = self.container.get_wrapped_container().attrs
+            except Exception:
+                attrs = {}
+            self._completer_environnement_image(platform, attrs)
 
             host_port = self.container.get_exposed_port(service_port)
             published_host = self._resolve_published_host()
@@ -498,6 +508,7 @@ class BentoMLRunner(BaseRunner):
 
             self.cli_container_id = (run_result.stdout or "").strip() or self.container_name
             container_started = True
+            self._completer_environnement_image(platform, self._attrs_conteneur_cli())
             published_host = self._resolve_published_host()
             base_url = f"http://{published_host}:{host_port}"
             self.logger.info(f"Container started via docker CLI at {base_url}")
@@ -1272,7 +1283,7 @@ class BentoMLRunner(BaseRunner):
         command = [
             "uvx",
             "--python",
-            "3.11",
+            PYTHON_TESTS,
             "--with",
             "pytest",
             "--with",
@@ -1641,13 +1652,24 @@ class BentoMLRunner(BaseRunner):
         self._container_env = env
         return env
 
-    def _host_arch(self) -> str:
-        """Architecture de la machine, dans le vocabulaire de Docker."""
-        import platform as _platform
+    def _completer_environnement_image(self, platform: Optional[str], attrs: dict) -> None:
+        """L'image réellement exécutée, son architecture, et les limites du
+        conteneur lues dans son HostConfig."""
+        from .environnement import limites
+        arch = self._image_arch()
+        execution = f"exécutée sous émulation {platform}" if platform else "exécutée en natif"
+        self.completer_environnement([
+            f"image de l'apprenant : {self.image_name} ({arch or 'architecture non lue'}), {execution}",
+            f"limites du conteneur : {limites(attrs)}",
+        ])
 
-        return {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "arm"}.get(
-            _platform.machine(), _platform.machine()
-        )
+    def _attrs_conteneur_cli(self) -> dict:
+        try:
+            import docker
+            return docker.from_env().containers.get(self.cli_container_id).attrs
+        except Exception as exc:
+            self.logger.debug(f"Conteneur illisible : {exc}")
+            return {}
 
     def _image_arch(self) -> Optional[str]:
         """Architecture pour laquelle l'image a ete construite, si lisible."""
@@ -1659,18 +1681,6 @@ class BentoMLRunner(BaseRunner):
         except Exception as exc:
             self.logger.debug(f"Architecture de l'image illisible : {exc}")
             return None
-
-    def _qemu_available(self) -> bool:
-        """binfmt_misc expose-t-il des gestionnaires QEMU ?
-
-        Sans eux, une image d'une autre architecture ne peut pas s'executer,
-        quel que soit le --platform demande.
-        """
-        try:
-            entries = os.listdir("/proc/sys/fs/binfmt_misc")
-        except OSError:
-            return False
-        return any(name.startswith("qemu-") for name in entries)
 
     def _platform_for_image(self) -> Optional[str]:
         """`linux/<arch>` a passer a Docker, ou None si rien a forcer.

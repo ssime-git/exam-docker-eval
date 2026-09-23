@@ -338,6 +338,9 @@ class ComposeRunner(BaseRunner):
                 exit_code=getattr(self, "_port_relaxation_exit_code", 2),
                 duration=time.time() - port_relaxation_started,
             )
+            # Avant le build : un échec de build (exec format error, image de
+            # base introuvable) est justement là où la plateforme compte.
+            self.consigner_environnement(None, runner_installe=False)
 
             # Create testcontainers Compose instance
             self.logger.info(f"Creating Docker Compose instance with project name: {self.project_name}")
@@ -379,6 +382,7 @@ class ComposeRunner(BaseRunner):
 
                     # Wait for services to be ready
                     self._wait_for_services()
+                    self._completer_environnement_compose()
 
                     # Deux formes d'examen. Un service `pipeline` declare = un
                     # traitement qui se termine (linux-bash) : on attend sa fin.
@@ -536,6 +540,20 @@ class ComposeRunner(BaseRunner):
             if container.labels.get("com.docker.compose.service") == "pipeline":
                 return container
         return None
+
+    def _completer_environnement_compose(self) -> None:
+        """Image, architecture et limites de chaque conteneur démarré."""
+        from . import environnement
+        lignes = []
+        try:
+            for c in self._conteneurs_du_projet():
+                image = (c.attrs.get("Config") or {}).get("Image") or c.attrs.get("Image") or "?"
+                arch = environnement.arch_image(c.attrs.get("Image") or image)
+                lignes.append(f"conteneur {c.name} : image {image} ({arch or 'architecture non lue'}), "
+                              f"limites : {environnement.limites(c.attrs)}")
+        except Exception as erreur:
+            lignes.append(f"conteneurs non lus : {erreur}")
+        self.completer_environnement(lignes)
 
     def _sonder_ports_publies(self) -> list:
         """GET sur chaque port publié du projet, en HTTP puis HTTPS.

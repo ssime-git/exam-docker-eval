@@ -15,6 +15,7 @@ Il prend un rendu d'apprenant déjà extrait, l'exécute dans des conteneurs jet
 | `bento_compiled_runner` | `.bento` compilé |
 | `base_runner` | socle commun, dont la trace pas à pas |
 | `utils` | nettoyage et vérification des ressources |
+| `environnement` | faits d'environnement du harnais (Python des tests, version déclarée par la copie, images, plateforme, limites), consignés dans l'étape « Environnement du harnais » |
 | `config` | délais, limites de ressources, codes de sortie |
 
 ## Ce qu'il garantit
