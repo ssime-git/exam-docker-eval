@@ -187,7 +187,8 @@ def test_probe_error_has_nonzero_exit_and_exact_message(tmp_path, logger, monkey
     container = FakeContainer("nginx", service="nginx", ports={"80/tcp": [{"HostPort": "49152"}]})
     monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [container])
     monkeypatch.setattr(runner, "_capture_logs", lambda: "logs")
-    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(urllib.error.URLError("refused")))
+    import docker_eval.sonde_http as sonde_http
+    monkeypatch.setattr(sonde_http, "_ouvrir", lambda *_args, **_kwargs: (_ for _ in ()).throw(urllib.error.URLError("refused")))
 
     result = runner._evaluer_services_persistants()
     probes = [step for step in result["steps"] if step["title"].startswith("Sonde ")]

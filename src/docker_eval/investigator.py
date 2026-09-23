@@ -192,23 +192,17 @@ class Investigator:
     def _sonde(self, url: str, identifiants: str = "") -> str:
         if "127.0.0.1" not in url and "localhost" not in url:
             return "refusé : seules les URLs locales (127.0.0.1) sont sondables"
-        import ssl
-        contexte = ssl.create_default_context()
-        contexte.check_hostname = False
-        contexte.verify_mode = ssl.CERT_NONE
+        from .sonde_http import resume, sonder
         entetes = {}
         if identifiants:
             import base64
             entetes["Authorization"] = "Basic " + base64.b64encode(identifiants.encode()).decode()
-        try:
-            requete = urllib.request.Request(url, headers=entetes)
-            reponse = urllib.request.urlopen(
-                requete, timeout=10, context=contexte if url.startswith("https") else None)
-            return f"code {reponse.status}\n{reponse.read(400).decode('utf-8', 'replace')}"
-        except urllib.error.HTTPError as erreur:
-            return f"code {erreur.code}\n{erreur.read(400).decode('utf-8', 'replace')}"
-        except Exception as erreur:
-            return f"non reçu : {erreur}"
+        # Même règle que les sondes du runner : une 3xx est consignée, pas
+        # suivie vers un port que la stack ne publie pas (#320).
+        sonde = sonder(url, entetes=entetes, taille_extrait=400)
+        if not isinstance(sonde["code"], int):
+            return f"non reçu : {sonde['erreur']}"
+        return f"{resume(sonde)}\n{sonde['extrait']}"
 
     def _logs(self, service: str, lignes: int) -> str:
         if service not in self.services:
