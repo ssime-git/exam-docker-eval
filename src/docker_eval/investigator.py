@@ -197,8 +197,8 @@ class Investigator:
         if identifiants:
             import base64
             entetes["Authorization"] = "Basic " + base64.b64encode(identifiants.encode()).decode()
-        # Même règle que les sondes du runner : une 3xx est consignée, pas
-        # suivie vers un port que la stack ne publie pas (#320).
+        # Même règle que les sondes du runner : la chaîne de redirections est
+        # consignée, une cible injoignable n'est pas une panne (#320).
         sonde = sonder(url, entetes=entetes, taille_extrait=400)
         if not isinstance(sonde["code"], int):
             return f"non reçu : {sonde['erreur']}"

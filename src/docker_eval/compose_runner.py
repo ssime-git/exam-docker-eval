@@ -557,9 +557,10 @@ class ComposeRunner(BaseRunner):
                     for schema in ("http", "https"):
                         url = f"{schema}://127.0.0.1:{hote}/"
                         started = time.time()
-                        # Sans suivre les redirections : un 301 vers le 443
-                        # du conteneur, non publié, finissait en « Connection
-                        # refused » (#320).
+                        # Un 301 vers le 443 du conteneur, non publié,
+                        # finissait en « Connection refused » : la chaîne est
+                        # consignée, et une cible injoignable n'est pas une
+                        # panne (#320).
                         sonde = {"service": c.name, "port": interne, "url": url}
                         sonde.update(sonder(url))
                         sonde["duration_seconds"] = time.time() - started

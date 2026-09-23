@@ -15,7 +15,7 @@ Il prend un rendu d'apprenant déjà extrait, l'exécute dans des conteneurs jet
 | `bento_compiled_runner` | `.bento` compilé |
 | `base_runner` | socle commun, dont la trace pas à pas |
 | `utils` | nettoyage et vérification des ressources |
-| `sonde_http` | requête de sonde qui ne suit pas les redirections : une 3xx est consignée avec son `Location` |
+| `sonde_http` | requête de sonde : les redirections sont suivies et consignées ; une cible injoignable depuis le harnais laisse le 3xx, « redirection active », jamais une panne |
 | `config` | délais, limites de ressources, codes de sortie |
 
 ## Ce qu'il garantit
