@@ -134,13 +134,10 @@ def lignes_de_depart(eval_dir: str, python_tests: str | None, arch_machine: str,
         resolue = version_python_resolue(None)
         python = "Python par défaut de uv (uvx sans --python" + (f", résolu en {resolue})" if resolue else ")")
     lignes = [f"Python des tests et des dépendances de la copie : {python}"]
-    declarees = versions_python_declarees(eval_dir)
-    if declarees:
-        lignes += [f"version déclarée par la copie : {version} ({fichier} : {extrait})"
-                   for fichier, version, extrait in declarees]
-    else:
-        lignes.append("version déclarée par la copie : aucune (ni .python-version, "
-                      "ni requires-python, ni README)")
+    # Seulement quand la copie déclare : la recherche ne lit ni bentofile.yaml
+    # ni l'image, un « aucune » affirmerait plus que ce qu'on a lu.
+    lignes += [f"version déclarée par la copie : {version} ({fichier} : {extrait})"
+               for fichier, version, extrait in versions_python_declarees(eval_dir)]
     bases = images_de_base(eval_dir)
     if bases:
         lignes.append("images de base : " + ", ".join(f"{image} ({fichier})" for fichier, image in bases))

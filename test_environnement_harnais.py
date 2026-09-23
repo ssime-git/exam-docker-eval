@@ -21,15 +21,13 @@ from docker_eval.config import PYTHON_TESTS
 
 TITRE = "Environnement du harnais"
 
-# Extrait du README de 461638, tel que rendu.
-README_461638 = """# Admission prediction service
-
-## Installation
+# Les deux lignes du README de 461638 qui parlent de Python, recopiées de
+# l'archive rendue (le reste du README est omis).
+README_461638 = """## Installation
 
 ```bash
-uv venv --python 3.12
-source .venv/bin/activate
-uv pip install -r requirements.txt
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
 ```
 """
 
@@ -53,7 +51,7 @@ def test_version_declaree_dans_le_readme_imbrique(tmp_path):
     (tmp_path / "exam_bentoml_rendu" / "README.md").write_text(README_461638)
 
     assert environnement.versions_python_declarees(str(tmp_path)) == [
-        ("exam_bentoml_rendu/README.md", "3.12", "uv venv --python 3.12"),
+        ("exam_bentoml_rendu/README.md", "3.12", "uv venv --python 3.12 .venv"),
     ]
 
 
@@ -73,6 +71,14 @@ def test_aucune_version_declaree(tmp_path):
     (tmp_path / "README.md").write_text("Lancer `make run`.\n")
 
     assert environnement.versions_python_declarees(str(tmp_path)) == []
+
+
+def test_pas_de_ligne_declaree_sans_declaration(tmp_path):
+    """La recherche ne couvre pas tout (bentofile, FROM python:x, image) : un
+    « aucune » affirmerait plus que ce qu'on a lu."""
+    lignes = environnement.lignes_de_depart(str(tmp_path), PYTHON_TESTS, "amd64", False)
+
+    assert not any(l.startswith("version déclarée") for l in lignes)
 
 
 def test_images_de_base_des_dockerfiles(tmp_path):
@@ -118,7 +124,7 @@ def test_bentoml_image_seule_garde_ses_etapes_et_l_environnement(tmp_path, monke
     assert f"Python des tests et des dépendances de la copie : {PYTHON_TESTS} " \
            f"(uvx --python {PYTHON_TESTS}, résolu en 3.11.15)" in env["output"]
     assert "version déclarée par la copie : 3.12 (exam_bentoml_rendu/README.md : " \
-           "uv venv --python 3.12)" in env["output"]
+           "uv venv --python 3.12 .venv)" in env["output"]
     assert "machine : amd64, émulation QEMU absente" in env["output"]
 
 
