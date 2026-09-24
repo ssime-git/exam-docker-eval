@@ -8,14 +8,12 @@ docker-compose.yml configurations.
 import logging
 import os
 import time
-import urllib.request
-import urllib.error
-import ssl
 from typing import Dict, Any
 
 from testcontainers.compose import DockerCompose
 
 from .base_runner import BaseRunner
+from .sonde_http import contexte_tls_permissif, resume, sonder
 from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN
 
 
@@ -563,9 +561,6 @@ class ComposeRunner(BaseRunner):
         qui répond, l'agent et le barème en font ce qu'ils savent.
         """
         sondes = []
-        contexte_tls = ssl.create_default_context()
-        contexte_tls.check_hostname = False
-        contexte_tls.verify_mode = ssl.CERT_NONE
         for c in self._conteneurs_du_projet():
             if c.status != "running":
                 continue
@@ -580,27 +575,14 @@ class ComposeRunner(BaseRunner):
                     for schema in ("http", "https"):
                         url = f"{schema}://127.0.0.1:{hote}/"
                         started = time.time()
-                        try:
-                            reponse = urllib.request.urlopen(
-                                url, timeout=10,
-                                context=contexte_tls if schema == "https" else None,
-                            )
-                            sondes.append({"service": c.name, "port": interne, "url": url,
-                                           "code": reponse.status,
-                                           "extrait": reponse.read(200).decode("utf-8", "replace"),
-                                           "duration_seconds": time.time() - started})
-                        except urllib.error.HTTPError as erreur:
-                            corps = erreur.read(300).decode("utf-8", "replace")
-                            sondes.append({"service": c.name, "port": interne, "url": url,
-                                           "code": erreur.code,
-                                           "entetes": dict(erreur.headers) if "WWW-Authenticate" in erreur.headers else None,
-                                           "extrait": corps,
-                                           "duration_seconds": time.time() - started})
-                        except Exception as erreur:
-                            sondes.append({"service": c.name, "port": interne, "url": url,
-                                           "code": "non reçu", "erreur": str(erreur),
-                                           "extrait": str(erreur)})
-                            sondes[-1]["duration_seconds"] = time.time() - started
+                        # Un 301 vers le 443 du conteneur, non publié,
+                        # finissait en « Connection refused » : la chaîne est
+                        # consignée, et une cible injoignable n'est pas une
+                        # panne (#320).
+                        sonde = {"service": c.name, "port": interne, "url": url}
+                        sonde.update(sonder(url))
+                        sonde["duration_seconds"] = time.time() - started
+                        sondes.append(sonde)
         return sondes
 
     def _evaluer_services_persistants(self) -> Dict[str, Any]:
@@ -615,13 +597,12 @@ class ComposeRunner(BaseRunner):
         annoter_bruit_de_sondes(sondes)
         for sonde in sondes:
             code = sonde.get("code", "non reçu")
-            resume = f"code {code}"
             note = sonde.get("note")
             bruit = bool(note and note.startswith("échec attendu"))
             self.record_step(
                 f"Sonde {sonde['url']}",
                 command=f"GET {sonde['url']}",
-                output=(f"{resume}\n{note + chr(10) if note else ''}{sonde.get('extrait', '')}")[:500],
+                output=(f"{resume(sonde)}\n{note + chr(10) if note else ''}{sonde.get('extrait', '')}")[:500],
                 # Une sonde qui reçoit un code HTTP a atteint le service : la
                 # qualité de la réponse est l'affaire du barème, pas de l'étape.
                 # Un échec attendu (mauvais schéma sur ce port) ne compte pas
@@ -680,12 +661,7 @@ class ComposeRunner(BaseRunner):
         chemins = chemins_nginx_declares(self.eval_dir)
         if not chemins:
             return []
-        import ssl
-        import urllib.request
-        import urllib.error
-        contexte = ssl.create_default_context()
-        contexte.check_hostname = False
-        contexte.verify_mode = ssl.CERT_NONE
+        contexte = contexte_tls_permissif()
         bases = [
             s for s in sondes_racine
             if "nginx" in str(s.get("service", "")).lower()
@@ -699,22 +675,13 @@ class ComposeRunner(BaseRunner):
                 url = f"{racine_url}{chemin}"
                 started = time.time()
                 sonde = {"service": base["service"], "port": base["port"], "url": url}
-                try:
-                    reponse = urllib.request.urlopen(url, timeout=10, context=contexte)
-                    sonde.update(code=reponse.status,
-                                 extrait=reponse.read(200).decode("utf-8", "replace"))
-                except urllib.error.HTTPError as erreur:
-                    sonde.update(code=erreur.code,
-                                 entetes=dict(erreur.headers) if "WWW-Authenticate" in erreur.headers else None,
-                                 extrait=erreur.read(300).decode("utf-8", "replace"))
-                except Exception as erreur:
-                    sonde.update(code="non reçu", erreur=str(erreur), extrait=str(erreur))
+                sonde.update(sonder(url, contexte=contexte))
                 sonde["duration_seconds"] = time.time() - started
                 code = sonde.get("code")
                 self.record_step(
                     f"Sonde {url}",
                     command=f"GET {url}",
-                    output=f"code {code}\n{sonde.get('extrait', '')}"[:500],
+                    output=f"{resume(sonde)}\n{sonde.get('extrait', '')}"[:500],
                     exit_code=0 if isinstance(code, int) else 1,
                     duration=sonde["duration_seconds"],
                 )
@@ -741,23 +708,14 @@ class ComposeRunner(BaseRunner):
                         started = time.time()
                         sonde_auth = {"service": base["service"], "port": base["port"],
                                       "url": url, "auth": True, "source_identifiants": source}
-                        try:
-                            requete = urllib.request.Request(
-                                url, headers={"Authorization": f"Basic {jeton}"})
-                            reponse = urllib.request.urlopen(requete, timeout=10, context=contexte)
-                            sonde_auth.update(code=reponse.status,
-                                              extrait=reponse.read(200).decode("utf-8", "replace"))
-                        except urllib.error.HTTPError as erreur:
-                            sonde_auth.update(code=erreur.code,
-                                              extrait=erreur.read(300).decode("utf-8", "replace"))
-                        except Exception as erreur:
-                            sonde_auth.update(code="non reçu", erreur=str(erreur), extrait=str(erreur))
+                        sonde_auth.update(sonder(url, entetes={"Authorization": f"Basic {jeton}"},
+                                                 contexte=contexte))
                         sonde_auth["duration_seconds"] = time.time() - started
                         code_auth = sonde_auth.get("code")
                         self.record_step(
                             f"Sonde authentifiée {url} (identifiants {source})",
                             command=f"GET {url} avec Authorization: Basic (identifiants {source})",
-                            output=f"code {code_auth}\n{sonde_auth.get('extrait', '')}"[:500],
+                            output=f"{resume(sonde_auth)}\n{sonde_auth.get('extrait', '')}"[:500],
                             exit_code=0 if isinstance(code_auth, int) else 1,
                             duration=sonde_auth["duration_seconds"],
                         )
@@ -784,17 +742,8 @@ class ComposeRunner(BaseRunner):
                 started = time.time()
                 sonde = {"service": base["service"], "port": base["port"], "url": url,
                          "auth": bool(requete["identifiants"]), "declared": True}
-                try:
-                    req = urllib.request.Request(url, data=corps, headers=entetes,
-                                                 method=requete["methode"])
-                    reponse = urllib.request.urlopen(req, timeout=15, context=contexte)
-                    sonde.update(code=reponse.status,
-                                 extrait=reponse.read(200).decode("utf-8", "replace"))
-                except urllib.error.HTTPError as erreur:
-                    sonde.update(code=erreur.code,
-                                 extrait=erreur.read(300).decode("utf-8", "replace"))
-                except Exception as erreur:
-                    sonde.update(code="non reçu", erreur=str(erreur), extrait=str(erreur))
+                sonde.update(sonder(url, entetes=entetes, corps=corps, methode=requete["methode"],
+                                    timeout=15, contexte=contexte))
                 sonde["duration_seconds"] = time.time() - started
                 code = sonde.get("code")
                 self.record_step(
@@ -802,7 +751,7 @@ class ComposeRunner(BaseRunner):
                     command=f"{requete['methode']} {url}"
                             + (" + corps JSON" if corps else "")
                             + (" + Authorization Basic" if requete["identifiants"] else ""),
-                    output=f"code {code}\n{sonde.get('extrait', '')}"[:500],
+                    output=f"{resume(sonde)}\n{sonde.get('extrait', '')}"[:500],
                     exit_code=0 if isinstance(code, int) else 1,
                     duration=sonde["duration_seconds"],
                 )
