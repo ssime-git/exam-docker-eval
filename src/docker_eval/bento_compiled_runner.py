@@ -67,6 +67,13 @@ class BentoCompiledRunner(BaseRunner):
         self.credentials_in_tests = False
 
     def run_evaluation(self) -> Dict[str, Any]:
+        """Évaluer, et rendre la trace avec le résultat : aucun retour de ce
+        runner ne portait `steps`, l'environnement compris (#322)."""
+        resultat = self._evaluer()
+        resultat.setdefault("steps", self.steps)
+        return resultat
+
+    def _evaluer(self) -> Dict[str, Any]:
         """
         Execute BentoML compiled evaluation.
 
@@ -85,6 +92,8 @@ class BentoCompiledRunner(BaseRunner):
         """
         self._log_execution_start()
         self.record_submission_step()
+        # pytest tourne en `uvx` sans --python : le Python par défaut de uv.
+        self.consigner_environnement(None)
 
         bento_extracted = False
         image_built = False
@@ -149,6 +158,14 @@ class BentoCompiledRunner(BaseRunner):
             self.container.start()
             container_started = True
             self.logger.info("✓ Container started successfully")
+            try:
+                from .environnement import limites
+                self.completer_environnement([
+                    f"image de l'apprenant : {self.image_name}, construite depuis le .bento, exécutée en natif",
+                    f"limites du conteneur : {limites(self.container.get_wrapped_container().attrs)}",
+                ])
+            except Exception as exc:
+                self.logger.debug(f"Environnement non complété : {exc}")
 
             host_port = (
                 BENTOML_PORT

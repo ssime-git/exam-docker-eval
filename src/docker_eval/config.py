@@ -32,6 +32,11 @@ API_STARTUP_TIMEOUT = _seconds("EXAM_API_STARTUP_TIMEOUT", 60)
 # lentement. Les delais HTTP sont multiplies par ce facteur quand on emule.
 EMULATION_TIMEOUT_FACTOR = _seconds("EXAM_EMULATION_TIMEOUT_FACTOR", 6)
 
+# Python des tests et des dependances de la copie (runner bentoml : uvx
+# --python). Consigne tel quel dans l'etape « Environnement du harnais » :
+# une copie qui exige un autre Python ne doit pas en porter la faute (#322).
+PYTHON_TESTS = "3.11"
+
 # Resource limits
 MAX_MEMORY = "2g"  # 2GB memory limit per container
 MAX_CPUS = "1.0"  # 1 CPU core
