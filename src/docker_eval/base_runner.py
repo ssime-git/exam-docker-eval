@@ -145,15 +145,19 @@ class BaseRunner(ABC):
         exit_code=None,
         note: str = "",
         duration=None,
+        **champs,
     ) -> None:
         """Consigner une etape de l'evaluation.
 
         `title` est ce qu'on cherchait a faire, en une ligne lisible.
         `command` est ce qui a reellement ete lance, `output` ce que ca a rendu.
         `note` est la remarque a afficher au relecteur avant la commande.
+        `champs` ajoute des cles lues par les consommateurs (ex. `verdict`
+        d'une etape Hypothese, `hypotheses_restantes` du verdict).
         """
         self.steps.append(
             {
+                **champs,
                 "title": title,
                 "command": command,
                 "output": output,

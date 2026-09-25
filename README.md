@@ -43,11 +43,14 @@ Une hypothèse porte un test et deux prédictions :
 - **Le test** est une action de lecture, bornée aux conteneurs de la copie : `sonde`, `logs`, `exec` (liste noire d'écriture), `fichier`, `dns` (`getent hosts` dans le conteneur, puis son `resolv.conf`), `ports` (`ss -ltn`, sinon `netstat`, sinon `/proc/net/tcp` décodé), `env` (`docker inspect`, valeurs des clés contenant KEY, TOKEN, SECRET ou PASS masquées).
 - **Une prédiction** combine `code` (HTTP), `exit_code`, `contient` et `ne_contient_pas`. Les sous-chaînes sont cherchées dans la sortie complète, pas dans l'extrait affiché.
 - **Hypothèse rejetée, non exécutée** : `faute` absente, test qui n'est pas une lecture, ou prédictions qui peuvent être vraies ensemble.
-- **Verdict mécanique** : `établie` si seule `si_vraie` tient, `réfutée` si seule `si_fausse` tient, `non tranchée` sinon. Une donnée absente ou un refus du harnais donne toujours `non tranchée`.
+- **Verdict mécanique** : `établie` si seule `si_vraie` tient, `réfutée` si seule `si_fausse` tient, `non tranchée` sinon. Plusieurs cas donnent toujours `non tranchée` : une donnée absente, un refus du harnais, une erreur du démon docker (conteneur arrêté), une absence cherchée dans une lecture tronquée à la source (logs au plafond de `--tail`, fichier ou corps HTTP trop longs).
 
-Chaque expérience devient une étape « Hypothèse H1 — énoncé ». La première hypothèse établie donne la `cause` et la `faute` du verdict, sans passer par le scoreur de #307. Sinon le verdict est « cause : non établie », `faute: indetermine`, et le révélable se réduit au symptôme observé. Un verdict direct `{"action":"verdict",…}` reste accepté et passe par le scoreur comme avant.
+La première hypothèse établie donne la `cause` et la `faute` du verdict, sans passer par le scoreur de #307. Sinon le verdict est « cause non établie », `faute: indetermine`, et le révélable se réduit au symptôme observé. Un verdict direct `{"action":"verdict",…}` reste accepté et passe par le scoreur comme avant.
 
-La sortie de l'étape « Investigation — verdict » se termine toujours par un bloc ` ```json ` (scriptorium #338 et pi-corrector #337 le lisent) :
+### Contrat des étapes (lu par scriptorium#340)
+
+- **Étape d'expérience** : titre `Hypothèse H<n> — <énoncé>`, `command` = le test exécuté. La sortie contient une ligne `résultat : code=… exit_code=…`, puis les lignes correspondant aux sous-chaînes prédites. Elle finit par `verdict : établie | réfutée | non tranchée`. La clé `verdict` de l'étape porte la même valeur. Une hypothèse rejetée a aussi son étape, avec le verdict `non tranchée`.
+- **Étape `Investigation — verdict`** : sans cause établie, la sortie contient `cause non établie`. Dans tous les cas, elle se termine par un bloc ` ```json ` d'une seule ligne. Les clés `statut` et `hypotheses_restantes` de l'étape reprennent les valeurs du bloc. Le consommateur prend le dernier bloc ` ```json ` (scriptorium #338, pi-corrector #337).
 
 ```json
 {"version": 1,
@@ -59,13 +62,18 @@ La sortie de l'étape « Investigation — verdict » se termine toujours par un
  "hypotheses_restantes": [{"id": "H2", "enonce": "…", "faute": "…",
                            "resultat": "non_tranchee | rejetee",
                            "raison_rejet": "si rejetee",
-                           "experiences": [{"test": "…", "si_vraie": {}, "si_fausse": {},
-                                            "resultat": {"code": 500, "exit_code": null, "extrait": "…"},
-                                            "verdict": "non_tranchee"}]}],
+                           "experiences": [{"test": "GET http://127.0.0.1:8080/predict",
+                                            "prediction": {"si_vraie": {"code": 401}, "si_fausse": {"code": 200}},
+                                            "resultat": "code=500 exit_code=-",
+                                            "verdict": "non_tranchee",
+                                            "mesures": {"code": 500, "exit_code": null, "tronquee": false,
+                                                        "fiable": true, "correspondances": [], "extrait": "…"}}]}],
  "hypotheses_refutees": ["même forme, resultat refutee"]}
 ```
 
-Le consommateur prend le dernier bloc ` ```json ` de la sortie. Budget : `PI_CORRECTOR_INVESTIGATE_MAX_ACTIONS` (6) et `PI_CORRECTOR_INVESTIGATE_TIMEOUT_SECONDS` (240). Chaque test d'hypothèse compte pour une action, et chaque étape Hypothèse porte sa durée.
+`hypotheses_restantes` regroupe les hypothèses non tranchées et les rejetées. Une hypothèse avec `experiences: []` est une piste non testée. Les réfutées sont dans `hypotheses_refutees`.
+
+Budget : `PI_CORRECTOR_INVESTIGATE_MAX_ACTIONS` (6) et `PI_CORRECTOR_INVESTIGATE_TIMEOUT_SECONDS` (240). Chaque test d'hypothèse compte pour une action, et chaque étape Hypothèse porte sa durée.
 
 ## Contrat de ligne de commande
 

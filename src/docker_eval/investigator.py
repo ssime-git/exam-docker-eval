@@ -33,12 +33,20 @@ test (une action du budget) et compare :
 - établie : si_vraie tient et si_fausse ne tient pas ;
 - réfutée : si_fausse tient et si_vraie ne tient pas ;
 - non tranchée : tout le reste, y compris une donnée absente (pas de code
-  HTTP sur un « non reçu », pas de code de sortie sur une lecture de
-  fichier) et un refus du harnais (« refusé : … », « échec de l'action »),
-  qui n'est jamais une observation.
+  HTTP sur un « non reçu »), un refus du harnais (« refusé : … », « échec
+  de l'action ») et une erreur du démon docker (conteneur arrêté ou absent :
+  son code de retour n'est pas celui de la commande), qui ne sont jamais des
+  observations. Sur une lecture tronquée à la source (fichier au-delà de
+  LECTURE_FICHIER_MAX, corps HTTP au-delà de LECTURE_SONDE_MAX, logs au
+  plafond de --tail), une présence se prouve encore, une absence non.
 
-Chaque expérience devient une étape « Hypothèse H1 — <énoncé> » : test,
-prédictions, résultat brut, verdict mécanique. La première hypothèse
+Chaque expérience devient une étape (contrat lu par scriptorium#340) :
+titre « Hypothèse H<n> — <énoncé> », `command` = le test exécuté, une
+sortie avec les prédictions, une ligne « résultat : <code=… exit_code=…> »,
+les lignes qui contiennent les sous-chaînes prédites, l'extrait brut, et
+une dernière ligne « verdict : établie | réfutée | non tranchée ». La clé
+`verdict` de l'étape porte la même valeur. Une hypothèse rejetée a aussi
+son étape, avec le verdict « non tranchée ». La première hypothèse
 établie clôt l'investigation. Son énoncé devient la `cause`, et sa `faute`
 celle du verdict. Le scoreur de #307 n'est pas sollicité, et l'étape
 « Investigation — vérification du verdict » le consigne.
@@ -66,7 +74,8 @@ Un verdict `faute: indetermine`, un budget épuisé ou une investigation
 interrompue après des hypothèses donnent « cause : non établie »,
 `faute: indetermine` et un `revelable` réduit au symptôme observé.
 
-Sortie de l'étape « Investigation — verdict ». D'abord les lignes lisibles
+Sortie de l'étape « Investigation — verdict ». Sans cause établie, elle
+commence par la ligne « cause non établie ». Ensuite viennent les lignes lisibles
 (`cause : …`, `faute : …`, `révélable au feedback : …`, `à ne pas
 révéler : …`, puis la liste des hypothèses et de leurs expériences). Elle
 se termine TOUJOURS par un bloc JSON pour les consommateurs (scriptorium
@@ -85,10 +94,17 @@ se termine TOUJOURS par un bloc JSON pour les consommateurs (scriptorium
     <hypothèse> = {"id": str, "enonce": str, "faute": str,
                    "resultat": "non_tranchee" | "rejetee" | "refutee" | "etablie",
                    "raison_rejet": str (si rejetee),
-                   "experiences": [{"test": str, "si_vraie": {…}, "si_fausse": {…},
-                                    "resultat": {"code": int|null, "exit_code": int|null,
-                                                 "extrait": str},
-                                    "verdict": "etablie" | "refutee" | "non_tranchee"}]}
+                   "experiences": [<expérience>]}   # [] : piste non testée
+    <expérience> = {"test": str,
+                    "prediction": {"si_vraie": {…}, "si_fausse": {…}},
+                    "resultat": "code=405 exit_code=-",   # résultat brut court
+                    "verdict": "etablie" | "refutee" | "non_tranchee",
+                    "mesures": {"code": int|null, "exit_code": int|null,
+                                "tronquee": bool, "fiable": bool,
+                                "correspondances": [str], "extrait": str}}
+
+Le bloc tient sur une ligne entre ```json et ```. L'étape porte aussi les
+clés `statut` et `hypotheses_restantes`, qui ont les mêmes valeurs que dans le bloc.
 
 `cause_etablie` : une hypothèse établie mécaniquement. `cause_scoree` :
 verdict direct accepté par le scoreur. `cause_non_verifiee` : verdict
@@ -137,6 +153,14 @@ TIMEOUT_TOTAL_SECONDES = 240
 SORTIE_MAX = 2000
 # Extrait du résultat brut gardé par expérience dans le bloc JSON.
 EXTRAIT_MAX = 300
+# Lectures intégrales comparées aux prédictions (l'affichage reste à
+# SORTIE_MAX) : au-delà, la lecture est tronquée et une absence ne se prouve
+# plus.
+LECTURE_FICHIER_MAX = 200_000
+LECTURE_SONDE_MAX = 65_536
+# Erreurs du CLI docker (conteneur arrêté, absent, binaire manquant) : leur
+# code de retour n'est pas celui de la commande dans le conteneur.
+_ERREURS_DOCKER = ("Error response from daemon", "No such container", "OCI runtime exec failed")
 
 # Vérificateur du verdict (#307). Prompt et verdicts recopiés de
 # scriptorium/tools/verification.py : le seuil vient d'un banc mesuré avec eux.
@@ -180,12 +204,13 @@ PROMPT_SYSTEME = """Tu investigues l'échec d'une évaluation d'examen pendant q
 Tu réponds UNIQUEMENT par du JSON (un objet, ou une liste d'hypothèses), sans texte autour.
 
 Méthode attendue : le débogage par hypothèse. Tu conçois l'expérience ; le harnais l'exécute et la juge.
-{"action":"hypothese","id":"H1","enonce":"<cause supposée>","faute":"apprenant|harnais|indetermine","test":{<une action de lecture ci-dessous>},"si_vraie":{<prédiction>},"si_fausse":{<prédiction>}}
+{"action":"hypothese","id":"H1","enonce":"<cause supposée>","faute":"apprenant|harnais|indetermine","test":{<une action de lecture ci-dessous>},"si_vraie":{<prédiction>},"si_fausse":{<prédiction>},"revelable":"<ce que le feedback pourra dire si elle est établie : symptôme, où chercher>","non_revelable":"<la solution, à ne jamais donner>"}
 Une prédiction combine (ET) : "code" (code HTTP, entier ou liste), "exit_code" (entier ou liste),
 "contient" / "ne_contient_pas" (sous-chaîne ou liste). Les deux prédictions doivent s'exclure : codes
 différents, exit_code différents, ou "contient":"X" face à "ne_contient_pas":"Y" avec Y inclus dans X.
 Sinon l'hypothèse est rejetée sans être exécutée. "faute" est obligatoire : celle qui vaut si l'hypothèse
-est établie. Le harnais répond établie, réfutée ou non tranchée. La première hypothèse établie devient la
+est établie. "revelable" et "non_revelable" servent au verdict si elle est établie : l'énoncé seul
+peut contenir la solution. Le harnais répond établie, réfutée ou non tranchée. La première hypothèse établie devient la
 cause du verdict : tu n'as rien d'autre à faire. Réfutée ou non tranchée : propose une autre expérience.
 Tu peux envoyer plusieurs hypothèses d'un coup dans une liste JSON ; chaque test coûte une action.
 
@@ -271,15 +296,20 @@ class Observation(str):
     `code` (HTTP) et `exit_code` valent None quand l'action ne les produit
     pas. `integrale` est la sortie avant troncature d'affichage : les
     prédictions portent sur elle. `fiable` est faux quand le harnais n'a rien
-    observé (refus, erreur). Une `str` nue rendue par une action se lit comme
-    une Observation sans code ni code de sortie."""
+    observé (refus, erreur du démon docker). `tronquee` est vrai quand la
+    lecture elle-même s'est arrêtée avant la fin (fichier plus long, corps
+    HTTP plus long, logs au plafond de --tail) : une absence n'y prouve rien.
+    Une `str` nue rendue par une action se lit comme une Observation sans
+    code ni code de sortie."""
 
-    def __new__(cls, texte, code=None, exit_code=None, integrale=None, fiable=True):
+    def __new__(cls, texte, code=None, exit_code=None, integrale=None, fiable=True,
+                tronquee=False):
         obs = super().__new__(cls, texte)
         obs.code = code
         obs.exit_code = exit_code
         obs.integrale = str(texte) if integrale is None else integrale
         obs.fiable = fiable
+        obs.tronquee = tronquee
         return obs
 
 
@@ -288,7 +318,8 @@ def _lire(obs) -> dict:
     return {"code": getattr(obs, "code", None),
             "exit_code": getattr(obs, "exit_code", None),
             "integrale": getattr(obs, "integrale", texte),
-            "fiable": getattr(obs, "fiable", not texte.startswith(_NON_OBSERVATIONS))}
+            "fiable": getattr(obs, "fiable", not texte.startswith(_NON_OBSERVATIONS)),
+            "tronquee": getattr(obs, "tronquee", False)}
 
 
 def _liste(valeur) -> list:
@@ -327,16 +358,20 @@ def predictions_disjointes(a: dict, b: dict) -> bool:
 
 
 def evaluer_prediction(prediction: dict, lu: dict):
-    """True, False, ou None quand une donnée comparée manque."""
+    """True, False, ou None quand une donnée comparée manque. Sur une lecture
+    tronquée, une présence se prouve encore, une absence non."""
+    inconnu_si_tronque = None if lu.get("tronquee") else False
     resultats = []
     for cle, attendu in prediction.items():
         if cle in ("code", "exit_code"):
             obtenu = lu[cle]
             resultats.append(None if obtenu is None else obtenu in _liste(attendu))
         elif cle == "contient":
-            resultats.append(all(s in lu["integrale"] for s in _liste(attendu)))
+            presents = all(s in lu["integrale"] for s in _liste(attendu))
+            resultats.append(True if presents else inconnu_si_tronque)
         else:
-            resultats.append(all(s not in lu["integrale"] for s in _liste(attendu)))
+            present = any(s in lu["integrale"] for s in _liste(attendu))
+            resultats.append(False if present else (None if lu.get("tronquee") else True))
     if False in resultats:
         return False
     if None in resultats:
@@ -358,6 +393,20 @@ def verdict_mecanique(si_vraie: dict, si_fausse: dict, lu: dict) -> str:
 
 _LIBELLES = {"etablie": "établie", "refutee": "réfutée",
              "non_tranchee": "non tranchée", "rejetee": "rejetée"}
+
+
+def correspondances(predictions: list, integrale: str, par_motif: int = 3) -> list:
+    """Les lignes qui contiennent les sous-chaînes prédites : la preuve d'un
+    « contient » reste citable même quand l'affichage garde la fin."""
+    motifs = []
+    for prediction in predictions:
+        for cle in ("contient", "ne_contient_pas"):
+            motifs += [m for m in _liste(prediction.get(cle, [])) if m not in motifs]
+    lignes = []
+    for motif in motifs:
+        trouvees = [ligne.strip()[:200] for ligne in integrale.splitlines() if motif in ligne]
+        lignes += [ligne for ligne in trouvees[:par_motif] if ligne not in lignes]
+    return lignes
 
 
 def masquer_env(lignes: list) -> list:
@@ -449,10 +498,13 @@ class Investigator:
             entetes["Authorization"] = "Basic " + base64.b64encode(identifiants.encode()).decode()
         # Même règle que les sondes du runner : la chaîne de redirections est
         # consignée, une cible injoignable n'est pas une panne (#320).
-        sonde = sonder(url, entetes=entetes, taille_extrait=400)
+        sonde = sonder(url, entetes=entetes, taille_extrait=LECTURE_SONDE_MAX)
         if not isinstance(sonde["code"], int):
             return Observation(f"non reçu : {sonde['erreur']}")
-        return Observation(f"{resume(sonde)}\n{sonde['extrait']}", code=sonde["code"])
+        corps = sonde["extrait"]
+        return Observation(f"{resume(sonde)}\n{corps[:400]}", code=sonde["code"],
+                           integrale=f"{resume(sonde)}\n{corps}",
+                           tronquee=len(corps.encode()) >= LECTURE_SONDE_MAX)
 
     def _hors_perimetre(self, service: str):
         if service not in self.services:
@@ -460,19 +512,26 @@ class Investigator:
         return None
 
     @staticmethod
-    def _sortie(resultat, vide: str) -> Observation:
+    def _sortie(resultat, vide: str, tronquee: bool = False) -> Observation:
         integrale = (resultat.stdout or "") + (resultat.stderr or "")
+        # Conteneur arrêté ou absent : le code est celui du CLI docker, pas
+        # de la commande. Ce n'est pas une observation de la copie.
+        erreur_docker = any(e in (resultat.stderr or "") for e in _ERREURS_DOCKER)
         return Observation(integrale[-SORTIE_MAX:] or vide,
-                           exit_code=resultat.returncode, integrale=integrale)
+                           exit_code=None if erreur_docker else resultat.returncode,
+                           integrale=integrale, fiable=not erreur_docker, tronquee=tronquee)
 
     def _logs(self, service: str, lignes: int) -> str:
         refus = self._hors_perimetre(service)
         if refus is not None:
             return refus
+        plafond = min(int(lignes or 50), 200)
         resultat = subprocess.run(
-            ["docker", "logs", "--tail", str(min(int(lignes or 50), 200)), service],
+            ["docker", "logs", "--tail", str(plafond), service],
             capture_output=True, text=True, timeout=20)
-        return self._sortie(resultat, "(logs vides)")
+        # Au plafond de --tail, le début des logs manque peut-être.
+        lues = ((resultat.stdout or "") + (resultat.stderr or "")).count("\n")
+        return self._sortie(resultat, "(logs vides)", tronquee=lues >= plafond)
 
     def _exec(self, service: str, commande: str) -> str:
         refus = self._hors_perimetre(service)
@@ -493,7 +552,10 @@ class Investigator:
         if not os.path.isfile(cible):
             return Observation("fichier introuvable", exit_code=1)
         with open(cible, encoding="utf-8", errors="replace") as lecteur:
-            return Observation(lecteur.read(SORTIE_MAX), exit_code=0)
+            contenu = lecteur.read(LECTURE_FICHIER_MAX)
+            reste = lecteur.read(1)
+        return Observation(contenu[:SORTIE_MAX], exit_code=0, integrale=contenu,
+                           tronquee=bool(reste))
 
     def _dns(self, service: str, nom: str) -> str:
         """getent hosts dans le conteneur, puis son resolv.conf (un `dns:`
@@ -606,7 +668,13 @@ class Investigator:
 
     def _tester_hypothese(self, demande: dict):
         """Rend (fiche, message pour le LLM). Une hypothèse rejetée n'est pas
-        exécutée ; une hypothèse testée compte comme une action."""
+        exécutée ; une hypothèse testée compte comme une action.
+
+        Contrat de l'étape (lu par scriptorium#340) : titre « Hypothèse H<n> —
+        <énoncé> », `command` = le test, une ligne « résultat : … » et une
+        ligne « verdict : établie | réfutée | non tranchée », et la clé
+        `verdict` de même valeur. Une hypothèse rejetée, jamais exécutée, a le
+        verdict « non tranchée »."""
         fiche = self._fiche(demande)
         titre = f"Hypothèse {fiche['id']} — {fiche['enonce'] or '(sans énoncé)'}"[:200]
         rejet = self._rejet(demande)
@@ -614,21 +682,31 @@ class Investigator:
             if not fiche["experiences"]:
                 fiche["resultat"] = "rejetee"
                 fiche["raison_rejet"] = rejet
-            self.runner.record_step(titre, output=f"hypothèse rejetée, non exécutée : {rejet}",
-                                    exit_code=0)
+            self.runner.record_step(
+                titre, output=(f"hypothèse rejetée, non exécutée : {rejet}\n"
+                               "résultat : non exécutée\n"
+                               f"verdict : {_LIBELLES['non_tranchee']}"),
+                exit_code=0, verdict=_LIBELLES["non_tranchee"])
             return fiche, f"{fiche['id']} : rejetée, non exécutée — {rejet}"
         debut = time.time()
         commande, observation = self._executer(demande["test"])
         lu = _lire(observation)
         verdict = verdict_mecanique(demande["si_vraie"], demande["si_fausse"], lu)
         affiche = str(observation)[:SORTIE_MAX]
+        lignes = correspondances([demande["si_vraie"], demande["si_fausse"]], lu["integrale"])
+        brut = (f"code={self._val(lu['code'])} exit_code={self._val(lu['exit_code'])}"
+                + (" (lecture tronquée : une absence n'y prouve rien)" if lu["tronquee"] else "")
+                + ("" if lu["fiable"] else " (le harnais n'a rien observé)"))
         fiche["resultat"] = verdict
         fiche["experiences"].append({
-            "test": commande, "si_vraie": demande["si_vraie"], "si_fausse": demande["si_fausse"],
-            "resultat": {"code": lu["code"], "exit_code": lu["exit_code"],
-                         "extrait": affiche[-EXTRAIT_MAX:]},
-            "verdict": verdict})
-        brut = f"code={self._val(lu['code'])} exit_code={self._val(lu['exit_code'])}"
+            "test": commande,
+            "prediction": {"si_vraie": demande["si_vraie"], "si_fausse": demande["si_fausse"]},
+            "resultat": brut,
+            "verdict": verdict,
+            "mesures": {"code": lu["code"], "exit_code": lu["exit_code"],
+                        "tronquee": lu["tronquee"], "fiable": lu["fiable"],
+                        "correspondances": lignes, "extrait": affiche[-EXTRAIT_MAX:]}})
+        preuve = ("lignes correspondantes :\n" + "\n".join(lignes) + "\n") if lignes else ""
         self.runner.record_step(
             titre, command=commande,
             output=(f"faute si établie : {fiche['faute']}\n"
@@ -636,12 +714,12 @@ class Investigator:
                     f"si vraie : {json.dumps(demande['si_vraie'], ensure_ascii=False)}\n"
                     f"si fausse : {json.dumps(demande['si_fausse'], ensure_ascii=False)}\n"
                     f"résultat : {brut}\n"
-                    + ("" if lu["fiable"] else "le harnais n'a rien observé : non tranchable\n")
-                    + f"sortie :\n{affiche}\n"
-                    f"verdict mécanique : {_LIBELLES[verdict]}"),
-            exit_code=0, duration=time.time() - debut)
-        self._observations.append((titre, commande, affiche))
-        return fiche, (f"{fiche['id']} : {_LIBELLES[verdict]} ({brut})\n"
+                    f"{preuve}"
+                    f"sortie :\n{affiche}\n"
+                    f"verdict : {_LIBELLES[verdict]}"),
+            exit_code=0, duration=time.time() - debut, verdict=_LIBELLES[verdict])
+        self._observations.append((titre, commande, preuve + affiche))
+        return fiche, (f"{fiche['id']} : {_LIBELLES[verdict]} ({brut})\n{preuve}"
                        f"sortie :\n{affiche}")
 
     @staticmethod
@@ -840,6 +918,8 @@ class Investigator:
                            exit_code: int = 0) -> None:
         cause = verdict.get("cause")
         lignes = [entete] if entete else []
+        if statut == "cause_non_etablie" and "cause non établie" not in entete:
+            lignes.append("cause non établie")
         lignes += [f"cause : {'non établie' if cause is None else cause}",
                    f"faute : {verdict.get('faute')}",
                    f"révélable au feedback : {verdict.get('revelable')}",
@@ -852,9 +932,7 @@ class Investigator:
                               f"{_LIBELLES.get(fiche.get('resultat'), fiche.get('resultat'))}"
                               + (f" ({fiche['raison_rejet']})" if fiche.get("raison_rejet") else ""))
                 for experience in fiche["experiences"]:
-                    resultat = experience["resultat"]
-                    lignes.append(f"    · {experience['test']} → code={self._val(resultat['code'])} "
-                                  f"exit_code={self._val(resultat['exit_code'])} : "
+                    lignes.append(f"    · {experience['test']} → {experience['resultat']} : "
                                   f"{_LIBELLES[experience['verdict']]}")
 
         def publique(fiche):
@@ -873,10 +951,14 @@ class Investigator:
                                          if f.get("resultat") in ("non_tranchee", "rejetee")],
                 "hypotheses_refutees": [publique(f) for f in fiches
                                         if f.get("resultat") == "refutee"]}
+        # Une seule ligne entre les délimiteurs : moins fragile si un rendu
+        # aval coupe ou replie la sortie.
         lignes.append("bilan des hypothèses (JSON) :\n```json\n"
-                      + json.dumps(bloc, ensure_ascii=False, indent=2) + "\n```")
+                      + json.dumps(bloc, ensure_ascii=False) + "\n```")
         self.runner.record_step("Investigation — verdict", output="\n".join(lignes),
-                                exit_code=exit_code, duration=time.time() - debut)
+                                exit_code=exit_code, duration=time.time() - debut,
+                                statut=statut,
+                                hypotheses_restantes=bloc["hypotheses_restantes"])
 
     def _declasser(self, verdict: dict, echecs: list, debut: float, raison: str) -> None:
         """Une cause que le vérificateur n'a pas vue établie devient une

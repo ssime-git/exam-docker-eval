@@ -32,9 +32,9 @@ class RunnerFactice:
     def __init__(self):
         self.steps = []
 
-    def record_step(self, title, command="", output="", exit_code=0, duration=None):
+    def record_step(self, title, command="", output="", exit_code=0, duration=None, **champs):
         self.steps.append({"title": title, "command": command, "output": output,
-                           "exit_code": exit_code, "duration": duration})
+                           "exit_code": exit_code, "duration": duration, **champs})
 
     def titres(self):
         return [s["title"] for s in self.steps]
@@ -120,7 +120,7 @@ def test_461451_dns_impose_etabli(tmp_path, monkeypatch):
     assert "getent hosts" in etape["command"] and "archive.ics.uci.edu" in etape["command"]
     assert "si vraie" in etape["output"] and "si fausse" in etape["output"]
     assert "nameserver 172.31.0.2" in etape["output"]
-    assert "verdict mécanique : établie" in etape["output"]
+    assert "verdict : établie" in etape["output"]
     assert etape["duration"] is not None
     # le nom passe en argument positionnel, jamais concatene au script
     argv = processus.appels[0]
@@ -149,8 +149,10 @@ def test_461451_logs_dataset_injoignable_ne_contient_pas_sur_logs_complets(tmp_p
                                services=["bike-api"])
     inv.investiguer([ECHEC_461451])
 
-    assert "verdict mécanique : établie" in runner.steps[0]["output"]
+    assert "verdict : établie" in runner.steps[0]["output"]
     assert len(runner.steps[0]["output"]) < mod.SORTIE_MAX + 1500
+    # la ligne qui prouve reste citable, meme hors de l'extrait affiche
+    assert "lignes correspondantes :\nUnable to fetch Bike Sharing dataset" in runner.steps[0]["output"]
     assert bloc_json(runner.steps[-1]["output"])["statut"] == "cause_etablie"
 
 
@@ -175,8 +177,8 @@ def test_457405_refutee_puis_autre_etablie(tmp_path, monkeypatch):
     inv.investiguer([ECHEC_457405])
 
     assert vus == ["admin:4dm1N", "admin:4dm1N"]
-    assert "verdict mécanique : réfutée" in runner.steps[0]["output"]
-    assert "verdict mécanique : établie" in runner.steps[1]["output"]
+    assert "verdict : réfutée" in runner.steps[0]["output"]
+    assert "verdict : établie" in runner.steps[1]["output"]
     # le LLM apprend la refutation du harnais, pas l'inverse
     assert "H1 : réfutée" in messages[1][-1]["content"]
     assert scoreur.appels == []
@@ -185,7 +187,7 @@ def test_457405_refutee_puis_autre_etablie(tmp_path, monkeypatch):
     bloc = bloc_json(verdict)
     assert bloc["hypothese_etablie"] == "H2"
     assert [h["id"] for h in bloc["hypotheses_refutees"]] == ["H1"]
-    assert bloc["hypotheses_refutees"][0]["experiences"][0]["resultat"]["code"] == 405
+    assert bloc["hypotheses_refutees"][0]["experiences"][0]["mesures"]["code"] == 405
 
 
 def test_plusieurs_hypotheses_dans_une_reponse(tmp_path, monkeypatch):
@@ -211,7 +213,7 @@ def test_non_tranchee_cause_non_etablie_avec_hypotheses_restantes(tmp_path, monk
     inv, runner, _ = enqueteur(tmp_path, monkeypatch, [json.dumps(h), abandon], ScoreurFactice())
     inv.investiguer([ECHEC_457405])
 
-    assert "verdict mécanique : non tranchée" in runner.steps[0]["output"]
+    assert "verdict : non tranchée" in runner.steps[0]["output"]
     verdict = runner.steps[-1]["output"]
     assert "cause : non établie" in verdict and "faute : indetermine" in verdict
     assert "ligne 12" not in verdict  # le revelable se reduit au symptome
@@ -222,7 +224,7 @@ def test_non_tranchee_cause_non_etablie_avec_hypotheses_restantes(tmp_path, monk
     assert bloc["faute"] == "indetermine"
     restante = bloc["hypotheses_restantes"][0]
     assert restante["id"] == "H1" and restante["resultat"] == "non_tranchee"
-    assert restante["experiences"][0]["resultat"]["code"] == 500
+    assert restante["experiences"][0]["mesures"]["code"] == 500
 
 
 def test_budget_epuise_au_milieu_d_une_liste(tmp_path, monkeypatch):
@@ -283,7 +285,7 @@ def test_predictions_disjointes_par_inclusion_acceptees(tmp_path, monkeypatch):
                   {"contient": "Connection refused"}, {"ne_contient_pas": "refused"})
     inv, runner, _ = enqueteur(tmp_path, monkeypatch, [json.dumps(h)], ScoreurFactice())
     inv.investiguer([ECHEC_457405])
-    assert "verdict mécanique : établie" in runner.steps[0]["output"]
+    assert "verdict : établie" in runner.steps[0]["output"]
 
 
 def test_faute_manquante_rejetee(tmp_path, monkeypatch):
@@ -311,7 +313,7 @@ def test_refus_du_harnais_jamais_une_observation(tmp_path, monkeypatch):
     inv, runner, _ = enqueteur(tmp_path, monkeypatch, [json.dumps(h), "pas du json"], ScoreurFactice())
     inv.investiguer([ECHEC_461451])
     assert "hors du périmètre" in runner.steps[0]["output"]
-    assert "verdict mécanique : non tranchée" in runner.steps[0]["output"]
+    assert "verdict : non tranchée" in runner.steps[0]["output"]
 
 
 def test_metadonnee_absente_non_tranchee(tmp_path, monkeypatch):
@@ -321,7 +323,7 @@ def test_metadonnee_absente_non_tranchee(tmp_path, monkeypatch):
                   {"code": 401}, {"code": 200})
     inv, runner, _ = enqueteur(tmp_path, monkeypatch, [json.dumps(h), "pas du json"], ScoreurFactice())
     inv.investiguer([ECHEC_457405])
-    assert "verdict mécanique : non tranchée" in runner.steps[0]["output"]
+    assert "verdict : non tranchée" in runner.steps[0]["output"]
 
 
 # --- compatibilite : verdict direct -------------------------------------------
@@ -405,7 +407,7 @@ def test_action_env_masque_les_secrets(tmp_path, monkeypatch):
         assert secret not in verdict
         assert all(secret not in m["content"] for echange in messages for m in echange)
     assert "PATH=/usr/bin" in etape and "JWT_SECRET_KEY=***" in etape
-    assert "verdict mécanique : établie" in etape
+    assert "verdict : établie" in etape
 
 
 def test_exec_liste_noire_dans_un_test_d_hypothese(tmp_path, monkeypatch):
@@ -416,7 +418,7 @@ def test_exec_liste_noire_dans_un_test_d_hypothese(tmp_path, monkeypatch):
     inv, runner, _ = enqueteur(tmp_path, monkeypatch, [json.dumps(h), "pas du json"], ScoreurFactice())
     inv.investiguer([ECHEC_461451])
     assert processus.appels == []
-    assert "verdict mécanique : non tranchée" in runner.steps[0]["output"]
+    assert "verdict : non tranchée" in runner.steps[0]["output"]
 
 
 def test_actions_de_lecture_hors_hypothese(tmp_path, monkeypatch):
@@ -435,5 +437,114 @@ def test_prompt_pousse_vers_les_hypotheses(tmp_path, monkeypatch):
     inv.investiguer([ECHEC_461451])
     systeme = messages[0][0]["content"]
     for mot in ('"action":"hypothese"', '"si_vraie"', '"si_fausse"', '"action":"dns"',
+                '"revelable"', '"non_revelable"',
                 '"action":"ports"', '"action":"env"'):
         assert mot in systeme
+
+
+# --- contrat lu par scriptorium#340 ------------------------------------------
+
+def test_contrat_des_etapes_pour_la_revue(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.Investigator, "_sonde",
+                        lambda self, url, identifiants="": mod.Observation("code 500\nboom", code=500))
+    test = {"action": "sonde", "url": "http://127.0.0.1:8080/predict"}
+    h1 = hypothese("H1", "auth manquante", test, {"code": 401}, {"code": 200})
+    h2 = hypothese("H2", "piste floue", test, {"contient": "a"}, {"contient": "b"})
+    abandon = '{"action":"verdict","cause":"non établie","faute":"indetermine","revelable":"","non_revelable":""}'
+    inv, runner, _ = enqueteur(tmp_path, monkeypatch, [json.dumps([h1, h2]), abandon], ScoreurFactice())
+    inv.investiguer([ECHEC_457405])
+
+    etape = runner.steps[0]
+    assert etape["title"] == "Hypothèse H1 — auth manquante"
+    assert etape["command"] == "GET http://127.0.0.1:8080/predict"
+    assert "\nrésultat : code=500 exit_code=-" in etape["output"]
+    assert etape["output"].endswith("\nverdict : non tranchée")
+    assert etape["verdict"] == "non tranchée"
+    rejetee = runner.steps[1]
+    assert rejetee["title"] == "Hypothèse H2 — piste floue" and rejetee["verdict"] == "non tranchée"
+
+    verdict = runner.steps[-1]
+    assert verdict["title"] == "Investigation — verdict"
+    assert "cause non établie" in verdict["output"]
+    restantes = verdict["hypotheses_restantes"]
+    assert restantes == bloc_json(verdict["output"])["hypotheses_restantes"]
+    assert [(h["id"], h["enonce"]) for h in restantes] == [("H1", "auth manquante"), ("H2", "piste floue")]
+    experience = restantes[0]["experiences"][0]
+    assert set(experience) >= {"test", "prediction", "resultat", "verdict"}
+    assert experience["prediction"] == {"si_vraie": {"code": 401}, "si_fausse": {"code": 200}}
+    assert experience["resultat"] == "code=500 exit_code=-"
+    assert restantes[1]["experiences"] == []  # piste non testee
+
+
+# --- une absence ne se prouve pas sur une lecture tronquee --------------------
+
+def _hyp_absence(test):
+    return hypothese("H1", "le dataset est arrivé", test,
+                     {"ne_contient_pas": "Unable to fetch"}, {"contient": "Unable to fetch"})
+
+
+def test_logs_au_plafond_de_tail_absence_non_tranchee(tmp_path, monkeypatch):
+    logs = "".join(f"ligne {i}\n" for i in range(50))
+    monkeypatch.setattr(mod.subprocess, "run", Processus([("docker logs", (0, logs))]))
+    h = _hyp_absence({"action": "logs", "service": "s1", "lignes": 50})
+    inv, runner, _ = enqueteur(tmp_path, monkeypatch, [json.dumps(h), "pas du json"], ScoreurFactice())
+    inv.investiguer([ECHEC_461451])
+    assert "lecture tronquée" in runner.steps[0]["output"]
+    assert runner.steps[0]["verdict"] == "non tranchée"
+
+
+def test_logs_sous_le_plafond_absence_prouvee(tmp_path, monkeypatch):
+    logs = "".join(f"ligne {i}\n" for i in range(10))
+    monkeypatch.setattr(mod.subprocess, "run", Processus([("docker logs", (0, logs))]))
+    h = _hyp_absence({"action": "logs", "service": "s1", "lignes": 50})
+    inv, runner, _ = enqueteur(tmp_path, monkeypatch, [json.dumps(h)], ScoreurFactice())
+    inv.investiguer([ECHEC_461451])
+    assert runner.steps[0]["verdict"] == "établie"
+
+
+def test_fichier_long_absence_non_tranchee_presence_prouvee(tmp_path, monkeypatch):
+    (tmp_path / "gros.log").write_text("x" * mod.LECTURE_FICHIER_MAX + "Unable to fetch")
+    (tmp_path / "debut.log").write_text("Unable to fetch\n" + "x" * mod.LECTURE_FICHIER_MAX)
+    inv = mod.Investigator(RunnerFactice(), str(tmp_path), services=[])
+    gros = mod._lire(inv._fichier("gros.log"))
+    debut = mod._lire(inv._fichier("debut.log"))
+    assert gros["tronquee"] and debut["tronquee"]
+    si_vraie, si_fausse = {"ne_contient_pas": "Unable to fetch"}, {"contient": "Unable to fetch"}
+    assert mod.verdict_mecanique(si_vraie, si_fausse, gros) == "non_tranchee"
+    assert mod.verdict_mecanique(si_vraie, si_fausse, debut) == "refutee"
+
+
+def test_sonde_corps_long_absence_non_tranchee(tmp_path, monkeypatch):
+    from docker_eval import sonde_http
+
+    def sonder(url, entetes=None, taille_extrait=300, **kwargs):
+        return {"code": 200, "extrait": "a" * taille_extrait}
+
+    monkeypatch.setattr(sonde_http, "sonder", sonder)
+    inv = mod.Investigator(RunnerFactice(), str(tmp_path), services=[])
+    obs = inv._sonde("http://127.0.0.1:8080/")
+    lu = mod._lire(obs)
+    assert lu["tronquee"] and len(str(obs)) < 500
+    assert mod.verdict_mecanique({"ne_contient_pas": "erreur"}, {"contient": "erreur"}, lu) == "non_tranchee"
+    assert mod.verdict_mecanique({"code": 200}, {"code": 500}, lu) == "etablie"
+
+
+# --- une erreur du CLI docker n'est pas un code de sortie du conteneur --------
+
+@pytest.mark.parametrize("stderr", [
+    "Error response from daemon: container 3f2a is not running",
+    "Error response from daemon: No such container: s1",
+    "OCI runtime exec failed: exec failed: unable to start container process",
+])
+def test_conteneur_arrete_non_tranchee(tmp_path, monkeypatch, stderr):
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    h = hypothese("H1", "le fichier de config manque",
+                  {"action": "exec", "service": "s1", "commande": "cat /app/config.yml"},
+                  {"exit_code": 1}, {"exit_code": 0})
+    inv, runner, _ = enqueteur(tmp_path, monkeypatch, [json.dumps(h), "pas du json"], ScoreurFactice())
+    inv.investiguer([ECHEC_461451])
+    assert runner.steps[0]["verdict"] == "non tranchée"
+    assert "le harnais n'a rien observé" in runner.steps[0]["output"]
