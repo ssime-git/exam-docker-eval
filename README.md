@@ -16,6 +16,7 @@ Il prend un rendu d'apprenant déjà extrait, l'exécute dans des conteneurs jet
 | `base_runner` | socle commun, dont la trace pas à pas |
 | `utils` | nettoyage et vérification des ressources |
 | `environnement` | faits d'environnement du harnais (Python des tests, version déclarée par la copie, images, plateforme, limites), consignés dans l'étape « Environnement du harnais » |
+| `investigator` | investigation outillée pendant que la stack tourne : débogage par hypothèse, verdict mécanique ou scoré |
 | `config` | délais, limites de ressources, codes de sortie |
 
 ## Ce qu'il garantit
@@ -25,6 +26,46 @@ Il prend un rendu d'apprenant déjà extrait, l'exécute dans des conteneurs jet
 - **Une image d'une autre architecture est exécutée sous émulation** si `binfmt_misc` expose des gestionnaires QEMU. Un apprenant qui construit sur un Mac Apple Silicon n'est pas pénalisé.
 - **Un échec est attribué** : `apprenant`, `systeme`, ou `indetermine`. Dans le doute on ne tranche pas — un REPASS envoyé sur une supposition est irréversible.
 - **Le temps rapporté est le temps écoulé**, jamais le délai configuré.
+
+## Investigation par hypothèse (scriptorium #336)
+
+Quand une étape du runner compose échoue, un LLM enquête pendant que la stack tourne encore. Il conçoit des expériences et le harnais les juge. Le LLM ne décide jamais du résultat.
+
+Une hypothèse porte un test et deux prédictions :
+
+```json
+{"action":"hypothese","id":"H1","enonce":"le DNS imposé ne résout pas l'hôte du dataset",
+ "faute":"apprenant",
+ "test":{"action":"dns","service":"bike-api","nom":"archive.ics.uci.edu"},
+ "si_vraie":{"exit_code":2},"si_fausse":{"exit_code":0}}
+```
+
+- **Le test** est une action de lecture, bornée aux conteneurs de la copie : `sonde`, `logs`, `exec` (liste noire d'écriture), `fichier`, `dns` (`getent hosts` dans le conteneur, puis son `resolv.conf`), `ports` (`ss -ltn`, sinon `netstat`, sinon `/proc/net/tcp` décodé), `env` (`docker inspect`, valeurs des clés contenant KEY, TOKEN, SECRET ou PASS masquées).
+- **Une prédiction** combine `code` (HTTP), `exit_code`, `contient` et `ne_contient_pas`. Les sous-chaînes sont cherchées dans la sortie complète, pas dans l'extrait affiché.
+- **Hypothèse rejetée, non exécutée** : `faute` absente, test qui n'est pas une lecture, ou prédictions qui peuvent être vraies ensemble.
+- **Verdict mécanique** : `établie` si seule `si_vraie` tient, `réfutée` si seule `si_fausse` tient, `non tranchée` sinon. Une donnée absente ou un refus du harnais donne toujours `non tranchée`.
+
+Chaque expérience devient une étape « Hypothèse H1 — énoncé ». La première hypothèse établie donne la `cause` et la `faute` du verdict, sans passer par le scoreur de #307. Sinon le verdict est « cause : non établie », `faute: indetermine`, et le révélable se réduit au symptôme observé. Un verdict direct `{"action":"verdict",…}` reste accepté et passe par le scoreur comme avant.
+
+La sortie de l'étape « Investigation — verdict » se termine toujours par un bloc ` ```json ` (scriptorium #338 et pi-corrector #337 le lisent) :
+
+```json
+{"version": 1,
+ "statut": "cause_etablie | cause_scoree | cause_non_verifiee | cause_non_etablie",
+ "cause": "… ou null", "piste": "cause d'un verdict direct déclassé, ou null",
+ "faute": "apprenant | harnais | indetermine",
+ "revelable": "…", "non_revelable": "…",
+ "hypothese_etablie": "H1 ou null",
+ "hypotheses_restantes": [{"id": "H2", "enonce": "…", "faute": "…",
+                           "resultat": "non_tranchee | rejetee",
+                           "raison_rejet": "si rejetee",
+                           "experiences": [{"test": "…", "si_vraie": {}, "si_fausse": {},
+                                            "resultat": {"code": 500, "exit_code": null, "extrait": "…"},
+                                            "verdict": "non_tranchee"}]}],
+ "hypotheses_refutees": ["même forme, resultat refutee"]}
+```
+
+Le consommateur prend le dernier bloc ` ```json ` de la sortie. Budget : `PI_CORRECTOR_INVESTIGATE_MAX_ACTIONS` (6) et `PI_CORRECTOR_INVESTIGATE_TIMEOUT_SECONDS` (240). Chaque test d'hypothèse compte pour une action, et chaque étape Hypothèse porte sa durée.
 
 ## Contrat de ligne de commande
 
@@ -42,6 +83,7 @@ Un argument inconnu est ignoré avec un avertissement : un contrat qui s'enrichi
 uvx --with testcontainers --with docker --with requests --with pyyaml python test_container_death_reporting.py
 uvx --with testcontainers --with docker --with requests --with pyyaml python test_port_and_platform.py
 uvx --with testcontainers --with docker --with requests --with pyyaml python test_fault_attribution.py
+uvx --with pytest --with testcontainers --with docker --with requests --with pyyaml pytest -q
 ```
 
 ## ⚠️ Une modification locale ne prend effet qu'une fois poussée

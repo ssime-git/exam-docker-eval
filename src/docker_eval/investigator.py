@@ -3,18 +3,54 @@
 Quand une étape échoue sans annotation « attendu », un LLM (gateway
 OpenAI-compatible, typiquement Liora) mène une investigation bornée en
 lecture seule : re-sonder une URL, lire les logs d'un conteneur, exécuter
-une commande de lecture, lire un fichier de la copie. Chaque action et son
-observation deviennent des étapes du contrat — visibles au scratchpad,
-citables par la revue. Après le teardown, plus rien n'est testable : c'est
-ici que le vrai debug se joue (scriptorium #78).
+une commande de lecture, lire un fichier de la copie, résoudre un nom
+(`dns`), lister les ports en écoute (`ports`), lire l'environnement
+(`env`, secrets masqués). Chaque action et son observation deviennent des
+étapes du contrat, visibles au scratchpad et citables par la revue. Après
+le teardown, plus rien n'est testable : c'est ici que le vrai debug se joue
+(scriptorium #78).
 
-Verdict vérifié (scriptorium #307). Un verdict qui impute une faute
-(`faute` ≠ `indetermine`) n'est pas accepté sur la parole du LLM : sa `cause`
-est scorée par un vérificateur indépendant contre les seules preuves de
-l'investigation (sorties des étapes en échec et observations « Investigation
-N »). Le vérificateur est un scoring de logprobs sur quatre verdicts, même
-prompt que `score_claim` de scriptorium/tools/verification.py ; le banc #304
-a retenu Qwen3.5-4B Q4_K_M derrière llama-server.
+Débogage par hypothèse (scriptorium #336). Le LLM conçoit l'expérience, le
+harnais la juge. Il propose une ou plusieurs hypothèses (un objet, ou une
+liste d'objets) :
+
+    {"action":"hypothese","id":"H1","enonce":"…","faute":"apprenant|harnais|indetermine",
+     "test":{<action de lecture : sonde, logs, exec, fichier, dns, ports, env>},
+     "si_vraie":{<prédiction>},"si_fausse":{<prédiction>},
+     "revelable":"…(optionnel)","non_revelable":"…(optionnel)"}
+
+Une prédiction est une conjonction de clés vérifiables mécaniquement :
+`code` (code HTTP, entier ou liste), `exit_code` (entier ou liste),
+`contient` / `ne_contient_pas` (sous-chaîne ou liste, cherchée dans la
+sortie complète de l'action, pas dans l'extrait affiché). Le harnais
+rejette sans l'exécuter une hypothèse sans `faute` valide, dont le test
+n'est pas une action de lecture, ou dont les deux prédictions peuvent être
+vraies ensemble. Seuls trois cas prouvent la disjonction : des ensembles de
+`code` disjoints, des ensembles d'`exit_code` disjoints, ou `contient X`
+face à `ne_contient_pas Y` avec Y sous-chaîne de X. Sinon il exécute le
+test (une action du budget) et compare :
+
+- établie : si_vraie tient et si_fausse ne tient pas ;
+- réfutée : si_fausse tient et si_vraie ne tient pas ;
+- non tranchée : tout le reste, y compris une donnée absente (pas de code
+  HTTP sur un « non reçu », pas de code de sortie sur une lecture de
+  fichier) et un refus du harnais (« refusé : … », « échec de l'action »),
+  qui n'est jamais une observation.
+
+Chaque expérience devient une étape « Hypothèse H1 — <énoncé> » : test,
+prédictions, résultat brut, verdict mécanique. La première hypothèse
+établie clôt l'investigation. Son énoncé devient la `cause`, et sa `faute`
+celle du verdict. Le scoreur de #307 n'est pas sollicité, et l'étape
+« Investigation — vérification du verdict » le consigne.
+
+Verdict direct (compatibilité). {"action":"verdict",…} reste accepté. Un
+verdict qui impute une faute (`faute` ≠ `indetermine`) n'est pas pris sur
+la parole du LLM (scriptorium #307) : sa `cause` est scorée par un
+vérificateur indépendant contre les seules preuves de l'investigation
+(sorties des étapes en échec, observations et tests d'hypothèse). Le
+vérificateur est un scoring de logprobs sur quatre verdicts, même prompt
+que `score_claim` de scriptorium/tools/verification.py ; le banc #304 a
+retenu Qwen3.5-4B Q4_K_M derrière llama-server.
 
 - P(soutenu) ≥ seuil : verdict accepté, la distribution est consignée.
 - Sous le seuil, avec des actions et du temps restants et moins de
@@ -26,19 +62,57 @@ a retenu Qwen3.5-4B Q4_K_M derrière llama-server.
   cause préfixée « hypothèse : », `faute: indetermine`, `revelable` réduit au
   symptôme observé.
 
-Environnement (contrat de scriptorium #311) : PI_CORRECTOR_VERIFY_BASE_URL
-(base OpenAI-compatible, `/v1` compris ; absente = vérification désactivée,
-et l'étape « Vérification du verdict non configurée » le dit),
-PI_CORRECTOR_VERIFY_API_KEY (Bearer, optionnel), PI_CORRECTOR_VERIFY_MODEL
-(optionnel, ignoré par llama-server), PI_CORRECTOR_VERIFY_THRESHOLD (0.55),
-PI_CORRECTOR_VERIFY_MAX_ITERATIONS (2).
+Un verdict `faute: indetermine`, un budget épuisé ou une investigation
+interrompue après des hypothèses donnent « cause : non établie »,
+`faute: indetermine` et un `revelable` réduit au symptôme observé.
 
-Budget. ACTIONS_MAX borne les actions ; les tours de verdict ne le
-consomment plus (au plus 1 + MAX_ITERATIONS). TIMEOUT_TOTAL_SECONDES borne
-les actions et les ré-investigations, pas le scoring : le verdict final est
-toujours scoré. Budget additionnel assumé : au plus 1 + MAX_ITERATIONS appels
-au vérificateur, chacun borné par VERIFICATION_TIMEOUT_SECONDES (le banc
-mesure 15 à 26 s par appel sur CPU).
+Sortie de l'étape « Investigation — verdict ». D'abord les lignes lisibles
+(`cause : …`, `faute : …`, `révélable au feedback : …`, `à ne pas
+révéler : …`, puis la liste des hypothèses et de leurs expériences). Elle
+se termine TOUJOURS par un bloc JSON pour les consommateurs (scriptorium
+#338, pi-corrector #337), le dernier bloc ```json de la sortie :
+
+    {"version": 1,
+     "statut": "cause_etablie" | "cause_scoree" | "cause_non_verifiee" | "cause_non_etablie",
+     "cause": str | null,              # null si statut = cause_non_etablie
+     "piste": str | null,              # cause d'un verdict direct déclassé
+     "faute": "apprenant" | "harnais" | "indetermine",
+     "revelable": str, "non_revelable": str,
+     "hypothese_etablie": "H1" | null,
+     "hypotheses_restantes": [<hypothèse>],   # non tranchées et rejetées
+     "hypotheses_refutees": [<hypothèse>]}
+
+    <hypothèse> = {"id": str, "enonce": str, "faute": str,
+                   "resultat": "non_tranchee" | "rejetee" | "refutee" | "etablie",
+                   "raison_rejet": str (si rejetee),
+                   "experiences": [{"test": str, "si_vraie": {…}, "si_fausse": {…},
+                                    "resultat": {"code": int|null, "exit_code": int|null,
+                                                 "extrait": str},
+                                    "verdict": "etablie" | "refutee" | "non_tranchee"}]}
+
+`cause_etablie` : une hypothèse établie mécaniquement. `cause_scoree` :
+verdict direct accepté par le scoreur. `cause_non_verifiee` : verdict
+direct accepté sans scoreur configuré. Une hypothèse retestée sous le même
+id accumule ses expériences, et son `resultat` est celui de la dernière.
+
+Environnement. Investigation : PI_CORRECTOR_INVESTIGATE_MAX_ACTIONS
+(ACTIONS_MAX, 6) et PI_CORRECTOR_INVESTIGATE_TIMEOUT_SECONDS
+(TIMEOUT_TOTAL_SECONDES, 240). Vérification (contrat de scriptorium #311) :
+PI_CORRECTOR_VERIFY_BASE_URL (base OpenAI-compatible, `/v1` compris ;
+absente = vérification désactivée, et l'étape « Vérification du verdict non
+configurée » le dit), PI_CORRECTOR_VERIFY_API_KEY (Bearer, optionnel),
+PI_CORRECTOR_VERIFY_MODEL (optionnel, ignoré par llama-server),
+PI_CORRECTOR_VERIFY_THRESHOLD (0.55), PI_CORRECTOR_VERIFY_MAX_ITERATIONS (2).
+
+Budget. Le maximum d'actions borne les actions, et chaque test d'hypothèse
+compte pour une. Une hypothèse rejetée n'est pas exécutée et ne consomme
+pas d'action. Le nombre de tours de LLM reste borné. Les tours de verdict
+ne consomment pas d'action (au plus 1 + MAX_ITERATIONS). Le timeout borne
+les actions et les ré-investigations, pas le scoring : un verdict direct
+final est toujours scoré. Budget additionnel assumé : au plus
+1 + MAX_ITERATIONS appels au vérificateur, chacun borné par
+VERIFICATION_TIMEOUT_SECONDES (le banc mesure 15 à 26 s par appel sur CPU).
+Chaque étape Hypothèse porte sa durée, pour mesurer le temps sur les rejeux.
 
 Trou connu, non comblé ici : l'investigateur ne tourne que dans le runner
 compose (ComposeRunner, services persistants), et seulement quand des étapes
@@ -48,9 +122,11 @@ causes runtime restent sans verdict, donc sans vérification.
 """
 
 import functools
+import ipaddress
 import json
 import math
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -59,6 +135,8 @@ import urllib.request
 ACTIONS_MAX = 6
 TIMEOUT_TOTAL_SECONDES = 240
 SORTIE_MAX = 2000
+# Extrait du résultat brut gardé par expérience dans le bloc JSON.
+EXTRAIT_MAX = 300
 
 # Vérificateur du verdict (#307). Prompt et verdicts recopiés de
 # scriptorium/tools/verification.py : le seuil vient d'un banc mesuré avec eux.
@@ -77,26 +155,59 @@ PREFIXE_HYPOTHESE = "hypothèse : "
 
 # ponytail: liste noire lexicale, pas un sandbox — le vrai garde-fou est
 # l'exec sans écriture possible sur la copie (elle vit hors conteneur) et
-# le budget d'actions. Durcir en whitelist si un exam l'exige.
+# le budget d'actions. Durcir en whitelist si un exam l'exige. Elle ne
+# s'applique qu'aux commandes écrites par le LLM : dns, ports et env lancent
+# des commandes fixes du harnais.
 _EXEC_INTERDITS = (">", ">>", "rm ", "mv ", "cp ", "chmod", "chown", "kill",
                    "shutdown", "reboot", "mkfs", "dd ", "wget", "curl -o", "tee")
 
+ACTIONS_LECTURE = ("sonde", "logs", "exec", "fichier", "dns", "ports", "env")
+FAUTES = ("apprenant", "harnais", "indetermine")
+CLES_PREDICTION = ("code", "exit_code", "contient", "ne_contient_pas")
+# Ce que le harnais rend quand il n'a rien observé : jamais une observation.
+_NON_OBSERVATIONS = ("refusé", "échec de l'action", "action inconnue")
+# Masquage de `env` : toute clé qui contient un de ces mots.
+_CLES_SECRETES = ("KEY", "TOKEN", "SECRET", "PASS")
+_NOM_HOTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
+_MARQUEUR_PROC = "__PROC_NET_TCP__"
+# Le nom passe en argument positionnel ($1), jamais concaténé au script.
+_SCRIPT_DNS = ('getent hosts "$1"; rc=$?; echo "--- /etc/resolv.conf"; '
+               'cat /etc/resolv.conf 2>/dev/null; exit $rc')
+_SCRIPT_PORTS = ("ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || "
+                 "{ echo " + _MARQUEUR_PROC + "; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; }")
+
 PROMPT_SYSTEME = """Tu investigues l'échec d'une évaluation d'examen pendant que la stack Docker tourne encore.
-Tu réponds UNIQUEMENT par un objet JSON, sans texte autour. Actions disponibles :
+Tu réponds UNIQUEMENT par du JSON (un objet, ou une liste d'hypothèses), sans texte autour.
+
+Méthode attendue : le débogage par hypothèse. Tu conçois l'expérience ; le harnais l'exécute et la juge.
+{"action":"hypothese","id":"H1","enonce":"<cause supposée>","faute":"apprenant|harnais|indetermine","test":{<une action de lecture ci-dessous>},"si_vraie":{<prédiction>},"si_fausse":{<prédiction>}}
+Une prédiction combine (ET) : "code" (code HTTP, entier ou liste), "exit_code" (entier ou liste),
+"contient" / "ne_contient_pas" (sous-chaîne ou liste). Les deux prédictions doivent s'exclure : codes
+différents, exit_code différents, ou "contient":"X" face à "ne_contient_pas":"Y" avec Y inclus dans X.
+Sinon l'hypothèse est rejetée sans être exécutée. "faute" est obligatoire : celle qui vaut si l'hypothèse
+est établie. Le harnais répond établie, réfutée ou non tranchée. La première hypothèse établie devient la
+cause du verdict : tu n'as rien d'autre à faire. Réfutée ou non tranchée : propose une autre expérience.
+Tu peux envoyer plusieurs hypothèses d'un coup dans une liste JSON ; chaque test coûte une action.
+
+Actions de lecture (utilisables seules ou comme "test" d'une hypothèse) :
 {"action":"sonde","url":"http(s)://127.0.0.1:<port>/<chemin>","identifiants":"user:pass"} — refaire une requête, chemins et schémas libres ; "identifiants" (optionnel) ajoute une authentification Basic
 {"action":"logs","service":"<nom de conteneur>","lignes":50} — lire la fin des logs
 {"action":"exec","service":"<nom de conteneur>","commande":"<commande de LECTURE>"} — ex. cat d'une config effective
 {"action":"fichier","chemin":"<chemin relatif dans la copie>"} — lire un fichier rendu par l'apprenant
-{"action":"verdict","cause":"<cause établie ou 'non établie'>","faute":"apprenant|harnais|indetermine","revelable":"<ce que le feedback peut dire : symptôme, où chercher>","non_revelable":"<ce qu'il ne faut pas donner : la solution>"}
-Méthode : formule une hypothèse, teste-la par UNE action, lis l'observation, itère. Comble les trous
-de la soumission avant de conclure : une route qui répond 401 se traite en CHERCHANT les identifiants
-que l'apprenant a fournis (ses tests, son README, ses scripts — action "fichier") puis en re-sondant
-avec ("sonde" + "identifiants"). Ne conclus jamais « identifiants absents ou refusés » sans avoir lu
-les fichiers où ils pourraient être. Termine par "verdict"
-dès que la cause est établie ou qu'aucune action ne peut plus trancher. C'est un examen : le verdict guide
-sans jamais donner la correction. Cohérence exigée : "faute" ne peut valoir "apprenant" ou "harnais" QUE si
-"cause" est établie par une observation ; une cause non établie impose "faute":"indetermine" et un
-"revelable" qui dit seulement le symptôme observé. Budget strict : {actions_max} actions.
+{"action":"dns","service":"<nom de conteneur>","nom":"<hôte>"} — getent hosts DANS le conteneur, puis son /etc/resolv.conf ; exit_code 0 si le nom se résout
+{"action":"ports","service":"<nom de conteneur>"} — ports TCP en écoute dans le conteneur
+{"action":"env","service":"<nom de conteneur>"} — variables d'environnement du conteneur (secrets masqués)
+
+Comble les trous de la soumission avant de conclure : une route qui répond 401 se traite en CHERCHANT les
+identifiants que l'apprenant a fournis (ses tests, son README, ses scripts — action "fichier") puis en
+re-sondant avec ("sonde" + "identifiants"). Ne conclus jamais « identifiants absents ou refusés » sans avoir
+lu les fichiers où ils pourraient être.
+
+Si aucune expérience ne peut plus trancher, termine par
+{"action":"verdict","cause":"non établie","faute":"indetermine","revelable":"<symptôme observé>","non_revelable":"<la solution>"}
+Un verdict direct qui impute une faute sans hypothèse établie reste possible, mais il est scoré par un
+vérificateur indépendant et déclassé s'il n'est pas soutenu par tes observations. C'est un examen : le
+verdict guide sans jamais donner la correction. Budget strict : {actions_max} actions.
 """
 
 
@@ -152,6 +263,139 @@ def _nombre_env(nom: str, defaut, conversion):
         return defaut
 
 
+
+
+class Observation(str):
+    """Sortie affichée d'une action, avec ce que le harnais peut comparer.
+
+    `code` (HTTP) et `exit_code` valent None quand l'action ne les produit
+    pas. `integrale` est la sortie avant troncature d'affichage : les
+    prédictions portent sur elle. `fiable` est faux quand le harnais n'a rien
+    observé (refus, erreur). Une `str` nue rendue par une action se lit comme
+    une Observation sans code ni code de sortie."""
+
+    def __new__(cls, texte, code=None, exit_code=None, integrale=None, fiable=True):
+        obs = super().__new__(cls, texte)
+        obs.code = code
+        obs.exit_code = exit_code
+        obs.integrale = str(texte) if integrale is None else integrale
+        obs.fiable = fiable
+        return obs
+
+
+def _lire(obs) -> dict:
+    texte = str(obs)
+    return {"code": getattr(obs, "code", None),
+            "exit_code": getattr(obs, "exit_code", None),
+            "integrale": getattr(obs, "integrale", texte),
+            "fiable": getattr(obs, "fiable", not texte.startswith(_NON_OBSERVATIONS))}
+
+
+def _liste(valeur) -> list:
+    return list(valeur) if isinstance(valeur, (list, tuple)) else [valeur]
+
+
+def _valider_prediction(prediction) -> str:
+    if not isinstance(prediction, dict) or not prediction:
+        return "prédiction vide ou absente : toujours vraie, donc prédictions non disjointes"
+    for cle, valeur in prediction.items():
+        if cle not in CLES_PREDICTION:
+            return f"clé de prédiction inconnue : {cle} (attendu : {', '.join(CLES_PREDICTION)})"
+        valeurs = _liste(valeur)
+        if not valeurs:
+            return f"{cle} vide"
+        if cle in ("code", "exit_code"):
+            if not all(isinstance(v, int) and not isinstance(v, bool) for v in valeurs):
+                return f"{cle} doit être un entier ou une liste d'entiers"
+        elif not all(isinstance(v, str) and v for v in valeurs):
+            return f"{cle} doit être une chaîne non vide ou une liste de chaînes"
+    return ""
+
+
+def predictions_disjointes(a: dict, b: dict) -> bool:
+    """Vrai seulement si les deux prédictions ne peuvent pas tenir ensemble.
+    Par défaut, non : on ne rejette que ce qu'on sait prouver disjoint."""
+    for cle in ("code", "exit_code"):
+        if cle in a and cle in b and not set(_liste(a[cle])) & set(_liste(b[cle])):
+            return True
+    for p, q in ((a, b), (b, a)):
+        for present in _liste(p.get("contient", [])):
+            for absent in _liste(q.get("ne_contient_pas", [])):
+                if absent in present:
+                    return True
+    return False
+
+
+def evaluer_prediction(prediction: dict, lu: dict):
+    """True, False, ou None quand une donnée comparée manque."""
+    resultats = []
+    for cle, attendu in prediction.items():
+        if cle in ("code", "exit_code"):
+            obtenu = lu[cle]
+            resultats.append(None if obtenu is None else obtenu in _liste(attendu))
+        elif cle == "contient":
+            resultats.append(all(s in lu["integrale"] for s in _liste(attendu)))
+        else:
+            resultats.append(all(s not in lu["integrale"] for s in _liste(attendu)))
+    if False in resultats:
+        return False
+    if None in resultats:
+        return None
+    return True
+
+
+def verdict_mecanique(si_vraie: dict, si_fausse: dict, lu: dict) -> str:
+    if not lu["fiable"]:
+        return "non_tranchee"
+    vraie = evaluer_prediction(si_vraie, lu)
+    fausse = evaluer_prediction(si_fausse, lu)
+    if vraie is True and fausse is False:
+        return "etablie"
+    if fausse is True and vraie is False:
+        return "refutee"
+    return "non_tranchee"
+
+
+_LIBELLES = {"etablie": "établie", "refutee": "réfutée",
+             "non_tranchee": "non tranchée", "rejetee": "rejetée"}
+
+
+def masquer_env(lignes: list) -> list:
+    """Masque la valeur des clés qui ressemblent à un secret."""
+    masquees = []
+    for ligne in lignes:
+        cle, egal, _valeur = str(ligne).partition("=")
+        if egal and any(mot in cle.upper() for mot in _CLES_SECRETES):
+            masquees.append(f"{cle}=***")
+        else:
+            masquees.append(str(ligne))
+    return masquees
+
+
+def _adresse_proc(hexa: str) -> str:
+    adresse, _, port = hexa.partition(":")
+    brut = bytes.fromhex(adresse)
+    if len(brut) == 4:
+        ip = ipaddress.IPv4Address(brut[::-1])
+    else:
+        ip = ipaddress.IPv6Address(b"".join(brut[i:i + 4][::-1] for i in range(0, 16, 4)))
+    hote = f"[{ip}]" if ip.version == 6 else str(ip)
+    return f"{hote}:{int(port, 16)}"
+
+
+def ecoutes_proc_net_tcp(texte: str) -> list:
+    """Les sockets en écoute (état 0A) d'un /proc/net/tcp{,6}."""
+    ecoutes = []
+    for ligne in texte.splitlines():
+        champs = ligne.split()
+        if len(champs) > 3 and champs[0].endswith(":") and champs[3] == "0A":
+            try:
+                ecoutes.append(f"LISTEN {_adresse_proc(champs[1])}")
+            except ValueError:
+                continue
+    return ecoutes
+
+
 class Investigator:
     """Boucle d'investigation adossée au runner (record_step, conteneurs).
 
@@ -183,6 +427,11 @@ class Investigator:
         self.seuil = _nombre_env("PI_CORRECTOR_VERIFY_THRESHOLD", SEUIL_VERIFICATION, float)
         self.iterations_max = _nombre_env("PI_CORRECTOR_VERIFY_MAX_ITERATIONS",
                                           ITERATIONS_VERIFICATION, int)
+        self.actions_max = _nombre_env("PI_CORRECTOR_INVESTIGATE_MAX_ACTIONS", ACTIONS_MAX, int)
+        self.timeout_total = _nombre_env("PI_CORRECTOR_INVESTIGATE_TIMEOUT_SECONDS",
+                                         TIMEOUT_TOTAL_SECONDES, float)
+        self._observations = []   # (titre, commande, sortie) : les preuves de #307
+        self._hypotheses = {}     # id -> hypothèse et ses expériences, dans l'ordre
 
     def disponible(self) -> bool:
         return bool(self.base_url and self.api_key)
@@ -191,7 +440,8 @@ class Investigator:
 
     def _sonde(self, url: str, identifiants: str = "") -> str:
         if "127.0.0.1" not in url and "localhost" not in url:
-            return "refusé : seules les URLs locales (127.0.0.1) sont sondables"
+            return Observation("refusé : seules les URLs locales (127.0.0.1) sont sondables",
+                               fiable=False)
         from .sonde_http import resume, sonder
         entetes = {}
         if identifiants:
@@ -201,35 +451,202 @@ class Investigator:
         # consignée, une cible injoignable n'est pas une panne (#320).
         sonde = sonder(url, entetes=entetes, taille_extrait=400)
         if not isinstance(sonde["code"], int):
-            return f"non reçu : {sonde['erreur']}"
-        return f"{resume(sonde)}\n{sonde['extrait']}"
+            return Observation(f"non reçu : {sonde['erreur']}")
+        return Observation(f"{resume(sonde)}\n{sonde['extrait']}", code=sonde["code"])
+
+    def _hors_perimetre(self, service: str):
+        if service not in self.services:
+            return Observation("refusé : conteneur hors du périmètre de la copie", fiable=False)
+        return None
+
+    @staticmethod
+    def _sortie(resultat, vide: str) -> Observation:
+        integrale = (resultat.stdout or "") + (resultat.stderr or "")
+        return Observation(integrale[-SORTIE_MAX:] or vide,
+                           exit_code=resultat.returncode, integrale=integrale)
 
     def _logs(self, service: str, lignes: int) -> str:
-        if service not in self.services:
-            return "refusé : conteneur hors du périmètre de la copie"
+        refus = self._hors_perimetre(service)
+        if refus is not None:
+            return refus
         resultat = subprocess.run(
             ["docker", "logs", "--tail", str(min(int(lignes or 50), 200)), service],
             capture_output=True, text=True, timeout=20)
-        return (resultat.stdout + resultat.stderr)[-SORTIE_MAX:] or "(logs vides)"
+        return self._sortie(resultat, "(logs vides)")
 
     def _exec(self, service: str, commande: str) -> str:
-        if service not in self.services:
-            return "refusé : conteneur hors du périmètre de la copie"
+        refus = self._hors_perimetre(service)
+        if refus is not None:
+            return refus
         if any(interdit in commande for interdit in _EXEC_INTERDITS):
-            return "refusé : commande d'écriture ou de réseau — lecture seule"
+            return Observation("refusé : commande d'écriture ou de réseau — lecture seule",
+                               fiable=False)
         resultat = subprocess.run(
             ["docker", "exec", service, "sh", "-c", commande],
             capture_output=True, text=True, timeout=20)
-        return (resultat.stdout + resultat.stderr)[-SORTIE_MAX:] or f"(vide, rc={resultat.returncode})"
+        return self._sortie(resultat, f"(vide, rc={resultat.returncode})")
 
     def _fichier(self, chemin: str) -> str:
         cible = os.path.realpath(os.path.join(self.eval_dir, chemin))
         if not cible.startswith(self.eval_dir + os.sep):
-            return "refusé : chemin hors de la copie"
+            return Observation("refusé : chemin hors de la copie", fiable=False)
         if not os.path.isfile(cible):
-            return "fichier introuvable"
+            return Observation("fichier introuvable", exit_code=1)
         with open(cible, encoding="utf-8", errors="replace") as lecteur:
-            return lecteur.read(SORTIE_MAX)
+            return Observation(lecteur.read(SORTIE_MAX), exit_code=0)
+
+    def _dns(self, service: str, nom: str) -> str:
+        """getent hosts dans le conteneur, puis son resolv.conf (un `dns:`
+        imposé par le compose s'y lit : 461451)."""
+        refus = self._hors_perimetre(service)
+        if refus is not None:
+            return refus
+        if not _NOM_HOTE.match(str(nom or "")):
+            return Observation("refusé : nom d'hôte invalide", fiable=False)
+        resultat = subprocess.run(
+            ["docker", "exec", service, "sh", "-c", _SCRIPT_DNS, "sh", nom],
+            capture_output=True, text=True, timeout=20)
+        return self._sortie(resultat, f"(vide, rc={resultat.returncode})")
+
+    def _ports(self, service: str) -> str:
+        """ss, sinon netstat, sinon /proc/net/tcp décodé : les images minces
+        n'ont souvent ni l'un ni l'autre."""
+        refus = self._hors_perimetre(service)
+        if refus is not None:
+            return refus
+        resultat = subprocess.run(
+            ["docker", "exec", service, "sh", "-c", _SCRIPT_PORTS],
+            capture_output=True, text=True, timeout=20)
+        sortie = resultat.stdout or ""
+        if sortie.lstrip().startswith(_MARQUEUR_PROC):
+            ecoutes = ecoutes_proc_net_tcp(sortie)
+            texte = ("ports en écoute (lus dans /proc/net/tcp, ni ss ni netstat) :\n"
+                     + ("\n".join(ecoutes) or "(aucun)"))
+            return Observation(texte[-SORTIE_MAX:], exit_code=resultat.returncode, integrale=texte)
+        return self._sortie(resultat, f"(vide, rc={resultat.returncode})")
+
+    def _env(self, service: str) -> str:
+        """Config.Env du conteneur, lue par docker inspect (sans shell dans
+        l'image), valeurs secrètes masquées avant que quiconque les lise."""
+        refus = self._hors_perimetre(service)
+        if refus is not None:
+            return refus
+        resultat = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .Config.Env}}", service],
+            capture_output=True, text=True, timeout=20)
+        if resultat.returncode != 0:
+            return self._sortie(resultat, f"(vide, rc={resultat.returncode})")
+        try:
+            variables = json.loads(resultat.stdout or "null") or []
+        except ValueError:
+            return Observation("échec de l'action : sortie de docker inspect illisible", fiable=False)
+        texte = "\n".join(masquer_env(variables)) or "(aucune variable)"
+        return Observation(texte[-SORTIE_MAX:], exit_code=0, integrale=texte)
+
+    def _executer(self, demande: dict):
+        """(commande lisible, Observation) d'une action de lecture."""
+        action = demande.get("action")
+        try:
+            if action == "sonde":
+                identifiants = demande.get("identifiants", "")
+                return (f"GET {demande['url']}" + (" avec Authorization: Basic" if identifiants else ""),
+                        self._sonde(demande["url"], identifiants))
+            if action == "logs":
+                return (f"docker logs --tail {demande.get('lignes', 50)} {demande['service']}",
+                        self._logs(demande["service"], demande.get("lignes", 50)))
+            if action == "exec":
+                return (f"docker exec {demande['service']} sh -c {demande['commande']!r}",
+                        self._exec(demande["service"], demande["commande"]))
+            if action == "fichier":
+                return (f"lecture de {demande['chemin']} dans la copie",
+                        self._fichier(demande["chemin"]))
+            if action == "dns":
+                return (f"docker exec {demande['service']} getent hosts {demande['nom']} "
+                        "; cat /etc/resolv.conf",
+                        self._dns(demande["service"], demande["nom"]))
+            if action == "ports":
+                return (f"docker exec {demande['service']} ss -ltn (repli netstat, /proc/net/tcp)",
+                        self._ports(demande["service"]))
+            if action == "env":
+                return (f"docker inspect --format '{{{{json .Config.Env}}}}' {demande['service']} "
+                        "(secrets masqués)", self._env(demande["service"]))
+            return str(demande)[:200], Observation(f"action inconnue : {action}", fiable=False)
+        except Exception as erreur:
+            return str(demande)[:200], Observation(f"échec de l'action : {erreur}", fiable=False)
+
+    # --- hypothèses ----------------------------------------------------------
+
+    @staticmethod
+    def _rejet(demande: dict) -> str:
+        if not str(demande.get("enonce", "")).strip():
+            return "énoncé absent"
+        if str(demande.get("faute", "")).strip().lower() not in FAUTES:
+            return "champ faute obligatoire : apprenant, harnais ou indetermine"
+        test = demande.get("test")
+        if not isinstance(test, dict) or test.get("action") not in ACTIONS_LECTURE:
+            return f"le test doit être une action de lecture ({', '.join(ACTIONS_LECTURE)})"
+        for nom in ("si_vraie", "si_fausse"):
+            erreur = _valider_prediction(demande.get(nom))
+            if erreur:
+                return f"{nom} : {erreur}"
+        if not predictions_disjointes(demande["si_vraie"], demande["si_fausse"]):
+            return ("prédictions non disjointes : si_vraie et si_fausse peuvent être vraies "
+                    "ensemble, le résultat ne trancherait pas")
+        return ""
+
+    def _fiche(self, demande: dict) -> dict:
+        ident = str(demande.get("id") or f"H{len(self._hypotheses) + 1}").strip()[:20]
+        fiche = self._hypotheses.setdefault(ident, {"id": ident, "experiences": []})
+        fiche.update({"enonce": str(demande.get("enonce", "")).strip()[:300],
+                      "faute": str(demande.get("faute", "")).strip().lower(),
+                      "revelable": demande.get("revelable"),
+                      "non_revelable": demande.get("non_revelable")})
+        fiche.pop("raison_rejet", None)
+        return fiche
+
+    def _tester_hypothese(self, demande: dict):
+        """Rend (fiche, message pour le LLM). Une hypothèse rejetée n'est pas
+        exécutée ; une hypothèse testée compte comme une action."""
+        fiche = self._fiche(demande)
+        titre = f"Hypothèse {fiche['id']} — {fiche['enonce'] or '(sans énoncé)'}"[:200]
+        rejet = self._rejet(demande)
+        if rejet:
+            if not fiche["experiences"]:
+                fiche["resultat"] = "rejetee"
+                fiche["raison_rejet"] = rejet
+            self.runner.record_step(titre, output=f"hypothèse rejetée, non exécutée : {rejet}",
+                                    exit_code=0)
+            return fiche, f"{fiche['id']} : rejetée, non exécutée — {rejet}"
+        debut = time.time()
+        commande, observation = self._executer(demande["test"])
+        lu = _lire(observation)
+        verdict = verdict_mecanique(demande["si_vraie"], demande["si_fausse"], lu)
+        affiche = str(observation)[:SORTIE_MAX]
+        fiche["resultat"] = verdict
+        fiche["experiences"].append({
+            "test": commande, "si_vraie": demande["si_vraie"], "si_fausse": demande["si_fausse"],
+            "resultat": {"code": lu["code"], "exit_code": lu["exit_code"],
+                         "extrait": affiche[-EXTRAIT_MAX:]},
+            "verdict": verdict})
+        brut = f"code={self._val(lu['code'])} exit_code={self._val(lu['exit_code'])}"
+        self.runner.record_step(
+            titre, command=commande,
+            output=(f"faute si établie : {fiche['faute']}\n"
+                    f"test : {commande}\n"
+                    f"si vraie : {json.dumps(demande['si_vraie'], ensure_ascii=False)}\n"
+                    f"si fausse : {json.dumps(demande['si_fausse'], ensure_ascii=False)}\n"
+                    f"résultat : {brut}\n"
+                    + ("" if lu["fiable"] else "le harnais n'a rien observé : non tranchable\n")
+                    + f"sortie :\n{affiche}\n"
+                    f"verdict mécanique : {_LIBELLES[verdict]}"),
+            exit_code=0, duration=time.time() - debut)
+        self._observations.append((titre, commande, affiche))
+        return fiche, (f"{fiche['id']} : {_LIBELLES[verdict]} ({brut})\n"
+                       f"sortie :\n{affiche}")
+
+    @staticmethod
+    def _val(valeur) -> str:
+        return "-" if valeur is None else str(valeur)
 
     # --- boucle ------------------------------------------------------------
 
@@ -258,49 +675,68 @@ class Investigator:
             corps = json.load(reponse)
         return corps["choices"][0]["message"]["content"]
 
+    @staticmethod
+    def _demandes(brut: str) -> list:
+        """Un objet, une liste d'objets, ou {"hypotheses": [...]}."""
+        lu = json.loads(brut.strip().removeprefix("```json").removeprefix("```").removesuffix("```"))
+        if isinstance(lu, dict) and isinstance(lu.get("hypotheses"), list) and "action" not in lu:
+            lu = lu["hypotheses"]
+        demandes = lu if isinstance(lu, list) else [lu]
+        if not demandes or not all(isinstance(d, dict) for d in demandes):
+            raise ValueError("JSON attendu : un objet ou une liste d'objets")
+        return demandes
+
+    def _temps_ecoule(self, debut: float) -> bool:
+        return time.time() - debut > self.timeout_total
+
     def investiguer(self, echecs: list) -> None:
         debut = time.time()
+        self._observations, self._hypotheses = [], {}
+        observations = self._observations
         resume_echecs = "\n".join(
             f"- {e.get('title') or e.get('titre')}: {str(e.get('output') or e.get('sortie'))[:200]}"
             for e in echecs)
         messages = [
-            {"role": "system", "content": PROMPT_SYSTEME.replace("{actions_max}", str(ACTIONS_MAX))},
+            {"role": "system", "content": PROMPT_SYSTEME.replace("{actions_max}", str(self.actions_max))},
             {"role": "user", "content": f"Étapes en échec (non attendues) :\n{resume_echecs}\n"
                                         f"Conteneurs debout : {self._conteneurs()}\n"
                                         f"Fichiers de la copie :\n{self._inventaire()}\nCommence."},
         ]
-        observations = []       # (titre, commande, sortie) des actions menées
         iterations = 0          # challenges du vérificateur déjà renvoyés au LLM
         en_attente = None       # dernier verdict contesté : jamais perdu en sortie
         observations_au_challenge = 0
-        # Chaque tour est une action ou un verdict ; les verdicts sont au plus
-        # 1 + iterations_max, les actions au plus ACTIONS_MAX.
-        for _tour in range(ACTIONS_MAX + 1 + self.iterations_max):
-            if time.time() - debut > TIMEOUT_TOTAL_SECONDES:
+        # Chaque tour est une salve d'actions, une salve d'hypothèses ou un
+        # verdict. Les hypothèses rejetées ne consomment pas d'action : la
+        # borne des tours garde la boucle finie.
+        for _tour in range(2 * self.actions_max + 1 + self.iterations_max):
+            if self._temps_ecoule(debut):
                 self._interrompre("budget temps épuisé", en_attente, echecs, debut)
                 return
             try:
                 brut = self._appeler_llm(messages)
-                demande = json.loads(brut.strip().removeprefix("```json").removeprefix("```").removesuffix("```"))
+                demandes = self._demandes(brut)
             except Exception as erreur:
                 self._interrompre(f"réponse LLM inexploitable : {erreur}", en_attente, echecs, debut)
                 return
-            action = demande.get("action")
-            if action == "verdict":
+            if len(demandes) == 1 and demandes[0].get("action") == "verdict":
+                demande = demandes[0]
                 if self.scoreur is None:
                     self.runner.record_step(
                         "Vérification du verdict non configurée",
                         output="PI_CORRECTOR_VERIFY_BASE_URL absente : verdict accepté "
                                "sans vérification indépendante de la cause",
                         exit_code=0)
-                    self._consigner_verdict(demande, debut)
+                    if str(demande.get("faute", "")).strip().lower() == "indetermine":
+                        self._non_etablie(echecs, debut, non_revelable=demande.get("non_revelable"))
+                    else:
+                        self._consigner_verdict(demande, debut, "cause_non_verifiee")
                     return
                 if str(demande.get("faute", "")).strip().lower() == "indetermine":
                     self.runner.record_step(
                         "Investigation — vérification du verdict",
                         output="faute indetermine : cause non scorée, le verdict est déjà prudent",
                         exit_code=0)
-                    self._consigner_verdict(demande, debut)
+                    self._non_etablie(echecs, debut, non_revelable=demande.get("non_revelable"))
                     return
                 if en_attente is not None and len(observations) == observations_au_challenge:
                     self._declasser(demande, echecs, debut,
@@ -321,10 +757,10 @@ class Investigator:
                     self.runner.record_step("Investigation — vérification du verdict",
                                             output=f"{lecture}\ncause établie : verdict accepté",
                                             exit_code=0)
-                    self._consigner_verdict(demande, debut)
+                    self._consigner_verdict(demande, debut, "cause_scoree")
                     return
-                if (iterations < self.iterations_max and len(observations) < ACTIONS_MAX
-                        and time.time() - debut <= TIMEOUT_TOTAL_SECONDES):
+                if (iterations < self.iterations_max and len(observations) < self.actions_max
+                        and not self._temps_ecoule(debut)):
                     iterations += 1
                     en_attente, observations_au_challenge = demande, len(observations)
                     self.runner.record_step(
@@ -341,68 +777,128 @@ class Investigator:
                 self._declasser(demande, echecs, debut,
                                 f"{lecture}\ncause non établie, budget de vérification épuisé")
                 return
-            try:
-                if action == "sonde":
-                    observation = self._sonde(demande["url"], demande.get("identifiants", ""))
-                    commande = f"GET {demande['url']}" + (" avec Authorization: Basic" if demande.get("identifiants") else "")
-                elif action == "logs":
-                    observation = self._logs(demande["service"], demande.get("lignes", 50))
-                    commande = f"docker logs --tail {demande.get('lignes', 50)} {demande['service']}"
-                elif action == "exec":
-                    observation = self._exec(demande["service"], demande["commande"])
-                    commande = f"docker exec {demande['service']} sh -c {demande['commande']!r}"
-                elif action == "fichier":
-                    observation = self._fichier(demande["chemin"])
-                    commande = f"lecture de {demande['chemin']} dans la copie"
-                else:
-                    observation = f"action inconnue : {action}"
-                    commande = str(demande)[:200]
-            except Exception as erreur:
-                observation, commande = f"échec de l'action : {erreur}", str(demande)[:200]
-            titre = f"Investigation {len(observations) + 1} : {action}"
-            self.runner.record_step(titre, command=commande,
-                                    output=observation[:SORTIE_MAX], exit_code=0)
-            observations.append((titre, commande, observation[:SORTIE_MAX]))
+            retours = []
+            for demande in demandes:
+                if len(observations) >= self.actions_max or self._temps_ecoule(debut):
+                    break
+                action = demande.get("action")
+                if action == "verdict":
+                    retours.append("verdict ignoré : un verdict se rend seul, après les résultats")
+                    continue
+                if action == "hypothese":
+                    fiche, retour = self._tester_hypothese(demande)
+                    retours.append(retour)
+                    if fiche.get("resultat") == "etablie":
+                        self._conclure_etablie(fiche, debut)
+                        return
+                    continue
+                commande, observation = self._executer(demande)
+                titre = f"Investigation {len(observations) + 1} : {action}"
+                self.runner.record_step(titre, command=commande,
+                                        output=observation[:SORTIE_MAX], exit_code=0)
+                observations.append((titre, commande, observation[:SORTIE_MAX]))
+                retours.append(f"Observation :\n{observation[:SORTIE_MAX]}")
             messages.append({"role": "assistant", "content": brut})
-            messages.append({"role": "user", "content": f"Observation :\n{observation[:SORTIE_MAX]}"})
-            if len(observations) >= ACTIONS_MAX:
+            messages.append({"role": "user", "content":
+                "\n\n".join(retours) or "Aucune action exécutée : budget épuisé."})
+            if self._temps_ecoule(debut):
+                self._interrompre("budget temps épuisé", en_attente, echecs, debut)
+                return
+            if len(observations) >= self.actions_max:
                 break
         if en_attente is not None:
             self._declasser(en_attente, echecs, debut,
                             "budget d'actions épuisé avant un nouveau verdict")
             return
-        self.runner.record_step("Investigation — verdict",
-                                output="budget d'actions épuisé sans verdict : cause non établie",
-                                exit_code=1, duration=time.time() - debut)
+        self._non_etablie(echecs, debut, entete="budget d'actions épuisé sans verdict : "
+                                                "cause non établie", exit_code=1)
 
     # --- verdict -------------------------------------------------------------
 
-    def _consigner_verdict(self, verdict: dict, debut: float) -> None:
+    def _conclure_etablie(self, fiche: dict, debut: float) -> None:
+        experience = fiche["experiences"][-1]
         self.runner.record_step(
-            "Investigation — verdict",
-            output=(f"cause : {verdict.get('cause')}\n"
-                    f"faute : {verdict.get('faute')}\n"
-                    f"révélable au feedback : {verdict.get('revelable')}\n"
-                    f"à ne pas révéler : {verdict.get('non_revelable')}"),
-            exit_code=0, duration=time.time() - debut)
+            "Investigation — vérification du verdict",
+            output=(f"cause établie mécaniquement par l'hypothèse {fiche['id']} "
+                    f"(test : {experience['test']}) : scoreur non sollicité"),
+            exit_code=0)
+        self._consigner_verdict(
+            {"cause": fiche["enonce"], "faute": fiche["faute"],
+             "revelable": fiche.get("revelable") or fiche["enonce"],
+             "non_revelable": fiche.get("non_revelable") or ""},
+            debut, "cause_etablie", hypothese_etablie=fiche["id"])
+
+    def _non_etablie(self, echecs: list, debut: float, entete: str = "",
+                     exit_code: int = 0, non_revelable=None) -> None:
+        self._consigner_verdict(
+            {"cause": None, "faute": "indetermine", "revelable": self._symptome(echecs),
+             "non_revelable": non_revelable or ""},
+            debut, "cause_non_etablie", entete=entete, exit_code=exit_code)
+
+    def _consigner_verdict(self, verdict: dict, debut: float, statut: str, *,
+                           hypothese_etablie=None, piste=None, entete: str = "",
+                           exit_code: int = 0) -> None:
+        cause = verdict.get("cause")
+        lignes = [entete] if entete else []
+        lignes += [f"cause : {'non établie' if cause is None else cause}",
+                   f"faute : {verdict.get('faute')}",
+                   f"révélable au feedback : {verdict.get('revelable')}",
+                   f"à ne pas révéler : {verdict.get('non_revelable')}"]
+        fiches = list(self._hypotheses.values())
+        if fiches:
+            lignes.append("hypothèses :")
+            for fiche in fiches:
+                lignes.append(f"- {fiche['id']} — {fiche.get('enonce')} : "
+                              f"{_LIBELLES.get(fiche.get('resultat'), fiche.get('resultat'))}"
+                              + (f" ({fiche['raison_rejet']})" if fiche.get("raison_rejet") else ""))
+                for experience in fiche["experiences"]:
+                    resultat = experience["resultat"]
+                    lignes.append(f"    · {experience['test']} → code={self._val(resultat['code'])} "
+                                  f"exit_code={self._val(resultat['exit_code'])} : "
+                                  f"{_LIBELLES[experience['verdict']]}")
+
+        def publique(fiche):
+            garde = {"id": fiche["id"], "enonce": fiche.get("enonce"), "faute": fiche.get("faute"),
+                     "resultat": fiche.get("resultat"), "experiences": fiche["experiences"]}
+            if fiche.get("raison_rejet"):
+                garde["raison_rejet"] = fiche["raison_rejet"]
+            return garde
+
+        bloc = {"version": 1, "statut": statut,
+                "cause": None if statut == "cause_non_etablie" else cause, "piste": piste,
+                "faute": verdict.get("faute"), "revelable": verdict.get("revelable"),
+                "non_revelable": verdict.get("non_revelable"),
+                "hypothese_etablie": hypothese_etablie,
+                "hypotheses_restantes": [publique(f) for f in fiches
+                                         if f.get("resultat") in ("non_tranchee", "rejetee")],
+                "hypotheses_refutees": [publique(f) for f in fiches
+                                        if f.get("resultat") == "refutee"]}
+        lignes.append("bilan des hypothèses (JSON) :\n```json\n"
+                      + json.dumps(bloc, ensure_ascii=False, indent=2) + "\n```")
+        self.runner.record_step("Investigation — verdict", output="\n".join(lignes),
+                                exit_code=exit_code, duration=time.time() - debut)
 
     def _declasser(self, verdict: dict, echecs: list, debut: float, raison: str) -> None:
         """Une cause que le vérificateur n'a pas vue établie devient une
         hypothèse, et le feedback n'en dit que le symptôme."""
         cause = str(verdict.get("cause", ""))
-        if not cause.startswith(PREFIXE_HYPOTHESE):
-            cause = PREFIXE_HYPOTHESE + cause
+        piste = cause.removeprefix(PREFIXE_HYPOTHESE)
         self.runner.record_step("Investigation — vérification du verdict",
                                 output=f"{raison}\nverdict déclassé en hypothèse, faute indetermine",
                                 exit_code=0)
-        self._consigner_verdict({"cause": cause, "faute": "indetermine",
+        self._consigner_verdict({"cause": PREFIXE_HYPOTHESE + piste, "faute": "indetermine",
                                  "revelable": self._symptome(echecs),
-                                 "non_revelable": verdict.get("non_revelable")}, debut)
+                                 "non_revelable": verdict.get("non_revelable")},
+                                debut, "cause_non_etablie", piste=piste)
 
     def _interrompre(self, raison: str, en_attente, echecs: list, debut: float) -> None:
         self.runner.record_step("Investigation interrompue", output=raison, exit_code=1)
         if en_attente is not None:
             self._declasser(en_attente, echecs, debut, f"investigation interrompue : {raison}")
+        elif self._hypotheses:
+            # Les expériences déjà faites partent en revue humaine.
+            self._non_etablie(echecs, debut, entete=f"investigation interrompue : {raison}",
+                              exit_code=1)
 
     @staticmethod
     def _symptome(echecs: list) -> str:
