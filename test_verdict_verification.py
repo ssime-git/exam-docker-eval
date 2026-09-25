@@ -34,7 +34,7 @@ class RunnerFactice:
     def __init__(self):
         self.steps = []
 
-    def record_step(self, title, command="", output="", exit_code=0, duration=0):
+    def record_step(self, title, command="", output="", exit_code=0, duration=0, **champs):
         self.steps.append({"title": title, "command": command, "output": output,
                            "exit_code": exit_code})
 

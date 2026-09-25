@@ -38,6 +38,8 @@ class BaseRunner(ABC):
         # matiere du scratchpad : sans elle, un relecteur doit recouper trois
         # fichiers pour reconstituer une execution.
         self.steps: list = []
+        # Dépendances d'environnement vérifiées (#336), lues par l'investigateur.
+        self.dependances_environnement: list = []
 
     _TREE_SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
 
@@ -145,15 +147,19 @@ class BaseRunner(ABC):
         exit_code=None,
         note: str = "",
         duration=None,
+        **champs,
     ) -> None:
         """Consigner une etape de l'evaluation.
 
         `title` est ce qu'on cherchait a faire, en une ligne lisible.
         `command` est ce qui a reellement ete lance, `output` ce que ca a rendu.
         `note` est la remarque a afficher au relecteur avant la commande.
+        `champs` ajoute des cles lues par les consommateurs (ex. `verdict`
+        d'une etape Hypothese, `hypotheses_restantes` du verdict).
         """
         self.steps.append(
             {
+                **champs,
                 "title": title,
                 "command": command,
                 "output": output,

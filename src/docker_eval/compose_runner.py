@@ -339,6 +339,7 @@ class ComposeRunner(BaseRunner):
             # Avant le build : un échec de build (exec format error, image de
             # base introuvable) est justement là où la plateforme compte.
             self.consigner_environnement(None, runner_installe=False)
+            self._consigner_dependances(compose_file)
 
             # Create testcontainers Compose instance
             self.logger.info(f"Creating Docker Compose instance with project name: {self.project_name}")
@@ -538,6 +539,26 @@ class ComposeRunner(BaseRunner):
             if container.labels.get("com.docker.compose.service") == "pipeline":
                 return container
         return None
+
+    def _consigner_dependances(self, compose_file: str) -> None:
+        """Dépendances d'environnement du compose, et si cette machine les
+        satisfait (#336). Un fait pour la portabilité et pour l'imputation de
+        l'investigateur, jamais une faute : l'étape reste en 0. Sans
+        dépendance, l'étape est inchangée."""
+        from . import environnement
+        try:
+            deps = environnement.verifier_dependances(
+                environnement.dependances_environnement(self.eval_dir, compose_file))
+        except Exception as erreur:
+            self.logger.debug(f"dépendances d'environnement non lues : {erreur}")
+            deps = []
+        self.dependances_environnement = deps
+        if not deps:
+            return
+        self.completer_environnement(environnement.lignes_dependances(deps))
+        etape = getattr(self, "_etape_environnement", None)
+        if etape is not None:
+            etape["dependances_environnement"] = deps
 
     def _completer_environnement_compose(self) -> None:
         """Image, architecture et limites de chaque conteneur démarré."""

@@ -329,7 +329,7 @@ def test_investigator_garde_fous(tmp_path):
 
     class RunnerFactice:
         def __init__(self): self.steps = []
-        def record_step(self, title, command="", output="", exit_code=0, duration=0):
+        def record_step(self, title, command="", output="", exit_code=0, duration=0, **champs):
             self.steps.append({"title": title, "output": output, "exit_code": exit_code})
 
     (tmp_path / "note.txt").write_text("contenu de la copie")
@@ -350,7 +350,7 @@ def test_investigator_verdict_enregistre(monkeypatch, tmp_path):
 
     class RunnerFactice:
         def __init__(self): self.steps = []
-        def record_step(self, title, command="", output="", exit_code=0, duration=0):
+        def record_step(self, title, command="", output="", exit_code=0, duration=0, **champs):
             self.steps.append({"title": title, "output": output, "exit_code": exit_code})
 
     runner = RunnerFactice()
