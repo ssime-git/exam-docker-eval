@@ -75,11 +75,89 @@ VERIFICATION_TIMEOUT_SECONDES = 120
 PREUVES_MAX = 6000
 PREFIXE_HYPOTHESE = "hypothèse : "
 
-# ponytail: liste noire lexicale, pas un sandbox — le vrai garde-fou est
-# l'exec sans écriture possible sur la copie (elle vit hors conteneur) et
-# le budget d'actions. Durcir en whitelist si un exam l'exige.
-_EXEC_INTERDITS = (">", ">>", "rm ", "mv ", "cp ", "chmod", "chown", "kill",
-                   "shutdown", "reboot", "mkfs", "dd ", "wget", "curl -o", "tee")
+# Liste blanche : l'action `exec` ne lance que des lectures. Rejeu du 25/09
+# (461451) : un test proposé par le LLM a exécuté `apt-get install` dans le
+# conteneur de l'apprenant, que l'ancienne liste noire lexicale laissait passer
+# (apt-get, pip, sed -i, python -c…). Une commande est un ou plusieurs
+# segments reliés par `|`, chacun ouvert par un programme de lecture, sans
+# enchaînement, redirection ni substitution.
+_LECTURES = {
+    "cat", "head", "tail", "ls", "grep", "egrep", "wc", "sort", "uniq", "cut",
+    "ps", "env", "printenv", "getent", "nslookup", "dig", "ss", "netstat",
+    "id", "whoami", "df", "du", "uname", "hostname", "date", "stat", "which",
+    "find", "curl", "nginx", "python", "python3", "pip", "pip3",
+}
+_METACARACTERES = (";", "&&", "||", ">", "<", "`", "$(", "\n", "&")
+_OPTIONS_INTERDITES = {
+    "find": {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"},
+    "curl": {"-o", "-O", "--output", "--remote-name", "-X", "--request", "-d", "--data",
+             "--data-raw", "--data-binary", "--data-urlencode", "-T", "--upload-file",
+             "-F", "--form", "-K", "--config"},
+}
+_ARGUMENTS_AUTORISES = {
+    # Pour ces programmes, seuls ces premiers arguments sont des lectures.
+    "nginx": {"-T", "-t", "-v", "-V"},
+    "python": {"--version", "-V"},
+    "python3": {"--version", "-V"},
+    "pip": {"list", "show", "freeze", "--version", "-V"},
+    "pip3": {"list", "show", "freeze", "--version", "-V"},
+}
+
+
+def _arguments_dangereux(programme: str, args: list[str]) -> str | None:
+    """Programmes de lecture qui écrivent ou exécutent selon leurs arguments."""
+    import re
+    if programme == "env" and args:
+        # `env PROG` exécute PROG : seul `env` nu est une lecture.
+        return "env : sans argument seulement (env PROG exécute PROG)"
+    if programme == "printenv" and any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", a) for a in args):
+        return "printenv : noms de variables seulement"
+    if programme == "sort" and any(a == "-o" or a.startswith("--output") or (a.startswith("-") and not a.startswith("--") and "o" in a[1:]) for a in args):
+        return "sort -o écrit un fichier"
+    if programme == "uniq" and len([a for a in args if not a.startswith("-")]) > 1:
+        return "uniq ENTRÉE SORTIE écrit un fichier"
+    if programme == "date" and any(not a.startswith("+") for a in args):
+        return "date : format d'affichage (+…) seulement"
+    if programme == "hostname" and any(a not in {"-f", "-i", "-I", "-s", "-d"} for a in args):
+        return "hostname : lecture seulement"
+    if programme == "ss" and any(a in {"-K", "--kill"} or (a.startswith("-") and not a.startswith("--") and "K" in a[1:]) for a in args):
+        return "ss -K coupe des connexions"
+    return None
+
+
+def commande_de_lecture(commande: str) -> str | None:
+    """None si la commande n'est qu'une lecture, sinon la raison du refus."""
+    import shlex
+    if not commande or not commande.strip():
+        return "commande vide"
+    if "\n" in commande:
+        return "une seule ligne de commande"
+    for meta in _METACARACTERES:
+        if meta in commande:
+            return f"« {meta} » interdit : ni enchaînement, ni redirection, ni substitution"
+    for segment in commande.split("|"):
+        try:
+            mots = shlex.split(segment)
+        except ValueError:
+            return "commande mal formée"
+        if not mots:
+            return "segment vide"
+        programme = mots[0].rsplit("/", 1)[-1]
+        if programme not in _LECTURES:
+            return f"« {programme} » n'est pas un programme de lecture"
+        interdites = _OPTIONS_INTERDITES.get(programme, set())
+        for mot in mots[1:]:
+            option = mot.split("=", 1)[0]
+            if option in interdites or (programme == "curl" and option.startswith("-") and not option.startswith("--")
+                                        and any(c in option[1:] for c in "oOXdTFK")):
+                return f"option « {mot} » de {programme} : écriture ou envoi"
+        refus = _arguments_dangereux(programme, mots[1:])
+        if refus:
+            return refus
+        autorises = _ARGUMENTS_AUTORISES.get(programme)
+        if autorises is not None and (len(mots) < 2 or mots[1] not in autorises):
+            return f"{programme} : seules les lectures {sorted(autorises)} sont permises"
+    return None
 
 PROMPT_SYSTEME = """Tu investigues l'échec d'une évaluation d'examen pendant que la stack Docker tourne encore.
 Tu réponds UNIQUEMENT par un objet JSON, sans texte autour. Actions disponibles :
@@ -215,8 +293,9 @@ class Investigator:
     def _exec(self, service: str, commande: str) -> str:
         if service not in self.services:
             return "refusé : conteneur hors du périmètre de la copie"
-        if any(interdit in commande for interdit in _EXEC_INTERDITS):
-            return "refusé : commande d'écriture ou de réseau — lecture seule"
+        refus = commande_de_lecture(commande)
+        if refus:
+            return f"refusé : lecture seule — {refus}"
         resultat = subprocess.run(
             ["docker", "exec", service, "sh", "-c", commande],
             capture_output=True, text=True, timeout=20)
