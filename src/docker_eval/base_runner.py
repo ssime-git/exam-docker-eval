@@ -38,6 +38,8 @@ class BaseRunner(ABC):
         # matiere du scratchpad : sans elle, un relecteur doit recouper trois
         # fichiers pour reconstituer une execution.
         self.steps: list = []
+        # Dépendances d'environnement vérifiées (#336), lues par l'investigateur.
+        self.dependances_environnement: list = []
 
     _TREE_SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
 

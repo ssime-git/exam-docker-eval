@@ -35,7 +35,7 @@ Une hypothèse porte un test et deux prédictions :
 
 ```json
 {"action":"hypothese","id":"H1","enonce":"le DNS imposé ne résout pas l'hôte du dataset",
- "faute":"apprenant",
+ "faute":"environnement",
  "test":{"action":"dns","service":"bike-api","nom":"archive.ics.uci.edu"},
  "si_vraie":{"exit_code":2},"si_fausse":{"exit_code":0}}
 ```
@@ -47,6 +47,24 @@ Une hypothèse porte un test et deux prédictions :
 
 La première hypothèse établie donne la `cause` et la `faute` du verdict, sans passer par le scoreur de #307. Sinon le verdict est « cause non établie », `faute: indetermine`, et le révélable se réduit au symptôme observé. Un verdict direct `{"action":"verdict",…}` reste accepté et passe par le scoreur comme avant.
 
+### Dépendances d'environnement et faute `environnement`
+
+461451 imposait `dns: 172.31.0.2`, le résolveur du VPC AWS de la machine de correction. En production, la copie passait. Hors de ce réseau, le DNS ne répond pas. Le fait est vrai, mais la faute n'est pas celle de l'apprenant.
+
+Avant le build, le runner compose relève ce qui lie la copie au réseau d'une machine précise. Il vérifie ensuite si la machine courante le satisfait :
+
+| dépendance | où | vérification |
+|---|---|---|
+| `dns` vers une IP privée (10/8, 172.16/12, 192.168/16, 169.254/16) | compose | requête DNS UDP réelle vers `<ip>:53` depuis l'hôte, 2 s. Toute réponse prouve que le résolveur est joignable. Le test du même /16 ne suffit pas : 172.31.0.2 répond dans tout le VPC, et un bridge docker local peut coïncider. |
+| IP privée en dur | `environment`, `command`, `entrypoint`, Dockerfile | l'IP est dans le sous-réseau d'une interface locale (`ip -o addr`) |
+| `extra_hosts` vers une IP privée | compose | idem |
+| `network_mode: host` | compose | satisfait sur Docker Linux natif |
+| téléchargement externe au démarrage | URL http(s) dans `command`, `entrypoint`, `environment`, `CMD`/`ENTRYPOINT` | connexion TCP vers l'hôte de l'URL, 3 s |
+
+Les dépendances trouvées sont ajoutées à l'étape « Environnement du harnais », sous `dépendances d'environnement : …`, avec la clé `dependances_environnement`. Elles figurent aussi dans le bloc JSON du verdict. C'est un fait, qui peut servir à un conseil de portabilité, et jamais une faute. Une copie sans dépendance garde une étape inchangée.
+
+Une hypothèse établie dont le test porte sur une dépendance **non satisfaite** reçoit mécaniquement `faute: environnement`, jamais `apprenant`. Le test porte sur la dépendance dans quatre cas : il vise un service qui l'a, la dépendance vient d'un Dockerfile, il ne vise aucun service (sonde, fichier), ou la valeur de la dépendance apparaît dans sa commande ou sa sortie. **Les consommateurs doivent lire `environnement` comme « non-apprenant »**, au même titre que `harnais` et `indetermine`.
+
 ### Contrat des étapes (lu par scriptorium#340)
 
 - **Étape d'expérience** : titre `Hypothèse H<n> — <énoncé>`, `command` = le test exécuté. La sortie contient une ligne `résultat : code=… exit_code=…`, puis les lignes correspondant aux sous-chaînes prédites. Elle finit par `verdict : établie | réfutée | non tranchée`. La clé `verdict` de l'étape porte la même valeur. Une hypothèse rejetée a aussi son étape, avec le verdict `non tranchée`.
@@ -56,9 +74,12 @@ La première hypothèse établie donne la `cause` et la `faute` du verdict, sans
 {"version": 1,
  "statut": "cause_etablie | cause_scoree | cause_non_verifiee | cause_non_etablie",
  "cause": "… ou null", "piste": "cause d'un verdict direct déclassé, ou null",
- "faute": "apprenant | harnais | indetermine",
+ "faute": "apprenant | harnais | environnement | indetermine",
  "revelable": "…", "non_revelable": "…",
  "hypothese_etablie": "H1 ou null",
+ "dependances_environnement": [{"type": "dns", "service": "bike-api", "valeur": "172.31.0.2",
+                                "source": "dns", "detail": "résolveur DNS privé imposé",
+                                "satisfaite": false, "verification": "requête DNS UDP …"}],
  "hypotheses_restantes": [{"id": "H2", "enonce": "…", "faute": "…",
                            "resultat": "non_tranchee | rejetee",
                            "raison_rejet": "si rejetee",

@@ -97,8 +97,11 @@ class Processus:
 
 # --- hypothese etablie / refutee / non tranchee ------------------------------
 
-def test_461451_dns_impose_etabli(tmp_path, monkeypatch):
-    """bike-api en connection reset : le DNS impose ne resout pas le dataset."""
+def test_hypothese_dns_etablie_sans_dependance_detectee(tmp_path, monkeypatch):
+    """Mecanique d'une hypothese etablie par `dns`. Le runner factice n'a
+    detecte aucune dependance d'environnement : la faute proposee reste. Le
+    vrai 461451 (dns: 172.31.0.2, resolveur du VPC AWS de la correction) est
+    rejoue dans test_dependances_environnement.py : faute environnement."""
     processus = Processus([
         ("getent", (2, "--- /etc/resolv.conf\nnameserver 172.31.0.2\n")),
     ])

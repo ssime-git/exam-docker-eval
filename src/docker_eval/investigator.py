@@ -14,7 +14,7 @@ Débogage par hypothèse (scriptorium #336). Le LLM conçoit l'expérience, le
 harnais la juge. Il propose une ou plusieurs hypothèses (un objet, ou une
 liste d'objets) :
 
-    {"action":"hypothese","id":"H1","enonce":"…","faute":"apprenant|harnais|indetermine",
+    {"action":"hypothese","id":"H1","enonce":"…","faute":"apprenant|harnais|environnement|indetermine",
      "test":{<action de lecture : sonde, logs, exec, fichier, dns, ports, env>},
      "si_vraie":{<prédiction>},"si_fausse":{<prédiction>},
      "revelable":"…(optionnel)","non_revelable":"…(optionnel)"}
@@ -51,6 +51,19 @@ son étape, avec le verdict « non tranchée ». La première hypothèse
 celle du verdict. Le scoreur de #307 n'est pas sollicité, et l'étape
 « Investigation — vérification du verdict » le consigne.
 
+Faute `environnement`. Le runner relève avant exécution les dépendances
+d'environnement de la copie (environnement.dependances_environnement :
+dns: vers une IP privée, IP privée en dur, network_mode: host, extra_hosts,
+téléchargement externe au démarrage) et vérifie si la machine courante les
+satisfait. Une hypothèse établie dont le test porte sur une dépendance NON
+satisfaite reçoit mécaniquement `faute: environnement`, jamais `apprenant`
+(461451 : dns: 172.31.0.2, le résolveur du VPC AWS de la correction). Le
+test « porte sur » la dépendance quand il vise un service qui l'a, quand la
+dépendance n'a pas de service (Dockerfile), quand il ne vise aucun service
+(sonde, fichier), ou quand la valeur de la dépendance apparaît dans sa
+commande ou sa sortie. Les consommateurs lisent `environnement` comme
+« non-apprenant », au même titre que harnais et indetermine.
+
 Verdict direct (compatibilité). {"action":"verdict",…} reste accepté. Un
 verdict qui impute une faute (`faute` ≠ `indetermine`) n'est pas pris sur
 la parole du LLM (scriptorium #307) : sa `cause` est scorée par un
@@ -85,9 +98,13 @@ se termine TOUJOURS par un bloc JSON pour les consommateurs (scriptorium
      "statut": "cause_etablie" | "cause_scoree" | "cause_non_verifiee" | "cause_non_etablie",
      "cause": str | null,              # null si statut = cause_non_etablie
      "piste": str | null,              # cause d'un verdict direct déclassé
-     "faute": "apprenant" | "harnais" | "indetermine",
+     "faute": "apprenant" | "harnais" | "environnement" | "indetermine",
      "revelable": str, "non_revelable": str,
      "hypothese_etablie": "H1" | null,
+     "dependances_environnement": [{"type": "dns|ip_privee|extra_hosts|network_mode|telechargement",
+                                    "service": str|null, "valeur": str, "source": str,
+                                    "detail": str, "satisfaite": bool|null,
+                                    "verification": str}],
      "hypotheses_restantes": [<hypothèse>],   # non tranchées et rejetées
      "hypotheses_refutees": [<hypothèse>]}
 
@@ -186,7 +203,11 @@ _EXEC_INTERDITS = (">", ">>", "rm ", "mv ", "cp ", "chmod", "chown", "kill",
                    "shutdown", "reboot", "mkfs", "dd ", "wget", "curl -o", "tee")
 
 ACTIONS_LECTURE = ("sonde", "logs", "exec", "fichier", "dns", "ports", "env")
-FAUTES = ("apprenant", "harnais", "indetermine")
+# `environnement` : la cause tient à une dépendance de la copie envers le
+# réseau d'une machine précise (461451 : dns: 172.31.0.2, résolveur du VPC
+# AWS de la correction). Les consommateurs la lisent comme « non-apprenant »,
+# au même titre que harnais et indetermine.
+FAUTES = ("apprenant", "harnais", "indetermine", "environnement")
 CLES_PREDICTION = ("code", "exit_code", "contient", "ne_contient_pas")
 # Ce que le harnais rend quand il n'a rien observé : jamais une observation.
 _NON_OBSERVATIONS = ("refusé", "échec de l'action", "action inconnue")
@@ -204,7 +225,7 @@ PROMPT_SYSTEME = """Tu investigues l'échec d'une évaluation d'examen pendant q
 Tu réponds UNIQUEMENT par du JSON (un objet, ou une liste d'hypothèses), sans texte autour.
 
 Méthode attendue : le débogage par hypothèse. Tu conçois l'expérience ; le harnais l'exécute et la juge.
-{"action":"hypothese","id":"H1","enonce":"<cause supposée>","faute":"apprenant|harnais|indetermine","test":{<une action de lecture ci-dessous>},"si_vraie":{<prédiction>},"si_fausse":{<prédiction>},"revelable":"<ce que le feedback pourra dire si elle est établie : symptôme, où chercher>","non_revelable":"<la solution, à ne jamais donner>"}
+{"action":"hypothese","id":"H1","enonce":"<cause supposée>","faute":"apprenant|harnais|environnement|indetermine","test":{<une action de lecture ci-dessous>},"si_vraie":{<prédiction>},"si_fausse":{<prédiction>},"revelable":"<ce que le feedback pourra dire si elle est établie : symptôme, où chercher>","non_revelable":"<la solution, à ne jamais donner>"}
 Une prédiction combine (ET) : "code" (code HTTP, entier ou liste), "exit_code" (entier ou liste),
 "contient" / "ne_contient_pas" (sous-chaîne ou liste). Les deux prédictions doivent s'exclure : codes
 différents, exit_code différents, ou "contient":"X" face à "ne_contient_pas":"Y" avec Y inclus dans X.
@@ -213,6 +234,13 @@ est établie. "revelable" et "non_revelable" servent au verdict si elle est éta
 peut contenir la solution. Le harnais répond établie, réfutée ou non tranchée. La première hypothèse établie devient la
 cause du verdict : tu n'as rien d'autre à faire. Réfutée ou non tranchée : propose une autre expérience.
 Tu peux envoyer plusieurs hypothèses d'un coup dans une liste JSON ; chaque test coûte une action.
+
+Dépendances d'environnement : le harnais te liste, s'il en a trouvé, ce qui lie la copie au réseau d'une
+machine précise (dns: vers une IP privée, IP privée en dur, network_mode: host, extra_hosts, téléchargement
+externe au démarrage) et si CETTE machine le satisfait. Une cause qui tient à une dépendance d'environnement
+non satisfaite n'est jamais une faute de l'apprenant : "faute":"environnement". Le harnais l'impose de toute
+façon à une hypothèse établie qui porte sur un service concerné. Ce constat peut guider un conseil de
+portabilité, jamais un reproche.
 
 Actions de lecture (utilisables seules ou comme "test" d'une hypothèse) :
 {"action":"sonde","url":"http(s)://127.0.0.1:<port>/<chemin>","identifiants":"user:pass"} — refaire une requête, chemins et schémas libres ; "identifiants" (optionnel) ajoute une authentification Basic
@@ -479,6 +507,8 @@ class Investigator:
         self.actions_max = _nombre_env("PI_CORRECTOR_INVESTIGATE_MAX_ACTIONS", ACTIONS_MAX, int)
         self.timeout_total = _nombre_env("PI_CORRECTOR_INVESTIGATE_TIMEOUT_SECONDS",
                                          TIMEOUT_TOTAL_SECONDES, float)
+        # Vérifiées par le runner avant exécution (environnement.py).
+        self.dependances = list(getattr(runner, "dependances_environnement", None) or [])
         self._observations = []   # (titre, commande, sortie) : les preuves de #307
         self._hypotheses = {}     # id -> hypothèse et ses expériences, dans l'ordre
 
@@ -698,6 +728,7 @@ class Investigator:
                 + (" (lecture tronquée : une absence n'y prouve rien)" if lu["tronquee"] else "")
                 + ("" if lu["fiable"] else " (le harnais n'a rien observé)"))
         fiche["resultat"] = verdict
+        fiche["_test"], fiche["_observation"] = demande["test"], commande + "\n" + lu["integrale"]
         fiche["experiences"].append({
             "test": commande,
             "prediction": {"si_vraie": demande["si_vraie"], "si_fausse": demande["si_fausse"]},
@@ -778,6 +809,7 @@ class Investigator:
             {"role": "system", "content": PROMPT_SYSTEME.replace("{actions_max}", str(self.actions_max))},
             {"role": "user", "content": f"Étapes en échec (non attendues) :\n{resume_echecs}\n"
                                         f"Conteneurs debout : {self._conteneurs()}\n"
+                                        f"{self._dependances_pour_llm()}"
                                         f"Fichiers de la copie :\n{self._inventaire()}\nCommence."},
         ]
         iterations = 0          # challenges du vérificateur déjà renvoyés au LLM
@@ -893,15 +925,51 @@ class Investigator:
 
     # --- verdict -------------------------------------------------------------
 
+    def _dependances_pour_llm(self) -> str:
+        if not self.dependances:
+            return ""
+        from .environnement import decrire_dependance
+        lignes = [f"- {decrire_dependance(d)} : "
+                  + {True: "satisfaite", False: "NON satisfaite"}.get(d.get("satisfaite"), "non vérifiable")
+                  + " par cette machine" for d in self.dependances]
+        return "Dépendances d'environnement détectées (faits du harnais) :\n" + "\n".join(lignes) + "\n"
+
+    def _dependance_en_cause(self, fiche: dict):
+        """La dépendance non satisfaite sur laquelle porte le test de
+        l'hypothèse, ou None. Règle volontairement large, pour ne jamais
+        imputer l'apprenant à tort : le test vise un service qui a la
+        dépendance, ou une dépendance sans service (Dockerfile) ; le test ne
+        vise aucun service (sonde, fichier) ; ou la valeur de la dépendance
+        apparaît dans la commande ou la sortie du test."""
+        test = fiche.get("_test") or {}
+        service = test.get("service")
+        for dep in self.dependances:
+            if dep.get("satisfaite") is not False:
+                continue
+            if (service is None or dep.get("service") in (None, service)
+                    or str(dep.get("valeur")) in fiche.get("_observation", "")):
+                return dep
+        return None
+
     def _conclure_etablie(self, fiche: dict, debut: float) -> None:
         experience = fiche["experiences"][-1]
+        faute = fiche["faute"]
+        imputation = ""
+        dep = self._dependance_en_cause(fiche)
+        if dep is not None:
+            from .environnement import decrire_dependance
+            faute = "environnement"
+            imputation = (f"\nfaute environnement : le test porte sur une dépendance d'environnement "
+                          f"non satisfaite par cette machine ({decrire_dependance(dep)} ; "
+                          f"{dep.get('verification', '')}). Jamais apprenant"
+                          + (f", faute proposée « {fiche['faute']} » remplacée" if fiche["faute"] != "environnement" else ""))
         self.runner.record_step(
             "Investigation — vérification du verdict",
             output=(f"cause établie mécaniquement par l'hypothèse {fiche['id']} "
-                    f"(test : {experience['test']}) : scoreur non sollicité"),
+                    f"(test : {experience['test']}) : scoreur non sollicité{imputation}"),
             exit_code=0)
         self._consigner_verdict(
-            {"cause": fiche["enonce"], "faute": fiche["faute"],
+            {"cause": fiche["enonce"], "faute": faute,
              "revelable": fiche.get("revelable") or fiche["enonce"],
              "non_revelable": fiche.get("non_revelable") or ""},
             debut, "cause_etablie", hypothese_etablie=fiche["id"])
@@ -947,6 +1015,7 @@ class Investigator:
                 "faute": verdict.get("faute"), "revelable": verdict.get("revelable"),
                 "non_revelable": verdict.get("non_revelable"),
                 "hypothese_etablie": hypothese_etablie,
+                "dependances_environnement": self.dependances,
                 "hypotheses_restantes": [publique(f) for f in fiches
                                          if f.get("resultat") in ("non_tranchee", "rejetee")],
                 "hypotheses_refutees": [publique(f) for f in fiches
