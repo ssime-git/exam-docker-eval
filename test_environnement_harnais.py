@@ -121,8 +121,10 @@ def test_bentoml_image_seule_garde_ses_etapes_et_l_environnement(tmp_path, monke
     assert resultat["steps"][0]["title"] == "Ce que l'apprenant a rendu"
     env = etape(resultat["steps"])
     assert env["exit_code"] == 0
-    assert f"Python des tests et des dépendances de la copie : {PYTHON_TESTS} " \
-           f"(uvx --python {PYTHON_TESTS}, résolu en 3.11.15)" in env["output"]
+    # Le Python des tests est celui que la copie déclare (README : 3.12), plus
+    # le défaut du harnais : en 3.11, numpy==2.5.3 ne s'installait pas.
+    assert "Python des tests et des dépendances de la copie : 3.12 " \
+           "(uvx --python 3.12, résolu en 3.11.15)" in env["output"]
     assert "version déclarée par la copie : 3.12 (exam_bentoml_rendu/README.md : " \
            "uv venv --python 3.12 .venv)" in env["output"]
     assert "machine : amd64, émulation QEMU absente" in env["output"]

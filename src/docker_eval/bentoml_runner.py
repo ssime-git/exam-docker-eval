@@ -22,6 +22,7 @@ from typing import Dict, Any, Optional
 import requests
 from testcontainers.core.container import DockerContainer
 
+from . import environnement
 from .base_runner import BaseRunner
 from .utils import find_credentials_in_texts, looks_like_test_file
 from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT, EMULATION_TIMEOUT_FACTOR, PYTHON_TESTS
@@ -84,7 +85,8 @@ class BentoMLRunner(BaseRunner):
         # Ce que l'apprenant a rendu ouvre la trace : c'est la premiere chose
         # qu'un relecteur regarde.
         self.record_submission_step()
-        self.consigner_environnement(PYTHON_TESTS)
+        # Le Python retenu pour les tests : celui que la copie déclare (461638).
+        self.consigner_environnement(environnement.pythons_pour_les_tests(self.eval_dir, PYTHON_TESTS)[0])
         emulated_platform = None
         auto_containerized = False
         image_loaded = False
@@ -1179,6 +1181,9 @@ class BentoMLRunner(BaseRunner):
             re.MULTILINE,
         )
 
+        adresse_du_service = re.compile(
+            rf"http://(?:127\.0\.0\.1|localhost|0\.0\.0\.0):{BENTOML_PORT}(?![0-9])")
+
         for root, _, files in os.walk(dst_tests_path):
             for filename in files:
                 if not filename.endswith(".py"):
@@ -1191,6 +1196,12 @@ class BentoMLRunner(BaseRunner):
                     r'\1os.getenv("BENTOML_BASE_URL", \2http://127.0.0.1:3000\3)',
                     content,
                 )
+                # Toute autre forme qui vise le port du service : un défaut
+                # d'os.environ.get sous un nom qu'on n'exporte pas (459845 :
+                # SERVICE_BASE_URL, repli localhost:3000, 8 tests en connexion
+                # refusée), une URL en dur dans une fixture. Le service tourne
+                # sur un port éphémère : l'adresse documentée ne répond pas.
+                new_content = adresse_du_service.sub(base_url, new_content)
                 if new_content != content:
                     if "import os" not in new_content:
                         if re.search(r"^from __future__ import .+$", new_content, re.MULTILINE):
@@ -1206,7 +1217,7 @@ class BentoMLRunner(BaseRunner):
                     with open(filepath, "w", encoding="utf-8") as handle:
                         handle.write(new_content)
                     self.logger.info(
-                        f"Rewrote hardcoded BASE_URL in tests for dynamic port: {filepath}"
+                        f"Rewrote service URL in tests for dynamic port: {filepath}"
                     )
 
         self.logger.info(
@@ -1280,10 +1291,11 @@ class BentoMLRunner(BaseRunner):
             results["evaluable"] = False
             return results
 
+        pythons = environnement.pythons_pour_les_tests(self.eval_dir, PYTHON_TESTS)
         command = [
             "uvx",
             "--python",
-            PYTHON_TESTS,
+            pythons[0],
             "--with",
             "pytest",
             "--with",
@@ -1339,7 +1351,8 @@ class BentoMLRunner(BaseRunner):
         # courantes ne coûte rien et note ce que les tests valent vraiment.
         # Convention d'examen declarable (pi_test_env, #49).
         noms_env = [n.strip() for n in (os.environ.get("EXAM_TEST_ENV")
-                                        or "BASE_URL,API_URL,SERVICE_URL").split(",") if n.strip()]
+                                        or "BASE_URL,API_URL,SERVICE_URL,SERVICE_BASE_URL,API_BASE_URL,BENTO_URL").split(",")
+                    if n.strip()]
         for nom in noms_env:
             env.setdefault(nom, base_url)
         # Le meme secret que le conteneur : des tests qui forgent leur propre
@@ -1359,6 +1372,22 @@ class BentoMLRunner(BaseRunner):
             text=True,
             env=env,
         )
+        # uv n'a pas pu installer les dépendances de la copie pour ce Python
+        # (rien n'a tourné, pas de rapport) : le suivant, consigné.
+        essais = [pythons[0]]
+        position = command.index("--python") + 1
+        for suivant in pythons[1:]:
+            sortie = (result.stdout or "") + (result.stderr or "")
+            if (result.returncode in (0, 5) or os.path.exists(junit_path)
+                    or not environnement.installation_impossible(sortie)):
+                break
+            self.logger.info(
+                f"Dépendances des tests non installables en Python {command[position]} : essai en {suivant}")
+            command[position] = suivant
+            essais.append(suivant)
+            result = subprocess.run(command, cwd=projet, capture_output=True, text=True, env=env)
+        results["python"] = command[position]
+        results["pythons_essayes"] = essais
 
         if result.returncode == 5:
             # Pytest exit code 5 means nothing collected; retry with explicit python files.
