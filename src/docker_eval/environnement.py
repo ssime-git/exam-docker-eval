@@ -65,6 +65,39 @@ def versions_python_declarees(eval_dir: str) -> list:
     return declarees
 
 
+VERSIONS_PRISES_EN_CHARGE = ("3.10", "3.11", "3.12", "3.13")
+
+
+def pythons_pour_les_tests(eval_dir: str, defaut: str) -> list:
+    """Les Python à essayer pour les tests, dans l'ordre : celui que la copie
+    déclare, le défaut du harnais, puis les plus récents.
+
+    461638 : requirements.txt fixait numpy==2.5.3 (Python >= 3.12), le README
+    disait `uv venv --python 3.12`, et uvx tournait en 3.11 : aucun test
+    collecté, catégorie hors barème. La déclaration passe d'abord ; une copie
+    qui ne déclare rien mais exige un Python récent se rattrape au repli."""
+    candidats = []
+    for _, version, _ in versions_python_declarees(eval_dir):
+        trouve = re.search(r"3\.(\d+)", version)
+        if trouve and f"3.{trouve.group(1)}" in VERSIONS_PRISES_EN_CHARGE:
+            candidats.append(f"3.{trouve.group(1)}")
+            break
+    for version in (defaut, *VERSIONS_PRISES_EN_CHARGE):
+        if version in VERSIONS_PRISES_EN_CHARGE and version >= defaut and version not in candidats:
+            candidats.append(version)
+    return candidats
+
+
+# uv n'a pas pu installer les dépendances pour ce Python : un autre peut.
+_ECHEC_INSTALLATION_UV = re.compile(
+    r"No solution found when resolving|requires-python|Requires-Python|Failed to (?:build|run tool|install)"
+    r"|only has wheels for|has no wheels with a matching Python")
+
+
+def installation_impossible(sortie: str) -> bool:
+    return bool(_ECHEC_INSTALLATION_UV.search(sortie or ""))
+
+
 def images_de_base(eval_dir: str) -> list:
     """(image, Dockerfile) des FROM de la copie, sans les étapes nommées."""
     images = []
