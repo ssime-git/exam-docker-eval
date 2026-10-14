@@ -430,3 +430,42 @@ def test_requetes_declarees(tmp_path):
     assert "sentence" in predict["corps"]
     assert predict["entetes"].get("Content-Type") == "application/json"
     assert any(r["chemin"] == "/health" and r["methode"] == "GET" for r in reqs)
+
+
+def test_fixed_container_names_become_network_aliases(tmp_path, logger):
+    """461416 : deux corrections simultanées se disputaient
+    `container_name: prometheus_server` (« Conflict. The container name is
+    already in use »), et la copie échouait sans y être pour rien. Le nom fixe
+    devient un alias réseau : la copie qui y fait référence (proxy_pass
+    http://api_v2) le résout toujours."""
+    import yaml
+
+    runner = make_runner(
+        tmp_path,
+        logger,
+        "services:\n"
+        "  api-v2:\n    image: api\n    container_name: api_v2\n"
+        "  prometheus:\n    image: prom\n    container_name: prometheus_server\n"
+        "    networks: [monitoring, default]\n"
+        "  grafana:\n    image: graf\n    container_name: grafana_dashboard\n"
+        "    networks:\n      monitoring:\n        ipv4_address: 172.30.0.9\n"
+        "  hote:\n    image: x\n    container_name: sur_l_hote\n    network_mode: host\n"
+        "networks:\n  monitoring: {}\n",
+    )
+
+    nom = runner._relax_host_ports(str(tmp_path / "docker-compose.yml"))
+
+    doc = yaml.safe_load((tmp_path / nom).read_text())
+    services = doc["services"]
+    assert "container_name" not in services["api-v2"]
+    assert services["api-v2"]["networks"] == {"default": {"aliases": ["api_v2"]}}
+    assert services["prometheus"]["networks"] == {
+        "monitoring": {"aliases": ["prometheus_server"]},
+        "default": {"aliases": ["prometheus_server"]},
+    }
+    assert services["grafana"]["networks"]["monitoring"] == {
+        "ipv4_address": "172.30.0.9", "aliases": ["grafana_dashboard"],
+    }
+    # sans réseau Compose, pas d'alias possible : le nom reste
+    assert services["hote"]["container_name"] == "sur_l_hote"
+    assert "alias" in runner._port_relaxation_outcome

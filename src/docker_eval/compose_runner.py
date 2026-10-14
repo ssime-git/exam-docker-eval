@@ -230,6 +230,30 @@ class ComposeRunner(BaseRunner):
         # fidèlement après la sortie du context manager.
         self._compose_project_names = set()
 
+    @staticmethod
+    def _nom_fixe_en_alias(service: dict) -> bool:
+        """Remplacer `container_name` par un alias réseau du même nom.
+
+        461416 : deux corrections simultanées se disputaient
+        `container_name: prometheus_server`. L'alias garde le nom résolvable
+        (une copie qui fait `proxy_pass http://api_v2` marche toujours) sans
+        réserver un nom global sur la machine. Sans réseau Compose
+        (`network_mode`), pas d'alias possible : le nom reste.
+        """
+        nom = service.get("container_name")
+        if not nom or "network_mode" in service:
+            return False
+        reseaux = service.get("networks") or ["default"]
+        if isinstance(reseaux, list):
+            reseaux = {reseau: None for reseau in reseaux}
+        for reseau, reglages in list(reseaux.items()):
+            reglages = dict(reglages or {})
+            reglages["aliases"] = [*reglages.get("aliases", []), nom]
+            reseaux[reseau] = reglages
+        service["networks"] = reseaux
+        del service["container_name"]
+        return True
+
     def _relax_host_ports(self, compose_file: str) -> str:
         """Ecrit une copie du compose sans port hote fige, et rend son nom.
 
@@ -264,7 +288,11 @@ class ComposeRunner(BaseRunner):
             return os.path.basename(compose_file)
 
         changed = False
-        for service in doc["services"].values():
+        alias = []
+        for nom_service, service in doc["services"].items():
+            if isinstance(service, dict) and self._nom_fixe_en_alias(service):
+                alias.append(nom_service)
+                changed = True
             if not isinstance(service, dict) or "ports" not in service:
                 continue
             relaxed = []
@@ -291,7 +319,8 @@ class ComposeRunner(BaseRunner):
             return os.path.basename(compose_file)
 
         self.logger.info("Ports hote relaches : Docker en attribuera de libres")
-        self._port_relaxation_outcome = f"Ports hôte relâchés dans {relaxed_name}."
+        self._port_relaxation_outcome = f"Ports hôte relâchés dans {relaxed_name}." + (
+            f" Noms de conteneur fixes devenus alias réseau : {', '.join(alias)}." if alias else "")
         self._port_relaxation_exit_code = 0
         return relaxed_name
 
