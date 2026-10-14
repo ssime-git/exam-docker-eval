@@ -16,6 +16,7 @@ class Faux:
         self.eval_dir = eval_dir
         self.steps = [{"title": "Sonde", "exit_code": 1}]
         self.logger = logging.getLogger("test")
+        self.student_name = "copie-x"
 
 
 with tempfile.TemporaryDirectory() as racine:
@@ -39,6 +40,8 @@ echo intrus > {rendu}/nouveau.txt
     assert open(os.path.join(rendu, "conf", "nginx.conf")).read() == "original\n"
     assert not os.path.exists(os.path.join(rendu, "nouveau.txt"))
     assert os.path.exists(os.path.join(sortie, "stack.json"))
+    import json
+    assert json.load(open(os.path.join(sortie, "stack.json")))["projet"] == "eval_copie-x"
     # Un second démontage (runners imbriqués) ne relance pas l'agent.
     avant_demontage(runner, [])
     # Sans EXAM_AGENT_HOOK, rien ne se passe.

@@ -106,6 +106,9 @@ def avant_demontage(runner, conteneurs: list) -> None:
     poignee = {
         "eval_dir": os.path.abspath(runner.eval_dir),
         "runner": type(runner).__name__,
+        # Le projet compose de cette copie : l'agent en dérive le sien, pour
+        # que deux corrections parallèles ne relancent pas la même stack.
+        "projet": getattr(runner, "project_name", None) or f"eval_{runner.student_name}",
         "conteneurs": [_decrire(nom) for nom in conteneurs],
         "steps": runner.steps,
     }
