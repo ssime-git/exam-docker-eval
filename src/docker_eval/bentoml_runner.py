@@ -4015,6 +4015,8 @@ class BentoMLRunner(BaseRunner):
         Args:
             force: If True, ignore errors and force cleanup
         """
+        from .agent_hook import avant_demontage
+        avant_demontage(self, [self.container_name])
         if self.container:
             try:
                 self.logger.info("Stopping BentoML container...")
