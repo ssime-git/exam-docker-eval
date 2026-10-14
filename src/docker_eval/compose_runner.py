@@ -259,6 +259,23 @@ def annoter_bruit_de_sondes(sondes: list) -> None:
             )
 
 
+class _DemarrageSansDemontage:
+    """`with compose:` sans le démontage que testcontainers fait sur un `up`
+    raté : son __enter__ appelle __exit__ en cas d'échec, et les conteneurs
+    disparaissaient avant que le moteur ne relève leur état et leurs logs
+    (461416). Le démontage reste garanti par cleanup()."""
+
+    def __init__(self, compose):
+        self.compose = compose
+
+    def __enter__(self):
+        self.compose.start()
+        return self.compose
+
+    def __exit__(self, *exc):
+        return self.compose.__exit__(*exc)
+
+
 class ComposeRunner(BaseRunner):
     """
     Runner for evaluations using Docker Compose.
@@ -493,7 +510,7 @@ class ComposeRunner(BaseRunner):
             self.logger.info("Starting Docker Compose services...")
             compose_started = time.time()
             try:
-                with self.compose:
+                with _DemarrageSansDemontage(self.compose):
                     self.record_step(
                         "Build et démarrage Compose",
                         command=f"docker compose -f {compose_name} up --build",

@@ -18,6 +18,11 @@ class FakeCompose:
     def __init__(self, **_kwargs):
         pass
 
+    def start(self):
+        # Le moteur démarre lui-même (_DemarrageSansDemontage) : les doublures
+        # qui simulent un échec le font dans __enter__.
+        self.__enter__()
+
     def __enter__(self):
         return self
 
@@ -583,3 +588,35 @@ def test_failed_up_keeps_compose_output_and_dead_service_logs(tmp_path, logger, 
     assert "api-v1-1  Started" in build["output"]
     assert "api-v1" in build["output"] and "exited (1)" in build["output"]
     assert "No module named 'joblib'" in build["output"]
+
+
+def test_failed_up_is_diagnosed_before_teardown(tmp_path, logger, monkeypatch):
+    """testcontainers démonte la stack dans son propre __enter__ quand le up
+    échoue : le moteur démarre lui-même, relève, puis démonte."""
+    import subprocess
+    ordre = []
+
+    class VraiComportement(FakeCompose):
+        def start(self):
+            raise subprocess.CalledProcessError(1, ["docker", "compose", "up"], stderr=b"unhealthy")
+
+        def __enter__(self):
+            # ce que fait testcontainers : start(), et __exit__ s'il échoue
+            try:
+                self.start()
+            except Exception:
+                self.stop()
+                raise
+            return self
+
+        def stop(self):
+            ordre.append("démontage")
+
+    runner = make_runner(tmp_path, logger)
+    monkeypatch.setattr(module, "DockerCompose", VraiComportement)
+    monkeypatch.setattr(runner, "cleanup", lambda force=False: (runner.compose.stop(), ordre.append("cleanup")))
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: ordre.append("relevé") or [])
+
+    runner.run_evaluation()
+
+    assert ordre[0] == "relevé", ordre
