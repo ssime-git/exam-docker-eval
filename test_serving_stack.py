@@ -38,4 +38,8 @@ ok, morts = classer({"nginx": ("exited", 1), "api": ("running", 0)})
 assert not ok and "nginx" in morts
 ok, morts = classer({"api": ("dead", 0)})
 assert not ok and "api" in morts
-print("OK : debout = sain, one-shot code 0 = sain, sorti autrement = mort")
+# 461338 : bike-api plantait au démarrage (ImportError) et redémarrait en
+# boucle ; « restarting » passait pour sain, la stack « tenait debout ».
+ok, morts = classer({"bike-api": ("restarting", 1), "prometheus": ("running", 0)})
+assert not ok and "bike-api" in morts, morts
+print("OK : debout = sain, one-shot code 0 = sain, sorti autrement = mort, redémarrage en boucle = mort")
