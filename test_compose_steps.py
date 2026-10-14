@@ -492,3 +492,19 @@ def test_compose_project_is_named_after_the_copy(tmp_path, logger, monkeypatch):
     runner.run_evaluation()
 
     assert vus == ["eval_468469"]
+
+
+def test_built_images_are_those_of_the_copy_project(tmp_path, logger, monkeypatch):
+    """Depuis que le projet s'appelle eval_<id>, les images construites portent
+    ce préfixe : les retenir par le nom du dossier les laissait sur la machine."""
+    (tmp_path / "mlops-nginx-exam-2").mkdir()
+    runner = ComposeRunner("468469", str(tmp_path / "mlops-nginx-exam-2"), 1, logger)
+    monkeypatch.setattr(runner, "_images_du_projet", lambda: [
+        "eval_468469-api-v1:latest", "eval_468469-nginx:latest", "nginx:1.27", "prom/prometheus:v2.55.1",
+    ])
+    retenues = []
+    monkeypatch.setattr(runner, "record_exam_image", retenues.append)
+
+    runner._retenir_images_de_la_copie()
+
+    assert retenues == ["eval_468469-api-v1:latest", "eval_468469-nginx:latest"]

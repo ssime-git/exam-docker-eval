@@ -450,16 +450,7 @@ class ComposeRunner(BaseRunner):
                     # les supprimera. Celles de l'apprenant portent le préfixe du
                     # projet compose ; les images publiques (nginx, prometheus)
                     # restent, elles resserviront.
-                    try:
-                        prefixe = os.path.basename(self.eval_dir).lstrip(".-_").lower()
-                        for image in self._images_du_projet():
-                            # Seules les images construites pour cette copie : le
-                            # préfixe du projet compose. `nginx:latest` et autres
-                            # images publiques restent, elles resserviront.
-                            if image.lower().startswith(prefixe):
-                                self.record_exam_image(image)
-                    except Exception as erreur:
-                        self.logger.debug(f"images non recensées : {erreur}")
+                    self._retenir_images_de_la_copie()
 
                     # Wait for services to be ready
                     self._wait_for_services()
@@ -982,6 +973,19 @@ class ComposeRunner(BaseRunner):
             exit_code=0 if not errors else 1,
             duration=time.time() - started,
         )
+
+    def _retenir_images_de_la_copie(self) -> None:
+        """Seules les images construites pour cette copie : elles portent le
+        nom du projet compose (eval_<id>, posé par COMPOSE_PROJECT_NAME).
+        `nginx:latest` et autres images publiques restent, elles resserviront.
+        Le préfixe était le nom du dossier, devenu faux avec le projet par copie."""
+        try:
+            prefixe = self.project_name.lower()
+            for image in self._images_du_projet():
+                if image.lower().startswith(prefixe):
+                    self.record_exam_image(image)
+        except Exception as erreur:
+            self.logger.debug(f"images non recensées : {erreur}")
 
     def _force_cleanup_docker_resources(self):
         """Supprimer les ressources portant les labels Compose réellement vus.
