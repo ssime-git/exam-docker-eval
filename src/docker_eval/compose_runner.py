@@ -17,6 +17,47 @@ from .sonde_http import contexte_tls_permissif, resume, sonder
 from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN
 
 
+# Les quatre noms que docker compose accepte lui-meme, dans son ordre de
+# priorite : compose.yaml > compose.yml > docker-compose.yaml >
+# docker-compose.yml (on garde ce dernier en tete, c'est le nom demande par
+# les enonces).
+NOMS_COMPOSE = ("docker-compose.yml", "docker-compose.yaml", "compose.yaml", "compose.yml")
+_DOSSIERS_IGNORES = {".git", ".venv", "venv", "node_modules", "__pycache__", "__MACOSX"}
+
+
+def fichier_compose(dossier: str) -> str | None:
+    """Le fichier Compose d'un dossier, s'il en porte un."""
+    return next((chemin for nom in NOMS_COMPOSE
+                 if os.path.isfile(chemin := os.path.join(dossier, nom))), None)
+
+
+def dossier_du_compose(eval_dir: str, profondeur_max: int = 2) -> tuple[str | None, list[str]]:
+    """Le dossier du projet : celui qui porte le fichier Compose.
+
+    La racine du rendu d'abord. Sinon, un dossier d'emballage : 466056
+    livrait un projet complet et conforme — compose, deployment/, src/ — dans
+    `projet/`, et l'evaluation s'arretait sur « compose not found » a la
+    racine, Bloque pour une affaire de zip. On descend jusqu'a
+    `profondeur_max` niveaux ; un seul dossier candidat est le projet. Plusieurs
+    candidats : on ne choisit pas a la place de l'apprenant.
+
+    Rend (dossier ou None, candidats relatifs a eval_dir).
+    """
+    if fichier_compose(eval_dir):
+        return eval_dir, []
+    candidats = []
+    for racine, dossiers, _ in os.walk(eval_dir):
+        dossiers[:] = sorted(d for d in dossiers if d not in _DOSSIERS_IGNORES and not d.startswith("."))
+        profondeur = os.path.relpath(racine, eval_dir).count(os.sep) + 1 if racine != eval_dir else 0
+        if profondeur >= profondeur_max:
+            dossiers[:] = []
+        if racine != eval_dir and fichier_compose(racine):
+            candidats.append(racine)
+            dossiers[:] = []  # un compose imbriqué dans un projet n'est pas un autre projet
+    relatifs = [os.path.relpath(c, eval_dir) for c in candidats]
+    return (candidats[0] if len(candidats) == 1 else None), relatifs
+
+
 def chemins_nginx_declares(eval_dir: str, maxi: int = 8) -> list:
     """Les chemins que la copie déclare dans son nginx.conf.
 
@@ -289,21 +330,28 @@ class ComposeRunner(BaseRunner):
         run_started = time.time()
         self.record_submission_step()
         try:
-            # Les quatre noms que docker compose accepte lui-meme, dans son
-            # ordre de priorite : compose.yaml > compose.yml > docker-compose.yaml
-            # > docker-compose.yml (on garde ce dernier en tete, c'est le nom
-            # demande par les enonces).
             compose_resolution_started = time.time()
-            compose_file = next(
-                (
-                    candidate
-                    for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yaml", "compose.yml")
-                    if os.path.exists(candidate := os.path.join(self.eval_dir, name))
-                ),
-                None,
-            )
+            dossier, candidats = dossier_du_compose(self.eval_dir)
+            if dossier is not None and dossier != self.eval_dir:
+                # Le rendu est emballe : l'evaluation part du dossier du projet
+                # (contexte de build, nom de projet Compose, lectures de la
+                # copie). Consigne, pour que le relecteur voie le detour.
+                self.record_step(
+                    "Dossier du projet",
+                    command="recherche du fichier Compose sous la racine du rendu",
+                    output=(f"Aucun fichier Compose à la racine ; le projet est dans "
+                            f"« {candidats[0]} », d'où l'évaluation repart."),
+                    exit_code=0,
+                    duration=time.time() - compose_resolution_started,
+                )
+                self.eval_dir = dossier
+            compose_file = fichier_compose(dossier) if dossier is not None else None
             if compose_file is None:
-                error_msg = f"docker-compose.yml (ou variante compose.yaml) not found in {self.eval_dir}"
+                if len(candidats) > 1:
+                    error_msg = (f"plusieurs fichiers Compose sous {self.eval_dir} "
+                                 f"({', '.join(candidats)}) et aucun à la racine : projet ambigu")
+                else:
+                    error_msg = f"docker-compose.yml (ou variante compose.yaml) not found in {self.eval_dir}"
                 self.logger.error(error_msg)
                 self.record_step(
                     "Fichier Compose résolu",
