@@ -133,6 +133,12 @@ def avant_demontage(runner, conteneurs: list) -> None:
     except Exception as erreur:
         logger.warning(f"[agent-hook] agent en erreur : {erreur}")
     finally:
+        # Filet : la stack que l'agent a relancée (outil compose) ne survit pas.
+        projet = os.path.join(dossier, "compose_project")
+        if os.path.exists(projet):
+            nom = open(projet, encoding="utf-8").read().strip()
+            subprocess.run(["docker", "compose", "-p", nom, "down", "-v", "--remove-orphans"],
+                           capture_output=True, timeout=180)
         try:
             changes = _restaurer(runner.eval_dir, instantane, avant)
             if changes:
