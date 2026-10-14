@@ -469,3 +469,26 @@ def test_fixed_container_names_become_network_aliases(tmp_path, logger):
     # sans réseau Compose, pas d'alias possible : le nom reste
     assert services["hote"]["container_name"] == "sur_l_hote"
     assert "alias" in runner._port_relaxation_outcome
+
+
+def test_compose_project_is_named_after_the_copy(tmp_path, logger, monkeypatch):
+    """468469 et 459773, deux copies nginx extraites dans un dossier du même
+    nom, corrigées en même temps : un seul projet compose, « No such
+    container ». Le projet porte désormais l'identifiant de la copie."""
+    vus = []
+
+    class Temoin(FakeCompose):
+        def __enter__(self):
+            vus.append(os.environ.get("COMPOSE_PROJECT_NAME"))
+            raise RuntimeError("arrêt du test")
+
+    monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
+    (tmp_path / "mlops-nginx-exam-2").mkdir()
+    (tmp_path / "mlops-nginx-exam-2" / "docker-compose.yml").write_text("services:\n  nginx:\n    image: nginx\n")
+    runner = ComposeRunner("468469", str(tmp_path / "mlops-nginx-exam-2"), 1, logger)
+    monkeypatch.setattr(module, "DockerCompose", Temoin)
+    no_docker_cleanup(runner, monkeypatch)
+
+    runner.run_evaluation()
+
+    assert vus == ["eval_468469"]

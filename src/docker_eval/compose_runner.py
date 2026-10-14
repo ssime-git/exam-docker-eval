@@ -419,6 +419,12 @@ class ComposeRunner(BaseRunner):
 
             # Create testcontainers Compose instance
             self.logger.info(f"Creating Docker Compose instance with project name: {self.project_name}")
+            # testcontainers ne transmet pas de nom de projet : compose prenait
+            # celui du dossier, le même pour toutes les copies d'un examen
+            # (mlops-nginx-exam-2). Deux corrections simultanées partageaient
+            # alors un projet et se démontaient l'une l'autre (« No such
+            # container »). Chaque commande compose hérite de cette variable.
+            os.environ["COMPOSE_PROJECT_NAME"] = self.project_name
             self.compose = DockerCompose(
                 context=self.eval_dir,
                 compose_file_name=compose_name,
