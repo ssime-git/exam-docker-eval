@@ -85,3 +85,50 @@ assert find_credentials_in_texts([test, service])["password"] == "du-test"
 assert find_credentials_in_texts([test])["in_tests"] is True
 assert find_credentials_in_texts([("vide.py", "")]) is None
 print("OK : motifs mutualises, l'ordre decide de la priorite")
+
+# --- 458998 : USERS_DB dans le service, et un test d'echec avant le test de succes
+# Le service (lu dans l'image) declarait USERS_DB ; le motif USERS ne le
+# voyait pas, et le correcteur se connectait avec le payload du test qui
+# attend un 401 : {"username": "wrong", "password": "wrong"}. 10/20 a tort.
+service_db = ("src/service.py", 'ALGORITHM = "HS256"\nUSERS_DB = {"admin": "admin123"}\n')
+tests_458998 = ("tests/test_service.py", '''
+def test_login_success():
+    username, password = list(USERS_DB.items())[0]
+    response = client.post("/login", json={"username": username, "password": password})
+    assert response.status_code == 200
+
+
+def test_login_failure():
+    response = client.post("/login", json={"username": "wrong", "password": "wrong"})
+    assert response.status_code == 401
+''')
+found = find_credentials_in_texts([service_db, tests_458998])
+assert (found["username"], found["password"]) == ("admin", "admin123"), found
+assert found["in_tests"] is False, found
+
+# meme sans service lisible, un test qui attend un echec n'est pas une source
+assert find_credentials_in_texts([tests_458998]) is None
+
+# un test d'echec avant un test de succes : on prend celui du succes
+tests_ordre = ("tests/test_api.py", '''
+def test_invalid_credentials():
+    r = requests.post(URL, json={"username": "admin", "password": "mauvais"})
+    assert r.status_code == 401
+
+def test_login_ok():
+    r = requests.post(URL, json={"username": "admin", "password": "bon-mdp"})
+    assert r.status_code == 200
+''')
+assert find_credentials_in_texts([tests_ordre])["password"] == "bon-mdp"
+
+# variantes de declaration dans le service
+for decl in ('fake_users_db = {"alice": "s3cret"}', 'USERS_DATABASE: dict = {"alice": "s3cret"}'):
+    found = find_credentials_in_texts([("src/service.py", decl)])
+    assert found and (found["username"], found["password"]) == ("alice", "s3cret"), (decl, found)
+
+# un dictionnaire d'utilisateurs imbrique ne donne pas ("username", "alice")
+imbrique = ("src/service.py",
+            'USERS_DB = {"alice": {"username": "alice", "password": "s3cret"}}')
+found = find_credentials_in_texts([imbrique])
+assert (found["username"], found["password"]) == ("alice", "s3cret"), found
+print("OK : USERS_DB du service, tests d'echec ecartes (458998)")
