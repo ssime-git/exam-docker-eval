@@ -259,6 +259,23 @@ def annoter_bruit_de_sondes(sondes: list) -> None:
             )
 
 
+class _DemarrageSansDemontage:
+    """`with compose:` sans le démontage que testcontainers fait sur un `up`
+    raté : son __enter__ appelle __exit__ en cas d'échec, et les conteneurs
+    disparaissaient avant que le moteur ne relève leur état et leurs logs
+    (461416). Le démontage reste garanti par cleanup()."""
+
+    def __init__(self, compose):
+        self.compose = compose
+
+    def __enter__(self):
+        self.compose.start()
+        return self.compose
+
+    def __exit__(self, *exc):
+        return self.compose.__exit__(*exc)
+
+
 class ComposeRunner(BaseRunner):
     """
     Runner for evaluations using Docker Compose.
@@ -493,7 +510,7 @@ class ComposeRunner(BaseRunner):
             self.logger.info("Starting Docker Compose services...")
             compose_started = time.time()
             try:
-                with self.compose:
+                with _DemarrageSansDemontage(self.compose):
                     self.record_step(
                         "Build et démarrage Compose",
                         command=f"docker compose -f {compose_name} up --build",
@@ -570,7 +587,7 @@ class ComposeRunner(BaseRunner):
                     self.record_step(
                         "Build et démarrage Compose",
                         command=f"docker compose -f {compose_name} up --build",
-                        output=str(exc),
+                        output=self._diagnostic_up_rate(exc),
                         exit_code=2,
                         duration=time.time() - compose_started,
                     )
@@ -1047,6 +1064,48 @@ class ComposeRunner(BaseRunner):
             except Exception as e:
                 self.logger.error(f"Error checking pipeline status: {e}")
                 time.sleep(check_interval)
+
+    def _diagnostic_up_rate(self, exc: Exception) -> str:
+        """Pourquoi le `compose up` a échoué, pris avant le démontage.
+
+        461416 : la trace ne disait que « returned non-zero exit status 1 ».
+        testcontainers garde pourtant la sortie de la commande dans
+        l'exception, et les conteneurs existent encore (le contexte n'a pas
+        été ouvert, donc pas refermé) : leur état et les logs des services
+        tombés disent ce qui a cassé.
+        """
+        parties = [str(exc)]
+        for flux, contenu in (("stderr", getattr(exc, "stderr", None)), ("stdout", getattr(exc, "stdout", None))):
+            if contenu:
+                texte = contenu.decode("utf-8", errors="replace") if isinstance(contenu, bytes) else str(contenu)
+                parties.append(f"--- {flux} du compose up (fin) ---\n{texte[-4000:].strip()}")
+        try:
+            conteneurs = self._conteneurs_du_projet()
+        except Exception as erreur:
+            parties.append(f"--- services : état illisible ({erreur}) ---")
+            conteneurs = []
+        if conteneurs:
+            lignes = []
+            for conteneur in conteneurs:
+                try:
+                    conteneur.reload()
+                except Exception:
+                    pass
+                code = conteneur.attrs.get("State", {}).get("ExitCode")
+                service = conteneur.labels.get("com.docker.compose.service", conteneur.name)
+                lignes.append(f"{service} ({conteneur.name}) : {conteneur.status}"
+                              + (f" ({code})" if conteneur.status != "running" else ""))
+            parties.append("--- services ---\n" + "\n".join(lignes))
+            for conteneur in conteneurs:
+                if conteneur.status == "running":
+                    continue
+                try:
+                    logs = conteneur.logs(tail=40).decode("utf-8", errors="replace").strip()
+                except Exception as erreur:
+                    logs = f"logs illisibles : {erreur}"
+                service = conteneur.labels.get("com.docker.compose.service", conteneur.name)
+                parties.append(f"--- logs de {service} (fin) ---\n{logs}")
+        return "\n".join(parties)
 
     def _capture_logs(self) -> str:
         """

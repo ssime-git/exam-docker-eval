@@ -18,6 +18,11 @@ class FakeCompose:
     def __init__(self, **_kwargs):
         pass
 
+    def start(self):
+        # Le moteur démarre lui-même (_DemarrageSansDemontage) : les doublures
+        # qui simulent un échec le font dans __enter__.
+        self.__enter__()
+
     def __enter__(self):
         return self
 
@@ -547,3 +552,71 @@ def test_no_restart_no_wait(tmp_path, logger, monkeypatch):
     monkeypatch.setattr(module.time, "sleep", lambda _s: (_ for _ in ()).throw(AssertionError("attente inutile")))
 
     assert runner._boucles_de_redemarrage() == set()
+
+
+def test_failed_up_keeps_compose_output_and_dead_service_logs(tmp_path, logger, monkeypatch):
+    """461416 : la trace ne disait que « returned non-zero exit status 1 ».
+    La sortie du `compose up` et l'état des services, pris avant le
+    démontage, disent pourquoi la stack n'a pas démarré."""
+    import subprocess
+
+    class UpFails(FakeCompose):
+        def __enter__(self):
+            raise subprocess.CalledProcessError(
+                1, ["docker", "compose", "up", "--build", "--wait"],
+                output=b"Container api-v1-1  Started\n",
+                stderr=b"dependency failed to start: container api-v1-1 is unhealthy\n",
+            )
+
+    class Mort(FakeContainer):
+        def logs(self, tail=None):
+            return b"ModuleNotFoundError: No module named 'joblib'\n"
+
+    runner = make_runner(tmp_path, logger)
+    monkeypatch.setattr(module, "DockerCompose", UpFails)
+    no_docker_cleanup(runner, monkeypatch)
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [
+        FakeContainer("nginx-1", service="nginx"),
+        Mort("api-v1-1", status="exited", exit_code=1, service="api-v1"),
+    ])
+
+    result = runner.run_evaluation()
+
+    build = next(step for step in result["steps"] if step["title"] == "Build et démarrage Compose")
+    assert build["exit_code"] != 0
+    assert "is unhealthy" in build["output"]
+    assert "api-v1-1  Started" in build["output"]
+    assert "api-v1" in build["output"] and "exited (1)" in build["output"]
+    assert "No module named 'joblib'" in build["output"]
+
+
+def test_failed_up_is_diagnosed_before_teardown(tmp_path, logger, monkeypatch):
+    """testcontainers démonte la stack dans son propre __enter__ quand le up
+    échoue : le moteur démarre lui-même, relève, puis démonte."""
+    import subprocess
+    ordre = []
+
+    class VraiComportement(FakeCompose):
+        def start(self):
+            raise subprocess.CalledProcessError(1, ["docker", "compose", "up"], stderr=b"unhealthy")
+
+        def __enter__(self):
+            # ce que fait testcontainers : start(), et __exit__ s'il échoue
+            try:
+                self.start()
+            except Exception:
+                self.stop()
+                raise
+            return self
+
+        def stop(self):
+            ordre.append("démontage")
+
+    runner = make_runner(tmp_path, logger)
+    monkeypatch.setattr(module, "DockerCompose", VraiComportement)
+    monkeypatch.setattr(runner, "cleanup", lambda force=False: (runner.compose.stop(), ordre.append("cleanup")))
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: ordre.append("relevé") or [])
+
+    runner.run_evaluation()
+
+    assert ordre[0] == "relevé", ordre

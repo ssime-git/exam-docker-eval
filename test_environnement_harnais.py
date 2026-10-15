@@ -170,6 +170,9 @@ def test_compose_consigne_l_environnement_avant_le_build(tmp_path, monkeypatch):
         def __init__(self, **_kw):
             pass
 
+        def start(self):
+            raise RuntimeError("build impossible")
+
         def __enter__(self):
             raise RuntimeError("build impossible")
 
