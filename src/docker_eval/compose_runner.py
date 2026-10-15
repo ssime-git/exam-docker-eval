@@ -7,6 +7,7 @@ docker-compose.yml configurations.
 
 import logging
 import os
+import re
 import time
 from typing import Dict, Any
 
@@ -171,6 +172,26 @@ def requetes_declarees(eval_dir: str, maxi: int = 6) -> list:
                 if len(requetes) >= maxi:
                     return requetes
     return requetes
+
+
+def sens_sonde_authentifiee(code_sans_auth, code_auth) -> str:
+    """Ce qu'une sonde authentifiée en GET prouve, dit en clair dans l'étape.
+
+    401 sans identifiants puis 405 avec : le reverse proxy a ACCEPTÉ les
+    identifiants, et c'est l'application qui refuse le verbe GET sur une
+    route POST. 469145 (15/10) : ce 405 était lu « identifiants introuvables
+    dans le rendu » alors que les POST authentifiés de la copie rendaient 200."""
+    if code_sans_auth == 401 and code_auth == 405:
+        return ("authentification acceptée (le 401 sans identifiants devient 405) : seule la méthode GET "
+                "n'est pas servie par cette route — voir les requêtes déclarées pour le bon verbe\n")
+    if code_sans_auth == 401 and isinstance(code_auth, int) and code_auth != 401:
+        return "authentification acceptée (le 401 sans identifiants disparaît)\n"
+    return ""
+
+
+def code_attendu_negatif(identifiants: str):
+    """401 pour les identifiants qu'une copie fausse exprès dans ses tests."""
+    return 401 if re.search(r"wrong|bad|invalid|faux|mauvais", identifiants, re.IGNORECASE) else None
 
 
 PAUSE_LIMITATION_S = 1.5
@@ -795,10 +816,11 @@ class ComposeRunner(BaseRunner):
                                                  contexte=contexte))
                         sonde_auth["duration_seconds"] = time.time() - started
                         code_auth = sonde_auth.get("code")
+                        note_auth = sens_sonde_authentifiee(code, code_auth)
                         self.record_step(
                             f"Sonde authentifiée {url} (identifiants {source})",
                             command=f"GET {url} avec Authorization: Basic (identifiants {source})",
-                            output=f"{resume(sonde_auth)}\n{sonde_auth.get('extrait', '')}"[:500],
+                            output=f"{resume(sonde_auth)}\n{note_auth}{sonde_auth.get('extrait', '')}"[:500],
                             exit_code=0 if isinstance(code_auth, int) else 1,
                             duration=sonde_auth["duration_seconds"],
                         )
@@ -865,6 +887,9 @@ class ComposeRunner(BaseRunner):
             sonde["limitation_de_debit"] = premiere
             note = (f"limitation de débit de la copie (limit_req) atteinte par les sondes du "
                     f"harnais : {premiere} d'abord, rejouée après {PAUSE_LIMITATION_S:g} s\n")
+        if requete["identifiants"] and code_attendu_negatif(requete["identifiants"]) == sonde.get("code"):
+            note += ("requête négative de la copie (identifiants volontairement faux) : "
+                     "le 401 est la réponse attendue, la protection fonctionne\n")
         sonde["duration_seconds"] = time.time() - started
         code = sonde.get("code")
         self.record_step(
