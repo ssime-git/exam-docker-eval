@@ -495,6 +495,15 @@ def test_les_ports_publies_par_la_copie_deviennent_des_relais_localhost():
     assert sondes_nginx.redirections_make_test("pas: [du yaml") == []
 
 
+def test_les_relais_make_test_lisent_variables_et_plages():
+    """Même lecture des ports que le rejeu des requêtes déclarées
+    (`publications_hote`, 467379) : variables du .env et plages comprises."""
+    compose = ("services:\n  nginx:\n    ports:\n      - \"${HTTPS_PORT:-8443}:443\"\n"
+               "  api:\n    ports:\n      - \"${API_PORT}:8000\"\n      - \"6000-6001:7000-7001\"\n")
+    assert sondes_nginx.redirections_make_test(compose, {"API_PORT": "8085"}) == [
+        (8443, "nginx", 443), (8085, "api", 8000), (6000, "api", 7000), (6001, "api", 7001)]
+
+
 def test_la_commande_de_validation_finale(tmp_path):
     assert sondes_nginx.commande_make_test(str(tmp_path))[0] is None  # ni Makefile ni cible test
     ecrire(tmp_path / "Makefile", "start-project:\n\tdocker compose up -d\n\ntest:\n\tbash tests/run_tests.sh\n")

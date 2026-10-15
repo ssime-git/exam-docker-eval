@@ -286,38 +286,18 @@ def corps_depuis_pydantic(eval_dir: str) -> dict | None:
     return None
 
 
-def redirections_make_test(texte_compose: str) -> list:
+def redirections_make_test(texte_compose: str, env: dict | None = None) -> list:
     """(port hôte, service, port conteneur) de chaque port que la copie publie.
 
     run_tests.sh vise `https://localhost/predict`, donc le 443 que la copie
     publie sur SA machine. Le moteur relâche ces ports (Docker en choisit
     d'autres) : le conteneur jetable de `make test` relaie localhost:<hôte>
     vers <service>:<conteneur>, et le script tourne tel qu'il est écrit. Un
-    port sans hôte fixe (« 5000 ») n'était joignable qu'au hasard : ignoré."""
-    try:
-        import yaml
-        services = (yaml.safe_load(texte_compose) or {}).get("services") or {}
-    except Exception:
-        return []
-    redirections = []
-    for nom, service in services.items():
-        if not isinstance(service, dict):
-            continue
-        for entree in service.get("ports") or []:
-            hote = conteneur = None
-            if isinstance(entree, dict):
-                hote, conteneur = entree.get("published"), entree.get("target")
-            elif isinstance(entree, str):
-                parties = entree.split("/")[0].split(":")
-                if len(parties) >= 2:
-                    hote, conteneur = parties[-2], parties[-1]
-            try:
-                hote, conteneur = int(hote), int(conteneur)
-            except (TypeError, ValueError):
-                continue  # plage, variable ou port seul
-            if all(h != hote for h, _, _ in redirections):
-                redirections.append((hote, nom, conteneur))
-    return redirections
+    port sans hôte fixe (« 5000 ») n'était joignable qu'au hasard : ignoré.
+    Lecture des ports partagée avec le rejeu des requêtes déclarées
+    (`publications_hote`, 467379) : variables `env` et plages comprises."""
+    from .compose_runner import publications_hote  # compose_runner importe ce module
+    return [(hote, *cibles[0]) for hote, cibles in publications_hote(texte_compose, env or {}).items()]
 
 
 def _recettes_makefile(texte: str) -> dict:
