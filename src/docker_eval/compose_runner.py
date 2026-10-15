@@ -1651,10 +1651,7 @@ class ComposeRunner(BaseRunner):
             declare = sondes_prometheus.endpoint_drift_declare(self.eval_dir)
             if api and declare:
                 avant = sondes_prometheus.series_drift((sonde_metrics or {}).get("extrait", ""))
-                methode = declare["methode"]
-                reponse = sonder(f"{api}{declare['chemin']}", methode=methode, timeout=DELAI_DERIVE_S)
-                if reponse.get("code") == 405 and methode != "GET":
-                    reponse = sonder(f"{api}{declare['chemin']}", methode="GET", timeout=DELAI_DERIVE_S)
+                reponse = self._appeler_derive(api, declare, notes)
                 code = reponse.get("code")
                 modifiee = None
                 if isinstance(code, int) and 200 <= code < 300:
@@ -1682,13 +1679,58 @@ class ComposeRunner(BaseRunner):
             command=(f"GET <api>/metrics ({api or 'API introuvable'}), "
                      f"Prometheus {prometheus or 'non publié'} : /-/ready, /api/v1/targets, /api/v1/rules ; "
                      f"Grafana {grafana or 'non publié'} : /api/health, /api/datasources, /api/search, "
-                     "/api/dashboards/uid, /api/v1/provisioning/alert-rules (identifiants du compose, non consignés) ; endpoint de dérive puis "
-                     "/metrics relu"),
+                     "/api/dashboards/uid, /api/v1/provisioning/alert-rules (identifiants du compose, non consignés) ; GET <api>/openapi.json (schéma du corps), "
+                     "endpoint de dérive puis /metrics relu"),
             output=sondes_prometheus.resume_comportement(c) + ("\n" + "\n".join(notes) if notes else ""),
             exit_code=0,
             duration=time.time() - debut,
         )
         return c
+
+    def _appeler_derive(self, api: str, declare: dict, notes: list) -> dict:
+        """Appeler l'endpoint de dérive avec le corps le plus juste : celui
+        du curl déclaré, sinon un corps tiré du schéma OpenAPI de l'API
+        (/evaluate attend un lot de données, 467379), sinon sans corps.
+
+        On ne passe au suivant que sur un refus 4xx : un délai dépassé ne se
+        rejoue pas (DELAI_DERIVE_S chacun, budget de la VM)."""
+        import json
+        import urllib.parse
+
+        chemin, methode = declare["chemin"], declare["methode"]
+        essais = []
+        if declare.get("corps"):
+            essais.append((f"corps du curl déclaré ({declare.get('source')})", methode,
+                           declare["corps"].encode(), {}))
+        try:
+            spec = self._lire_json(f"{api}/openapi.json")
+            requete = sondes_prometheus.requete_depuis_openapi(spec, chemin, methode)
+        except Exception:
+            requete = None
+        if requete:
+            corps = None if requete["corps"] is None else json.dumps(requete["corps"]).encode()
+            cles = ", ".join(f"{k} ({len(v)} ligne(s))" if isinstance(v, list) else k
+                             for k, v in requete["corps"].items()) if isinstance(requete["corps"], dict) else ""
+            detail = (f" : {cles}" if cles else "") + (
+                f" ; paramètres {', '.join(requete['query'])}" if requete["query"] else "")
+            essais.append(("corps généré depuis le schéma OpenAPI de l'API (/openapi.json)" + detail,
+                           requete["methode"], corps, requete["query"]))
+
+        for source, methode_essai, corps, query in essais:
+            url = f"{api}{chemin}" + (f"?{urllib.parse.urlencode(query)}" if query else "")
+            entetes = {"Content-Type": "application/json"} if corps is not None else None
+            reponse = sonder(url, methode=methode_essai, corps=corps, entetes=entetes, timeout=DELAI_DERIVE_S)
+            code = reponse.get("code")
+            notes.append(f"endpoint de dérive {chemin} ({methode_essai}) avec {source} → {code}")
+            if not (isinstance(code, int) and 400 <= code < 500):
+                return reponse
+
+        reponse = sonder(f"{api}{chemin}", methode=methode, timeout=DELAI_DERIVE_S)
+        if reponse.get("code") == 405 and methode != "GET":
+            reponse = sonder(f"{api}{chemin}", methode="GET", timeout=DELAI_DERIVE_S)
+        if essais:
+            notes.append(f"endpoint de dérive {chemin} rappelé sans corps → {reponse.get('code')}")
+        return reponse
 
     def _record_service_states(self) -> dict:
         """Lire et consigner l'état de chaque conteneur du projet."""

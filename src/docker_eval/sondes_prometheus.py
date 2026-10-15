@@ -207,7 +207,8 @@ _ROUTE_DERIVE = re.compile(
 
 def _par_preference(candidats: list) -> dict | None:
     """Un endpoint qui dit « drift » d'abord : il déclenche la dérive sans
-    corps. /evaluate attend un lot de données que le harnais n'a pas."""
+    corps. /evaluate attend un lot de données « courantes » que le harnais
+    doit fabriquer (`requete_depuis_openapi`)."""
     for candidat in candidats:
         if "drift" in candidat["chemin"].lower():
             return candidat
@@ -238,6 +239,12 @@ def endpoint_drift_declare(eval_dir: str) -> dict | None:
                     methode = re.search(r"-X\s*(\w+)", ligne)
                     candidat = {"chemin": m.group(1), "methode": methode.group(1).upper() if methode else "POST",
                                 "source": source}
+                    # Le corps que l'apprenant envoie lui-même passe avant
+                    # tout corps fabriqué (même lecture que `requetes_declarees`).
+                    corps = re.search(r"(?:-d|--data(?:-raw)?)\s+'([^']*)'", ligne) or \
+                        re.search(r"(?:-d|--data(?:-raw)?)\s+\"([^\"]*)\"", ligne)
+                    if corps:
+                        candidat["corps"] = corps.group(1)
                     if candidat["chemin"] not in [c["chemin"] for c in declares]:
                         declares.append(candidat)
         else:
@@ -246,6 +253,235 @@ def endpoint_drift_declare(eval_dir: str) -> dict | None:
                 if candidat["chemin"] not in [c["chemin"] for c in routes]:
                     routes.append(candidat)
     return _par_preference(declares) or _par_preference(routes)
+
+
+# --- Un corps pour /evaluate, tiré du schéma OpenAPI de l'API --------------
+#
+# L'énoncé : /evaluate « acceptera des données courantes pour une période
+# (ex : une semaine de février) ». 467379 (15/10) ne déclare aucun curl : le
+# moteur POSTait /evaluate sans corps → 422, la jauge jamais relue. FastAPI
+# publie /openapi.json ; on y lit le corps attendu et on en fabrique un
+# exemple plausible. Une API sans schéma (Flask) est appelée comme avant.
+
+DEBUT_PERIODE, FIN_PERIODE = "2011-02-01", "2011-02-07"
+LIGNES_PAR_LOT = 24
+MAX_PROFONDEUR = 8
+# Une ligne du jeu Bike Sharing UCI (les colonnes de l'énoncé, la cible
+# `cnt`) : février 2011, hiver (season 1), mardi 1er février (weekday 2).
+LIGNE_JEU = {"temp": 0.24, "atemp": 0.29, "hum": 0.6, "windspeed": 0.2, "mnth": 2, "hr": 8, "weekday": 2,
+             "season": 1, "holiday": 0, "workingday": 1, "weathersit": 1, "yr": 0, "cnt": 40,
+             "dteday": DEBUT_PERIODE}
+COLONNES_ENONCE = ("temp", "atemp", "hum", "windspeed", "mnth", "hr", "weekday", "season", "holiday",
+                   "workingday", "weathersit", "dteday", "cnt")
+_NOMS_LOT = {"data", "records", "rows", "lignes", "donnees", "items", "current", "current_data", "batch"}
+
+
+def _mots(nom: str) -> list:
+    """`startDate`, `start_date`, `date-debut` → ['start', 'date']…"""
+    return [m.lower() for m in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", nom or "")]
+
+
+def _resoudre(schema, spec: dict, profondeur: int = 0) -> dict:
+    """$ref, allOf, anyOf/oneOf (Optional de Pydantic v2 : la branche non
+    nulle) ramenés à un seul schéma."""
+    for _ in range(MAX_PROFONDEUR):
+        if not isinstance(schema, dict):
+            return {}
+        ref = schema.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/"):
+            cible = spec
+            for morceau in ref[2:].split("/"):
+                cible = cible.get(morceau, {}) if isinstance(cible, dict) else {}
+            reste = {k: v for k, v in schema.items() if k != "$ref"}
+            schema = {**cible, **reste} if isinstance(cible, dict) else reste
+            continue
+        if isinstance(schema.get("allOf"), list):
+            fusion = {k: v for k, v in schema.items() if k != "allOf"}
+            for partie in schema["allOf"]:
+                partie = _resoudre(partie, spec, profondeur + 1)
+                fusion = {**partie, **fusion,
+                          "properties": {**(partie.get("properties") or {}), **(fusion.get("properties") or {})},
+                          "required": list(partie.get("required") or []) + list(fusion.get("required") or [])}
+            if not fusion["properties"]:
+                fusion.pop("properties")
+            if not fusion["required"]:
+                fusion.pop("required")
+            schema = fusion
+            continue
+        for cle in ("anyOf", "oneOf"):
+            if isinstance(schema.get(cle), list):
+                branches = [b for b in schema[cle] if not (isinstance(b, dict) and b.get("type") == "null")]
+                reste = {k: v for k, v in schema.items() if k != cle}
+                schema = {**(branches[0] if branches else {}), **reste}
+                break
+        else:
+            return schema
+    return schema if isinstance(schema, dict) else {}
+
+
+def _type(schema: dict) -> str | None:
+    genre = schema.get("type")
+    if isinstance(genre, list):
+        genre = next((g for g in genre if g != "null"), None)
+    if genre is None:
+        if "properties" in schema or "additionalProperties" in schema:
+            return "object"
+        if "items" in schema:
+            return "array"
+    return genre
+
+
+def _valeur_jeu(nom: str, genre: str | None, i: int = 0):
+    """La valeur d'une colonne du jeu Bike Sharing pour la ligne i du lot :
+    heures et jours de la semaine de février qui varient, cible aussi."""
+    jour = i % 7
+    if nom == "dteday":
+        return f"2011-02-{1 + jour:02d}"
+    if nom == "hr":
+        return (8 + 5 * i) % 24
+    if nom == "weekday":
+        return (2 + jour) % 7
+    if nom == "workingday":
+        return 0 if (2 + jour) % 7 in (0, 6) else 1
+    if nom == "cnt":
+        return 40 + 7 * i
+    if nom in ("temp", "atemp", "hum", "windspeed"):
+        return round(LIGNE_JEU[nom] + 0.01 * (i % 10), 2)
+    valeur = LIGNE_JEU[nom]
+    if genre == "string":
+        return str(valeur)
+    return valeur
+
+
+def _ligne_jeu(schema_ligne: dict, spec: dict, i: int, profondeur: int) -> dict:
+    """Une ligne du jeu : les noms de propriétés du schéma quand il en donne,
+    sinon ceux du schéma de /predict (BikeSharingInput) ou de l'énoncé."""
+    proprietes = schema_ligne.get("properties") or {}
+    if not proprietes:
+        noms = list(_schema_des_lignes(spec)) or list(COLONNES_ENONCE)
+        if "cnt" not in noms:
+            noms.append("cnt")
+        return {n: _valeur_jeu(n, None, i) for n in noms if n in LIGNE_JEU}
+    ligne = {}
+    for nom, sous in proprietes.items():
+        sous = _resoudre(sous, spec)
+        if nom in LIGNE_JEU:
+            ligne[nom] = _valeur_jeu(nom, _type(sous), i)
+        else:
+            ligne[nom] = _exemple(sous, spec, nom, profondeur + 1)
+    return ligne
+
+
+def _schema_des_lignes(spec: dict) -> dict:
+    """Le schéma des composants qui ressemble le plus à une ligne du jeu
+    (BikeSharingInput dans le gabarit : /predict l'utilise)."""
+    meilleur, score = {}, 2
+    for schema in ((spec.get("components") or {}).get("schemas") or {}).values():
+        proprietes = schema.get("properties") if isinstance(schema, dict) else None
+        if isinstance(proprietes, dict):
+            communes = len(set(proprietes) & set(LIGNE_JEU))
+            if communes > score:
+                meilleur, score = proprietes, communes
+    return meilleur
+
+
+def _est_lot_de_lignes(nom: str, schema: dict, items: dict) -> bool:
+    if _type(items) != "object":
+        return False
+    proprietes = items.get("properties") or {}
+    if proprietes:
+        return len(set(proprietes) & set(LIGNE_JEU)) >= 3
+    description = str(schema.get("description") or "") + str(schema.get("title") or "")
+    return (nom or "").lower() in _NOMS_LOT or "cnt" in description
+
+
+def _date(nom: str, format_: str | None) -> str:
+    mots = _mots(nom)
+    fin = any(m in ("end", "fin", "to", "until", "stop") for m in mots)
+    jour = FIN_PERIODE if fin else DEBUT_PERIODE
+    return f"{jour}T00:00:00" if format_ == "date-time" else jour
+
+
+def _exemple(schema, spec: dict, nom: str = "", profondeur: int = 0):
+    """Un exemple plausible pour un schéma JSON (OpenAPI 3.0/3.1)."""
+    schema = _resoudre(schema, spec)
+    if profondeur > MAX_PROFONDEUR:
+        return None
+    for cle in ("example", "default", "const"):
+        if cle in schema:
+            return schema[cle]
+    if isinstance(schema.get("examples"), list) and schema["examples"]:
+        return schema["examples"][0]
+    if isinstance(schema.get("enum"), list) and schema["enum"]:
+        return schema["enum"][0]
+    genre = _type(schema)
+    mots = _mots(nom)
+    if genre == "object":
+        proprietes = schema.get("properties") or {}
+        requises = schema.get("required")
+        noms = [n for n in proprietes if n in requises] if isinstance(requises, list) else list(proprietes)
+        return {n: _exemple(proprietes[n], spec, n, profondeur + 1) for n in noms}
+    if genre == "array":
+        items = _resoudre(schema.get("items") or {}, spec)
+        if _est_lot_de_lignes(nom, schema, items):
+            return [_ligne_jeu(items, spec, i, profondeur) for i in range(LIGNES_PAR_LOT)]
+        return [_exemple(items, spec, nom, profondeur + 1)]
+    if genre in ("integer", "number"):
+        if any(m in ("week", "semaine") for m in mots):
+            return 1
+        if nom in LIGNE_JEU:
+            return _valeur_jeu(nom, genre)
+        if "minimum" in schema:
+            return schema["minimum"]
+        return 1 if genre == "integer" else 0.5
+    if genre == "boolean":
+        return False
+    if genre == "string" or genre is None:
+        format_ = schema.get("format")
+        if format_ in ("date", "date-time") or any(
+                m in ("date", "start", "end", "debut", "fin", "from", "to", "week", "semaine", "period", "periode")
+                for m in mots):
+            return _date(nom, format_)
+        return "exemple" if genre == "string" else None
+    return None
+
+
+def requete_depuis_openapi(spec, chemin: str, methode: str = "POST") -> dict | None:
+    """La requête qu'un schéma OpenAPI attend pour `chemin` : {methode,
+    corps (objet JSON ou None), query (dict)} ; None si le schéma ne décrit
+    ni corps ni paramètre de requête (l'appel sans corps reste juste).
+
+    La méthode déclarée d'abord, puis POST, puis GET."""
+    if not isinstance(spec, dict):
+        return None
+    operations = (spec.get("paths") or {}).get(chemin)
+    if not isinstance(operations, dict):
+        return None
+    for candidate in dict.fromkeys(((methode or "POST").upper(), "POST", "GET")):
+        operation = operations.get(candidate.lower())
+        if not isinstance(operation, dict):
+            continue
+        corps = None
+        contenu = (_resoudre(operation.get("requestBody") or {}, spec).get("content") or {})
+        media = contenu.get("application/json") or next(
+            (v for k, v in contenu.items() if "json" in k), None)
+        if isinstance(media, dict) and "schema" in media:
+            corps = _exemple(media["schema"], spec)
+        query = {}
+        for parametre in list(operations.get("parameters") or []) + list(operation.get("parameters") or []):
+            parametre = _resoudre(parametre, spec)
+            if parametre.get("in") != "query" or not parametre.get("name"):
+                continue
+            if "example" in parametre:
+                valeur = parametre["example"]
+            else:
+                valeur = _exemple(parametre.get("schema") or {}, spec, parametre["name"])
+            if valeur is not None:
+                query[parametre["name"]] = valeur
+        if corps is None and not query:
+            return None
+        return {"methode": candidate, "corps": corps, "query": query}
+    return None
 
 
 def lire_env(chemin: str) -> dict:
