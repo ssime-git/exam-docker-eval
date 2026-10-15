@@ -7,6 +7,7 @@ Provides cleanup guards, logging setup, disk space monitoring, and other helpers
 import atexit
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
@@ -185,7 +186,11 @@ def format_exit_code(exit_code: int) -> str:
 # rendre a l'apprenant.
 
 CREDENTIAL_PATTERNS = (
-    (r"""USERS\s*=\s*\{[^}]*?["']([^"']+)["']\s*:\s*["']([^"']+)["']""", "USERS"),
+    # USERS, USERS_DB, fake_users_db, USERS_DATABASE: dict... : la premiere
+    # entree, si elle est plate. Un dictionnaire imbrique ({"alice": {"username":
+    # ..., "password": ...}}) est laisse au motif « payload json », qui lit les
+    # bons champs dans le meme fichier (458998 declarait USERS_DB).
+    (r"""(?i:\b\w*users\w*)\s*(?::[^=\n]+)?=\s*\{\s*["']([^"']+)["']\s*:\s*["']([^"']+)["']""", "USERS"),
     (r"""VALID_USERNAME\s*=\s*["']([^"']+)["'][\s\S]{0,400}?VALID_PASSWORD\s*=\s*["']([^"']+)["']""", "VALID_*"),
     (r"""USERNAME\s*=\s*["']([^"']+)["'][\s\S]{0,400}?PASSWORD\s*=\s*["']([^"']+)["']""", "USERNAME/PASSWORD"),
     (r"""auth\s*=\s*\(\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']\s*\)""", "auth=()"),
@@ -203,6 +208,22 @@ def looks_like_test_file(path: str) -> bool:
     return "test" in os.path.basename(lowered) or "/tests/" in f"/{lowered}"
 
 
+# Un test qui attend un refus porte des identifiants faux par construction.
+# 458998 : le correcteur se connectait avec ceux de test_login_failure.
+TEST_D_ECHEC = re.compile(
+    r"fail|invalid|wrong|bad|incorrect|unauthori|denied|reject|forbidden|401|403|mauvais|errone",
+    re.I,
+)
+VALEUR_FAUSSE = re.compile(r"^(wrong|invalid|bad|incorrect|mauvais|fake_?pass)", re.I)
+
+
+def _dans_un_test_d_echec(content: str, debut: int, username: str, password: str) -> bool:
+    fonctions = re.findall(r"def\s+(\w+)\s*\(", content[:debut])
+    if fonctions and TEST_D_ECHEC.search(fonctions[-1]):
+        return True
+    return bool(VALEUR_FAUSSE.match(username) or VALEUR_FAUSSE.match(password))
+
+
 def find_credentials_in_texts(texts):
     """Premiers identifiants trouves dans une suite de (chemin, contenu).
 
@@ -211,19 +232,22 @@ def find_credentials_in_texts(texts):
 
     Rend un dict `username`, `password`, `source`, `in_tests`, ou None.
     """
-    import re as _re
-
     for path, content in texts:
         if not content:
             continue
+        en_test = looks_like_test_file(path)
         for pattern, label in CREDENTIAL_PATTERNS:
-            match = _re.search(pattern, content)
+            match = next(
+                (m for m in re.finditer(pattern, content)
+                 if not (en_test and _dans_un_test_d_echec(content, m.start(), m.group(1), m.group(2)))),
+                None,
+            )
             if not match:
                 continue
             return {
                 "username": match.group(1),
                 "password": match.group(2),
                 "source": f"{path} ({label})",
-                "in_tests": looks_like_test_file(path),
+                "in_tests": en_test,
             }
     return None
