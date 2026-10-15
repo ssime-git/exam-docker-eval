@@ -69,11 +69,13 @@ EXEMPLES_ENV = (".env.example", ".env.sample", ".env.template", "env.example", "
 
 
 def variables_requises(texte_compose: str) -> list:
-    """Les variables que le compose exige sans défaut, dans l'ordre d'apparition.
+    """Les variables sans lesquelles compose refuse d'interpoler, dans l'ordre.
 
-    Requises : `${VAR}`, `$VAR`, `${VAR:?msg}`, `${VAR?msg}`. Pas requises :
-    `${VAR:-def}`, `${VAR-def}` (défaut) ni `${VAR:+x}`, `${VAR+x}` (rien si
-    absente). On lit les valeurs du YAML chargé, pas le texte brut : un
+    Seules `${VAR:?msg}` et `${VAR?msg}` font échouer `up`. Un `${VAR}` ou
+    `$VAR` absent devient une chaîne vide (avertissement) et la stack démarre :
+    le harnais reproduit compose sans l'élargir — `DEBUG=${DEBUG}` rempli au
+    hasard deviendrait vrai. Défauts (`:-`, `-`) et `:+`, `+` : jamais requis.
+    On lit les valeurs du YAML chargé, pas le texte brut : un
     commentaire n'est pas interpolé par compose. Texte brut en secours si le
     YAML ne se charge pas.
     """
@@ -97,11 +99,10 @@ def variables_requises(texte_compose: str) -> list:
     requises = []
     for chaine in chaines:
         for m in _INTERPOLATION.finditer(chaine):
-            nom = m.group(1) or m.group(3)
+            nom = m.group(1)
             if not nom:
-                continue  # `$$`
-            modificateur = m.group(2) or ""
-            if modificateur and not modificateur.lstrip(":").startswith("?"):
+                continue  # `$$` ou `$VAR` : jamais une erreur pour compose
+            if not (m.group(2) or "").lstrip(":").startswith("?"):
                 continue
             if nom not in requises:
                 requises.append(nom)
@@ -372,6 +373,9 @@ class ComposeRunner(BaseRunner):
         # observés tant que les conteneurs existent afin de pouvoir nettoyer
         # fidèlement après la sortie du context manager.
         self._compose_project_names = set()
+        # Le .env écrit par le harnais (469217), retiré au nettoyage ; jamais
+        # celui de la copie.
+        self._env_cree = None
 
     @staticmethod
     def _nom_fixe_en_alias(service: dict) -> bool:
@@ -482,7 +486,10 @@ class ComposeRunner(BaseRunner):
         Le `.env` s'écrit dans le dossier du projet (compose l'y lit), qui est
         la copie de travail extraite, comme `docker-compose.eval.yml`. L'étape
         nomme les variables, jamais les valeurs. Un `.env` déjà présent, ou
-        aucune variable requise : on ne touche à rien et on ne consigne rien.
+        aucune variable `:?`/`?` : on ne touche à rien (même un exemple livré
+        reste en place) et on ne consigne rien. Le `.env` créé ici est retiré
+        par `cleanup`, pour qu'un rejeu dans le même workdir donne la même
+        trace.
         """
         import secrets
         import shutil
@@ -521,6 +528,8 @@ class ComposeRunner(BaseRunner):
             with open(cible, "w", encoding="utf-8") as sortie:
                 sortie.write(texte)
         except OSError as erreur:
+            if os.path.isfile(cible) and not os.path.islink(cible):
+                self._env_cree = cible  # copie partielle : la retirer aussi
             self.record_step(
                 "Variables d'environnement de la copie",
                 command="préparation du .env manquant",
@@ -529,6 +538,7 @@ class ComposeRunner(BaseRunner):
                 duration=time.time() - debut,
             )
             return
+        self._env_cree = cible
         self.logger.info(f".env fourni par le harnais : {', '.join(requises)}")
         self.record_step(
             "Variables d'environnement de la copie",
@@ -1611,6 +1621,16 @@ class ComposeRunner(BaseRunner):
             except Exception as e:
                 errors.append(str(e))
                 self.logger.warning(f"Cleanup error: {e}")
+        # Après `compose stop` : sans le .env, compose ne saurait plus
+        # interpoler le fichier pour démonter la stack (469217).
+        if self._env_cree:
+            try:
+                os.remove(self._env_cree)
+                self._env_cree = None
+            except FileNotFoundError:
+                self._env_cree = None
+            except OSError as e:
+                errors.append(f".env du harnais non retiré : {e}")
         self.record_step(
             "Nettoyage Compose",
             command="docker compose down et suppression des ressources d'examen",
