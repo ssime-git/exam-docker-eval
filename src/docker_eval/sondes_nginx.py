@@ -240,6 +240,8 @@ def resume_comportement(c: dict) -> str:
             f"{_oui_non(rafale['retour_2xx_apres_pause'])}")
     mauvais = c.get("mauvais_identifiants")
     lignes.append(f"mauvais identifiants : {'non mesuré' if mauvais is None else mauvais}")
+    sans = c.get("sans_identifiants")
+    lignes.append(f"POST sans identifiants : {'non mesuré' if sans is None else sans}")
     repartition = c.get("repartition")
     if repartition is None:
         lignes.append("répliques API v1 : non mesuré (aucun conteneur v1 identifié ou logs illisibles)")

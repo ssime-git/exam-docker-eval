@@ -310,3 +310,35 @@ def test_l_evaluation_porte_nginx_comportement(tmp_path, monkeypatch):
 def test_sans_nginx_conf_pas_de_cle_nginx_comportement(tmp_path, monkeypatch):
     runner, _ = runner_469145(tmp_path, monkeypatch, nginx=False)
     assert "nginx_comportement" not in _evaluer(runner, monkeypatch)
+
+
+def test_post_sans_identifiants_mesure_le_defi_meme_si_get_est_refuse(tmp_path, monkeypatch):
+    # 469217 (rejeu du 15/10) : /predict limité au POST, nginx rend 403 au GET
+    # avant auth_basic. La seule sonde sans identifiants était ce GET : le
+    # barème ne voyait jamais de 401 alors que l'authentification marche.
+    runner, appels = runner_469145(tmp_path, monkeypatch)
+    sonder_469145 = compose_runner.sonder
+
+    def sonder(url, entetes=None, corps=None, methode=None, timeout=10, contexte=None, taille_extrait=300):
+        if (methode or "GET") == "GET" and url.endswith("/predict"):
+            appels.append(("GET", url, dict(entetes or {})))
+            return {"code": 403, "extrait": "<html>403 Forbidden</html>"}
+        return sonder_469145(url, entetes=entetes, corps=corps, methode=methode, timeout=timeout,
+                             contexte=contexte, taille_extrait=taille_extrait)
+    monkeypatch.setattr(compose_runner, "sonder", sonder)
+
+    comportement = runner._sonder_comportement_nginx(SONDES_RACINE)
+    assert comportement["sans_identifiants"] == 401
+    # Même corps et mêmes en-têtes que la requête nominale, sans Authorization.
+    sans = [e for m, u, e in appels if m == "POST" and u.endswith("/predict") and "Authorization" not in e]
+    assert sans and all(e.get("Content-Type") == "application/json" for e in sans)
+    # Mesuré avant la rafale : le seau de limit_req est encore plein.
+    assert comportement["rafale"]["codes"] == {"200": 6, "503": 14}
+    etape = next(s for s in runner.steps if s["title"] == "Sondes de comportement nginx")
+    assert "POST sans identifiants : 401" in etape["output"]
+
+
+def test_sans_base_tls_pas_de_mesure_sans_identifiants(tmp_path, monkeypatch):
+    runner, _ = runner_469145(tmp_path, monkeypatch)
+    sondes = [s for s in SONDES_RACINE if "443" not in s["port"]]
+    assert runner._sonder_comportement_nginx(sondes)["sans_identifiants"] is None
