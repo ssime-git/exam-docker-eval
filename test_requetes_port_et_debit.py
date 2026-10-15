@@ -83,3 +83,25 @@ def test_rejeu_vers_le_bon_port_et_apres_la_limitation(tmp_path, monkeypatch):
     grafana = titres["Requête déclarée (tests/run_tests.sh) : GET /api/health"]
     assert "non rejouée" in grafana["output"] and grafana["exit_code"] == 0
     assert not any(u.startswith("https://127.0.0.1:32769/api/") for _, u in appels), appels
+
+
+def test_un_405_authentifie_dit_que_l_authentification_passe():
+    """469145 : 401 sans identifiants, 405 avec (GET sur une route POST) —
+    lu « identifiants introuvables » alors que l'authentification passait."""
+    from docker_eval.compose_runner import sens_sonde_authentifiee
+    assert "authentification acceptée" in sens_sonde_authentifiee(401, 405)
+    assert "GET" in sens_sonde_authentifiee(401, 405)
+    assert sens_sonde_authentifiee(401, 401) == ""
+    assert "authentification acceptée" in sens_sonde_authentifiee(401, 200)
+
+
+def test_la_requete_negative_de_la_copie_attend_son_401(tmp_path, monkeypatch):
+    """Le test 3 de 469145 envoie admin:wrongpassword et attend 401."""
+    ecrire(tmp_path / "tests" / "run_tests.sh",
+           'r=$(curl -s -X POST "https://localhost/predict" -d \'{"s": 1}\' --user admin:wrongpassword)\n')
+    runner = ComposeRunner("469145", str(tmp_path), timeout=60, logger=logging.getLogger("t"))
+    monkeypatch.setattr(compose_runner, "chemins_nginx_declares", lambda d: ["/predict"])
+    monkeypatch.setattr(compose_runner, "sonder", lambda url, **k: {"code": 401})
+    runner._sonder_chemins_declares(SONDES_RACINE)
+    etape = next(s for s in runner.steps if "Requête déclarée" in (s.get("title") or s.get("titre") or ""))
+    assert "requête négative" in etape["output"] and "attendue" in etape["output"]
