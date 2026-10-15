@@ -23,7 +23,7 @@ import requests
 from testcontainers.core.container import DockerContainer
 
 from . import environnement
-from .base_runner import BaseRunner
+from .base_runner import BaseRunner, verrou_images
 from .utils import find_credentials_in_texts, looks_like_test_file
 from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT, EMULATION_TIMEOUT_FACTOR, PYTHON_TESTS
 
@@ -393,28 +393,25 @@ class BentoMLRunner(BaseRunner):
         Load Docker image with `docker load -i` and extract image tag if possible.
         """
         try:
-            result = subprocess.run(
-                ["docker", "load", "-i", self.image_tar],
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-            output = (result.stdout or "") + "\n" + (result.stderr or "")
-            if result.returncode != 0:
-                self.logger.error(f"docker load failed: {output.strip()}")
-                return None
+            # Charger puis retaguer au nom de la copie sous le même verrou :
+            # une autre correction ne peut pas réécrire le tag entre les deux.
+            with verrou_images():
+                result = subprocess.run(
+                    ["docker", "load", "-i", self.image_tar],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+                output = (result.stdout or "") + "\n" + (result.stderr or "")
+                if result.returncode != 0:
+                    self.logger.error(f"docker load failed: {output.strip()}")
+                    return None
 
-            match = re.search(r"Loaded image:\s*(.+)", output)
-            if match:
-                image_name = match.group(1).strip()
-                self.logger.info(f"✓ Image loaded via docker CLI: {image_name}")
-                return image_name
-
-            id_match = re.search(r"Loaded image ID:\s*(.+)", output)
-            if id_match:
-                image_id = id_match.group(1).strip()
-                self.logger.info(f"✓ Image loaded via docker CLI: {image_id}")
-                return image_id
+                match = re.search(r"Loaded image:\s*(.+)", output) or re.search(r"Loaded image ID:\s*(.+)", output)
+                if match:
+                    chargee = match.group(1).strip()
+                    self.logger.info(f"✓ Image loaded via docker CLI: {chargee}")
+                    return self.adopter_image(chargee)
 
             self.logger.error("docker load succeeded but no image tag/id found in output")
             return None
@@ -579,16 +576,16 @@ class BentoMLRunner(BaseRunner):
         try:
             client = docker.from_env()
 
-            with open(self.image_tar, "rb") as f:
+            # Charger puis retaguer au nom de la copie sous le même verrou.
+            with verrou_images(), open(self.image_tar, "rb") as f:
                 self.logger.info("Loading image (this may take a minute)...")
                 images = client.images.load(f.read())
 
                 if images:
                     image = images[0]
-                    # Get image name (first tag or ID)
-                    image_name = image.tags[0] if image.tags else image.id
-                    self.logger.info(f"✓ Image loaded: {image_name}")
-                    return image_name
+                    chargee = image.tags[0] if image.tags else image.id
+                    self.logger.info(f"✓ Image loaded: {chargee}")
+                    return self.adopter_image(chargee)
                 else:
                     self.logger.error("No image found in tar file")
                     return None
@@ -610,10 +607,13 @@ class BentoMLRunner(BaseRunner):
             client = docker.from_env()
             images = client.images.list()
 
-            # Look for images with 'bento' in name or tags
+            # Seulement une image construite pour CETTE copie : prendre
+            # n'importe quelle image « bento » de la machine notait la copie
+            # sur l'image d'une autre.
+            copie = str(self.student_name).lower()
             for image in images:
                 for tag in image.tags:
-                    if "bento" in tag.lower():
+                    if "bento" in tag.lower() and copie in tag.lower():
                         self.logger.info(f"Found BentoML image: {tag}")
                         return tag
 
