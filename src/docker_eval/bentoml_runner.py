@@ -903,18 +903,22 @@ class BentoMLRunner(BaseRunner):
                 if login_wrapper not in contract['login_wrappers']:
                     contract['login_wrappers'].insert(0, login_wrapper)
 
-            predict_signature = re.search(r'def\s+predict\s*\(\s*self\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([a-zA-Z_][a-zA-Z0-9_]*)', text)
+            # Forme BentoML `def predict(self, x: T)`, ou route FastAPI montée
+            # dans BentoML `def predict(data: T, ...)` (458998). FastAPI attend
+            # les champs d'un modèle unique à plat : pas d'enveloppe.
+            predict_signature = re.search(r'def\s+predict\s*\(\s*(self\s*,\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([a-zA-Z_][a-zA-Z0-9_]*)', text)
             if predict_signature:
-                predict_wrapper = predict_signature.group(1)
+                route_fastapi = predict_signature.group(1) is None
+                predict_wrapper = predict_signature.group(2)
                 # Un parametre positionnel (marque par `/`) n'est PAS enveloppe
                 # par BentoML : les champs vont a la racine du corps. Verifie
                 # sur une copie reelle -- le corps nu rend 200, l'enveloppe 400.
                 positional = re.search(
                     r'def\s+predict\s*\([\s\S]{0,300}?^\s*/\s*,', text, re.M
                 )
-                if predict_wrapper not in contract['predict_wrappers'] and not positional:
+                if predict_wrapper not in contract['predict_wrappers'] and not positional and not route_fastapi:
                     contract['predict_wrappers'].insert(0, predict_wrapper)
-                request_type = predict_signature.group(2)
+                request_type = predict_signature.group(3)
                 request_fields = self._extract_class_fields(text, request_type)
                 if request_fields:
                     nested_body = {}
