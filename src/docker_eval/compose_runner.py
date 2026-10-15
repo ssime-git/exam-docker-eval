@@ -849,9 +849,11 @@ class ComposeRunner(BaseRunner):
         """Sonder, à travers le port TLS du reverse proxy, les chemins que la
         copie déclare. Seulement sur les ports où le TLS termine déjà (code
         HTTP reçu en https à la racine) : zéro bruit de schéma."""
+        # Sans nginx.conf, pas de chemin à sonder par le proxy — mais les
+        # requêtes que la copie déclare (curl vers :8000/metrics, :9090/api…)
+        # se rejouent quand même : prometheus-grafana n'a pas de reverse proxy,
+        # et ses requêtes déclarées n'étaient jamais rejouées.
         chemins = chemins_nginx_declares(self.eval_dir)
-        if not chemins:
-            return []
         contexte = contexte_tls_permissif()
         bases = [
             s for s in sondes_racine
