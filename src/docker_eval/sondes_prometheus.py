@@ -179,6 +179,23 @@ def requetes_des_panels(tableau: dict, maxi: int = 100) -> list:
     return requetes
 
 
+def alertes_grafana(regles: list, maxi: int = 50) -> list:
+    """/api/v1/provisioning/alert-rules → [{titre, expr}].
+
+    L'expression est le `model.expr` de la première requête qui en porte
+    une : les suivantes sont les expressions serveur (seuil, réduction,
+    `datasourceUid: __expr__`), sans PromQL."""
+    alertes = []
+    for regle in regles[:maxi]:
+        if not isinstance(regle, dict):
+            continue
+        expr = next((d["model"]["expr"] for d in regle.get("data") or []
+                     if isinstance(d, dict) and isinstance(d.get("model"), dict)
+                     and isinstance(d["model"].get("expr"), str)), "")
+        alertes.append({"titre": str(regle.get("title") or ""), "expr": expr})
+    return alertes
+
+
 # `curl -X POST $(API_URL)/trigger-drift`, `http://localhost:8080/evaluate` :
 # l'URL passe souvent par une variable du Makefile, que `requetes_declarees`
 # (localhost en dur) ne voit pas.
@@ -319,6 +336,11 @@ def resume_comportement(c: dict) -> str:
             f" (source Prometheus : {_oui_non(grafana['datasource_prometheus'])}), "
             f"{grafana['dashboards']} tableau(x) de bord, {len(grafana['requetes_panels'])} requête(s) de panneau"
             + (f" : {_liste(grafana['requetes_panels'], maxi=8)}" if grafana["requetes_panels"] else ""))
+        alertes = grafana.get("alertes")
+        lignes.append("alertes Grafana provisionnées : " + (
+            "non mesuré (/api/v1/provisioning/alert-rules sans réponse)" if alertes is None else
+            f"{len(alertes)}" + (" : " + "; ".join(f"{a['titre']} [{a['expr']}]" for a in alertes[:10])
+                                 if alertes else "")))
     derive = c.get("endpoint_drift")
     if derive is None:
         lignes.append("endpoint de dérive : non mesuré (aucun endpoint /…drift… ou /evaluate déclaré, ou API "

@@ -269,6 +269,28 @@ INFRA = {"dashboard": {"uid": "infra", "panels": [
     {"type": "gauge", "targets": [{"expr": "100 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100"}]}]}}
 
 
+# Forme réelle de /api/v1/provisioning/alert-rules (467439, Grafana 13).
+ALERTES_GRAFANA = [{
+    "id": 1, "uid": "ag08owqzgrl6od", "orgID": 1, "folderUID": "bike", "ruleGroup": "bike-model-alerts",
+    "title": "Model RMSE too high", "condition": "C", "for": "1m", "noDataState": "NoData",
+    "data": [
+        {"refId": "A", "relativeTimeRange": {"from": 600, "to": 0}, "datasourceUid": "prometheus",
+         "model": {"editorMode": "code", "expr": "model_rmse_score", "instant": True, "refId": "A"}},
+        {"refId": "C", "queryType": "expression", "datasourceUid": "__expr__",
+         "model": {"type": "threshold", "expression": "A", "refId": "C",
+                   "conditions": [{"evaluator": {"params": [100], "type": "gt"}}]}},
+    ],
+    "labels": {"severity": "warning"}, "annotations": {"summary": "RMSE"},
+}]
+
+
+def test_les_alertes_grafana_prennent_l_expr_de_la_premiere_requete():
+    assert sondes_prometheus.alertes_grafana(ALERTES_GRAFANA) == [
+        {"titre": "Model RMSE too high", "expr": "model_rmse_score"}]
+    assert sondes_prometheus.alertes_grafana([{"title": "x", "data": [{"model": {"type": "math"}}]}]) == [
+        {"titre": "x", "expr": ""}]
+
+
 def faux_sonder_467439():
     etat = {"derive": False}
     appels = []
@@ -309,6 +331,8 @@ def faux_sonder_467439():
                 return rendre(200, TABLEAU)
             if url.endswith("/api/dashboards/uid/infra"):
                 return rendre(200, INFRA)
+            if url.endswith("/api/v1/provisioning/alert-rules"):
+                return rendre(200, ALERTES_GRAFANA)
         return {"code": "non reçu", "erreur": "Connection refused", "extrait": "Connection refused"}
 
     return sonder, appels
@@ -342,7 +366,8 @@ def test_les_sondes_de_comportement_prouvent_les_exigences_de_467439(tmp_path, m
     assert c["regles"]["alertes"][0]["for"] == "1m"
     assert c["grafana"] == {"datasources": 1, "datasource_prometheus": True, "dashboards": 2,
                             "requetes_panels": ["rate(api_requests_total[5m])", "evidently_drift_share",
-                                                "100 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100"]}
+                                                "100 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100"],
+                            "alertes": [{"titre": "Model RMSE too high", "expr": "model_rmse_score"}]}
     assert c["endpoint_drift"] == {"chemin": "/trigger-drift", "code": 200, "metrique_modifiee": True}
 
     # Le rapport Evidently est lent : l'appel de dérive a un long délai.
@@ -354,7 +379,7 @@ def test_les_sondes_de_comportement_prouvent_les_exigences_de_467439(tmp_path, m
     etape = next(s for s in runner.steps if s["title"] == "Sondes de comportement Prometheus")
     assert etape["exit_code"] == 0
     for mot in ("Prometheus prêt", "Grafana", "bike-api", "node-exporter", "cadvisor", "api_requests_total",
-                "BikeApiDown", "1 erreur", "source Prometheus", "2 tableau", "/trigger-drift", "jauge"):
+                "BikeApiDown", "1 erreur", "Model RMSE too high", "source Prometheus", "2 tableau", "/trigger-drift", "jauge"):
         assert mot in etape["output"], mot
     # Jamais de secret dans une étape.
     assert SECRET not in json.dumps(runner.steps)
@@ -433,6 +458,19 @@ def test_un_endpoint_de_derive_en_erreur_ne_conclut_rien_sur_la_jauge(tmp_path, 
     monkeypatch.setattr(compose_runner, "sonder", sonder)
     c = runner._sonder_comportement_prometheus(SONDES_RACINE)
     assert c["endpoint_drift"] == {"chemin": "/trigger-drift", "code": 422, "metrique_modifiee": None}
+
+
+def test_api_d_alertes_grafana_muette_alertes_null(tmp_path, monkeypatch):
+    runner, _ = runner_467439(tmp_path, monkeypatch)
+    sonder_base = compose_runner.sonder
+
+    def sonder(url, **kw):
+        if url.endswith("/api/v1/provisioning/alert-rules"):
+            return {"code": 404, "extrait": "Not found"}
+        return sonder_base(url, **kw)
+    monkeypatch.setattr(compose_runner, "sonder", sonder)
+    grafana = runner._sonder_comportement_prometheus(SONDES_RACINE)["grafana"]
+    assert grafana["alertes"] is None and grafana["dashboards"] == 2
 
 
 def test_un_endpoint_de_derive_muet_vaut_null(tmp_path, monkeypatch):

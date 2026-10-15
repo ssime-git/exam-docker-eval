@@ -1633,7 +1633,17 @@ class ComposeRunner(BaseRunner):
                                                      for s in sources),
                         "dashboards": len(tableaux),
                         "requetes_panels": requetes,
+                        "alertes": None,
                     }
+                    # Les alertes gérées par Grafana (provisioning/alerting) :
+                    # 467439 y met son alerte RMSE, invisible de
+                    # /api/v1/rules de Prometheus.
+                    try:
+                        regles = self._lire_json(f"{grafana}/api/v1/provisioning/alert-rules", auth)
+                        if isinstance(regles, list):
+                            c["grafana"]["alertes"] = sondes_prometheus.alertes_grafana(regles)
+                    except Exception:
+                        c["grafana"]["alertes"] = None
             except Exception:
                 c["grafana"] = None
 
@@ -1672,7 +1682,7 @@ class ComposeRunner(BaseRunner):
             command=(f"GET <api>/metrics ({api or 'API introuvable'}), "
                      f"Prometheus {prometheus or 'non publié'} : /-/ready, /api/v1/targets, /api/v1/rules ; "
                      f"Grafana {grafana or 'non publié'} : /api/health, /api/datasources, /api/search, "
-                     "/api/dashboards/uid (identifiants du compose, non consignés) ; endpoint de dérive puis "
+                     "/api/dashboards/uid, /api/v1/provisioning/alert-rules (identifiants du compose, non consignés) ; endpoint de dérive puis "
                      "/metrics relu"),
             output=sondes_prometheus.resume_comportement(c) + ("\n" + "\n".join(notes) if notes else ""),
             exit_code=0,
