@@ -430,3 +430,81 @@ def test_requetes_declarees(tmp_path):
     assert "sentence" in predict["corps"]
     assert predict["entetes"].get("Content-Type") == "application/json"
     assert any(r["chemin"] == "/health" and r["methode"] == "GET" for r in reqs)
+
+
+def test_fixed_container_names_become_network_aliases(tmp_path, logger):
+    """461416 : deux corrections simultanées se disputaient
+    `container_name: prometheus_server` (« Conflict. The container name is
+    already in use »), et la copie échouait sans y être pour rien. Le nom fixe
+    devient un alias réseau : la copie qui y fait référence (proxy_pass
+    http://api_v2) le résout toujours."""
+    import yaml
+
+    runner = make_runner(
+        tmp_path,
+        logger,
+        "services:\n"
+        "  api-v2:\n    image: api\n    container_name: api_v2\n"
+        "  prometheus:\n    image: prom\n    container_name: prometheus_server\n"
+        "    networks: [monitoring, default]\n"
+        "  grafana:\n    image: graf\n    container_name: grafana_dashboard\n"
+        "    networks:\n      monitoring:\n        ipv4_address: 172.30.0.9\n"
+        "  hote:\n    image: x\n    container_name: sur_l_hote\n    network_mode: host\n"
+        "networks:\n  monitoring: {}\n",
+    )
+
+    nom = runner._relax_host_ports(str(tmp_path / "docker-compose.yml"))
+
+    doc = yaml.safe_load((tmp_path / nom).read_text())
+    services = doc["services"]
+    assert "container_name" not in services["api-v2"]
+    assert services["api-v2"]["networks"] == {"default": {"aliases": ["api_v2"]}}
+    assert services["prometheus"]["networks"] == {
+        "monitoring": {"aliases": ["prometheus_server"]},
+        "default": {"aliases": ["prometheus_server"]},
+    }
+    assert services["grafana"]["networks"]["monitoring"] == {
+        "ipv4_address": "172.30.0.9", "aliases": ["grafana_dashboard"],
+    }
+    # sans réseau Compose, pas d'alias possible : le nom reste
+    assert services["hote"]["container_name"] == "sur_l_hote"
+    assert "alias" in runner._port_relaxation_outcome
+
+
+def test_compose_project_is_named_after_the_copy(tmp_path, logger, monkeypatch):
+    """468469 et 459773, deux copies nginx extraites dans un dossier du même
+    nom, corrigées en même temps : un seul projet compose, « No such
+    container ». Le projet porte désormais l'identifiant de la copie."""
+    vus = []
+
+    class Temoin(FakeCompose):
+        def __enter__(self):
+            vus.append(os.environ.get("COMPOSE_PROJECT_NAME"))
+            raise RuntimeError("arrêt du test")
+
+    monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
+    (tmp_path / "mlops-nginx-exam-2").mkdir()
+    (tmp_path / "mlops-nginx-exam-2" / "docker-compose.yml").write_text("services:\n  nginx:\n    image: nginx\n")
+    runner = ComposeRunner("468469", str(tmp_path / "mlops-nginx-exam-2"), 1, logger)
+    monkeypatch.setattr(module, "DockerCompose", Temoin)
+    no_docker_cleanup(runner, monkeypatch)
+
+    runner.run_evaluation()
+
+    assert vus == ["eval_468469"]
+
+
+def test_built_images_are_those_of_the_copy_project(tmp_path, logger, monkeypatch):
+    """Depuis que le projet s'appelle eval_<id>, les images construites portent
+    ce préfixe : les retenir par le nom du dossier les laissait sur la machine."""
+    (tmp_path / "mlops-nginx-exam-2").mkdir()
+    runner = ComposeRunner("468469", str(tmp_path / "mlops-nginx-exam-2"), 1, logger)
+    monkeypatch.setattr(runner, "_images_du_projet", lambda: [
+        "eval_468469-api-v1:latest", "eval_468469-nginx:latest", "nginx:1.27", "prom/prometheus:v2.55.1",
+    ])
+    retenues = []
+    monkeypatch.setattr(runner, "record_exam_image", retenues.append)
+
+    runner._retenir_images_de_la_copie()
+
+    assert retenues == ["eval_468469-api-v1:latest", "eval_468469-nginx:latest"]

@@ -286,6 +286,30 @@ class ComposeRunner(BaseRunner):
         # fidèlement après la sortie du context manager.
         self._compose_project_names = set()
 
+    @staticmethod
+    def _nom_fixe_en_alias(service: dict) -> bool:
+        """Remplacer `container_name` par un alias réseau du même nom.
+
+        461416 : deux corrections simultanées se disputaient
+        `container_name: prometheus_server`. L'alias garde le nom résolvable
+        (une copie qui fait `proxy_pass http://api_v2` marche toujours) sans
+        réserver un nom global sur la machine. Sans réseau Compose
+        (`network_mode`), pas d'alias possible : le nom reste.
+        """
+        nom = service.get("container_name")
+        if not nom or "network_mode" in service:
+            return False
+        reseaux = service.get("networks") or ["default"]
+        if isinstance(reseaux, list):
+            reseaux = {reseau: None for reseau in reseaux}
+        for reseau, reglages in list(reseaux.items()):
+            reglages = dict(reglages or {})
+            reglages["aliases"] = [*reglages.get("aliases", []), nom]
+            reseaux[reseau] = reglages
+        service["networks"] = reseaux
+        del service["container_name"]
+        return True
+
     def _relax_host_ports(self, compose_file: str) -> str:
         """Ecrit une copie du compose sans port hote fige, et rend son nom.
 
@@ -320,7 +344,11 @@ class ComposeRunner(BaseRunner):
             return os.path.basename(compose_file)
 
         changed = False
-        for service in doc["services"].values():
+        alias = []
+        for nom_service, service in doc["services"].items():
+            if isinstance(service, dict) and self._nom_fixe_en_alias(service):
+                alias.append(nom_service)
+                changed = True
             if not isinstance(service, dict) or "ports" not in service:
                 continue
             relaxed = []
@@ -347,7 +375,8 @@ class ComposeRunner(BaseRunner):
             return os.path.basename(compose_file)
 
         self.logger.info("Ports hote relaches : Docker en attribuera de libres")
-        self._port_relaxation_outcome = f"Ports hôte relâchés dans {relaxed_name}."
+        self._port_relaxation_outcome = f"Ports hôte relâchés dans {relaxed_name}." + (
+            f" Noms de conteneur fixes devenus alias réseau : {', '.join(alias)}." if alias else "")
         self._port_relaxation_exit_code = 0
         return relaxed_name
 
@@ -446,6 +475,12 @@ class ComposeRunner(BaseRunner):
 
             # Create testcontainers Compose instance
             self.logger.info(f"Creating Docker Compose instance with project name: {self.project_name}")
+            # testcontainers ne transmet pas de nom de projet : compose prenait
+            # celui du dossier, le même pour toutes les copies d'un examen
+            # (mlops-nginx-exam-2). Deux corrections simultanées partageaient
+            # alors un projet et se démontaient l'une l'autre (« No such
+            # container »). Chaque commande compose hérite de cette variable.
+            os.environ["COMPOSE_PROJECT_NAME"] = self.project_name
             self.compose = DockerCompose(
                 context=self.eval_dir,
                 compose_file_name=compose_name,
@@ -471,16 +506,7 @@ class ComposeRunner(BaseRunner):
                     # les supprimera. Celles de l'apprenant portent le préfixe du
                     # projet compose ; les images publiques (nginx, prometheus)
                     # restent, elles resserviront.
-                    try:
-                        prefixe = os.path.basename(self.eval_dir).lstrip(".-_").lower()
-                        for image in self._images_du_projet():
-                            # Seules les images construites pour cette copie : le
-                            # préfixe du projet compose. `nginx:latest` et autres
-                            # images publiques restent, elles resserviront.
-                            if image.lower().startswith(prefixe):
-                                self.record_exam_image(image)
-                    except Exception as erreur:
-                        self.logger.debug(f"images non recensées : {erreur}")
+                    self._retenir_images_de_la_copie()
 
                     # Wait for services to be ready
                     self._wait_for_services()
@@ -1044,6 +1070,19 @@ class ComposeRunner(BaseRunner):
             exit_code=0 if not errors else 1,
             duration=time.time() - started,
         )
+
+    def _retenir_images_de_la_copie(self) -> None:
+        """Seules les images construites pour cette copie : elles portent le
+        nom du projet compose (eval_<id>, posé par COMPOSE_PROJECT_NAME).
+        `nginx:latest` et autres images publiques restent, elles resserviront.
+        Le préfixe était le nom du dossier, devenu faux avec le projet par copie."""
+        try:
+            prefixe = self.project_name.lower()
+            for image in self._images_du_projet():
+                if image.lower().startswith(prefixe):
+                    self.record_exam_image(image)
+        except Exception as erreur:
+            self.logger.debug(f"images non recensées : {erreur}")
 
     def _force_cleanup_docker_resources(self):
         """Supprimer les ressources portant les labels Compose réellement vus.
