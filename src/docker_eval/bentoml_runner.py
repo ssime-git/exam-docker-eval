@@ -1160,7 +1160,32 @@ class BentoMLRunner(BaseRunner):
             output="\n".join(f"{k} : {v}" for k, v in {**securite, **contrat}.items()),
             exit_code=0,
         )
-        return {"securite": securite, "contrat": contrat}
+        return {"securite": securite, "contrat": contrat,
+                "identifiants_dans_la_copie": self._identifiants_dans_la_copie(login_ok)}
+
+    def _identifiants_dans_la_copie(self, login_ok: dict) -> bool:
+        """Les identifiants qui ont ouvert /login figurent-ils dans un fichier
+        texte de la copie (README, tests, .env, code) ? Sinon le harnais les a
+        devinés, et un tiers ne saurait pas relancer les tests."""
+        cible = login_ok.get("credentials", login_ok) if isinstance(login_ok, dict) else {}
+        utilisateur, mot_de_passe = str(cible.get("username", "")), str(cible.get("password", ""))
+        if not utilisateur or not mot_de_passe:
+            return False
+        for racine, dossiers, fichiers in os.walk(self.eval_dir):
+            dossiers[:] = [d for d in dossiers if d not in (".git", ".venv", "venv", "node_modules",
+                                                            "__pycache__", ".pytest_cache")]
+            for nom in fichiers:
+                if not nom.lower().endswith((".md", ".txt", ".py", ".env", ".sh", ".yml", ".yaml", ".json", ".toml")) \
+                        and nom not in (".env", "Makefile"):
+                    continue
+                try:
+                    with open(os.path.join(racine, nom), encoding="utf-8", errors="ignore") as lecteur:
+                        texte = lecteur.read(200_000)
+                except OSError:
+                    continue
+                if utilisateur in texte and mot_de_passe in texte:
+                    return True
+        return False
 
     def _default_gateway_ip(self) -> Optional[str]:
         """Return the default gateway seen from the current process, when available."""

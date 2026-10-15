@@ -49,5 +49,15 @@ def test_les_refus_et_le_contrat_sont_releves_sur_la_forme_qui_a_reussi(tmp_path
     assert resultat["securite"] == {"predict_sans_token": 401, "predict_token_falsifie": 401,
                                     "login_mauvais_identifiants": 401}
     assert resultat["contrat"] == {"prediction": 0.82, "predict_entree_invalide": 422}
+    assert resultat["identifiants_dans_la_copie"] is False
     assert any(s["title"] == "Sondes de sécurité et de contrat" for s in runner.steps
                if "title" in s) or any(s.get("titre") == "Sondes de sécurité et de contrat" for s in runner.steps)
+
+
+def test_identifiants_lus_dans_la_copie(tmp_path):
+    """461638 : identifiants de démonstration dans le README, comptés comme
+    « non fournis » faute de credentials_source sur ce chemin du moteur."""
+    (tmp_path / "README.md").write_text("Login : user123 / password123\n", encoding="utf-8")
+    runner = BentoMLRunner("x", str(tmp_path), 300, logging.getLogger("t"))
+    assert runner._identifiants_dans_la_copie({"credentials": {"username": "user123", "password": "password123"}})
+    assert not runner._identifiants_dans_la_copie({"username": "admin", "password": "admin-devine"})
