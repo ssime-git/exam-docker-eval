@@ -1705,7 +1705,8 @@ class ComposeRunner(BaseRunner):
         relais = []
         try:
             with open(fichier_compose(self.eval_dir), encoding="utf-8", errors="replace") as lecteur:
-                publies = sondes_nginx.redirections_make_test(lecteur.read())
+                publies = sondes_nginx.redirections_make_test(
+                    lecteur.read(), sondes_prometheus.lire_env(os.path.join(self.eval_dir, ".env")))
         except Exception:
             publies = []
         for port_hote, nom_service, port_conteneur in publies:
