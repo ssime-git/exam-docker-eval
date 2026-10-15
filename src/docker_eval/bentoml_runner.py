@@ -28,6 +28,22 @@ from .utils import find_credentials_in_texts, looks_like_test_file
 from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT, EMULATION_TIMEOUT_FACTOR, PYTHON_TESTS
 
 
+def premier_nombre(donnee):
+    """La première valeur numérique d'une réponse JSON (la prédiction), ou None."""
+    if isinstance(donnee, bool):
+        return None
+    if isinstance(donnee, (int, float)):
+        return donnee
+    if isinstance(donnee, dict):
+        donnee = list(donnee.values())
+    if isinstance(donnee, list):
+        for element in donnee:
+            trouve = premier_nombre(element)
+            if trouve is not None:
+                return trouve
+    return None
+
+
 class BentoMLRunner(BaseRunner):
     """
     Runner for BentoML evaluations.
@@ -978,6 +994,8 @@ class BentoMLRunner(BaseRunner):
                     if payload not in login_candidates:
                         login_candidates.append(payload)
 
+        login_ok = None
+        predict_ok = None
         for payload in login_candidates:
             try:
                 self.logger.info("Testing /login endpoint with adaptive payload...")
@@ -994,6 +1012,7 @@ class BentoMLRunner(BaseRunner):
                 if token:
                     results["login_passed"] = True
                     results["token"] = token
+                    login_ok = payload
                     self.logger.info(
                         f"✓ Login successful, token: {token[:20]}..."
                     )
@@ -1074,6 +1093,7 @@ class BentoMLRunner(BaseRunner):
                         # avec un autre nom etait recale pour rien.
                         results["predict_passed"] = True
                         results["predict_response"] = str(data)[:400]
+                        predict_ok = (body, headers, data)
                         self.logger.info(f"✓ Prediction successful : {str(data)[:200]}")
                         break
                     except Exception as e:
@@ -1091,8 +1111,56 @@ class BentoMLRunner(BaseRunner):
 
         # Overall result
         results["all_passed"] = results["login_passed"] and results["predict_passed"]
+        if login_ok is not None and predict_ok is not None:
+            results.update(self._sonder_securite_et_contrat(base_url, login_ok, *predict_ok))
 
         return results
+
+    def _sonder_securite_et_contrat(self, base_url: str, login_ok: dict, corps: dict,
+                                    entetes: dict, reponse) -> Dict[str, Any]:
+        """Ce que l'API refuse, et ce que /predict rend — sur la forme de
+        requête qui a réussi, pour ne juger que le comportement.
+
+        Les sondes nominales ne prouvaient que « ça répond » : une API sans
+        aucune vérification de token avait la même note qu'une API sécurisée.
+        Codes relevés tels quels ; le barème décide."""
+        def code(methode, chemin, **kw):
+            try:
+                return requests.request(methode, f"{base_url}{chemin}",
+                                        timeout=self._http_timeout(10), **kw).status_code
+            except Exception as erreur:  # une connexion coupée n'est pas un code
+                return f"erreur : {type(erreur).__name__}"
+
+        sans_auth = {k: v for k, v in entetes.items() if k.lower() != "authorization"}
+        token = (entetes.get("Authorization") or "").split(" ", 1)[-1]
+        falsifie = token[:-4] + ("AAAA" if not token.endswith("AAAA") else "BBBB") if len(token) > 8 else "faux"
+        mauvais_login = json.loads(json.dumps(login_ok))
+        cible = mauvais_login.get("credentials", mauvais_login) if isinstance(mauvais_login, dict) else {}
+        if isinstance(cible, dict) and "password" in cible:
+            cible["password"] = "mauvais-mot-de-passe-scriptorium"
+        invalide = json.loads(json.dumps(corps))
+        cible_inv = next((v for v in invalide.values() if isinstance(v, dict)), invalide) if isinstance(invalide, dict) else {}
+        for cle, valeur in list(cible_inv.items()) if isinstance(cible_inv, dict) else []:
+            if isinstance(valeur, (int, float)) and not isinstance(valeur, bool):
+                cible_inv[cle] = "pas-un-nombre"
+        securite = {
+            "predict_sans_token": code("POST", "/predict", json=corps, headers=sans_auth),
+            "predict_token_falsifie": code("POST", "/predict", json=corps,
+                                           headers={**sans_auth, "Authorization": f"Bearer {falsifie}"}),
+            "login_mauvais_identifiants": code("POST", "/login", json=mauvais_login),
+        }
+        contrat = {
+            "prediction": premier_nombre(reponse),
+            "predict_entree_invalide": code("POST", "/predict", json=invalide, headers=entetes),
+        }
+        self.record_step(
+            "Sondes de sécurité et de contrat",
+            command="POST /predict sans token, avec un token falsifié, avec une entrée invalide ; "
+                    "POST /login avec un mauvais mot de passe",
+            output="\n".join(f"{k} : {v}" for k, v in {**securite, **contrat}.items()),
+            exit_code=0,
+        )
+        return {"securite": securite, "contrat": contrat}
 
     def _default_gateway_ip(self) -> Optional[str]:
         """Return the default gateway seen from the current process, when available."""
