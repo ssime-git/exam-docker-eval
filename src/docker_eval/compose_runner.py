@@ -60,6 +60,79 @@ def dossier_du_compose(eval_dir: str, profondeur_max: int = 2) -> tuple[str | No
     return (candidats[0] if len(candidats) == 1 else None), relatifs
 
 
+# Interpolation Compose. `$$` d'abord : c'est un dollar littéral, pas une
+# variable. Groupe 2 = le modificateur éventuel (`:-`, `-`, `:+`, `+`, `:?`,
+# `?`) ; le message de `:?` peut porter espaces, accents, parenthèses (469217).
+_INTERPOLATION = re.compile(
+    r"\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)((?::?[-+?])[^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+EXEMPLES_ENV = (".env.example", ".env.sample", ".env.template", "env.example", "example.env")
+
+
+def variables_requises(texte_compose: str) -> list:
+    """Les variables sans lesquelles compose refuse d'interpoler, dans l'ordre.
+
+    Seules `${VAR:?msg}` et `${VAR?msg}` font échouer `up`. Un `${VAR}` ou
+    `$VAR` absent devient une chaîne vide (avertissement) et la stack démarre :
+    le harnais reproduit compose sans l'élargir — `DEBUG=${DEBUG}` rempli au
+    hasard deviendrait vrai. Défauts (`:-`, `-`) et `:+`, `+` : jamais requis.
+    On lit les valeurs du YAML chargé, pas le texte brut : un
+    commentaire n'est pas interpolé par compose. Texte brut en secours si le
+    YAML ne se charge pas.
+    """
+    chaines = []
+    try:
+        import yaml
+
+        def parcourir(noeud):
+            if isinstance(noeud, str):
+                chaines.append(noeud)
+            elif isinstance(noeud, dict):
+                for valeur in noeud.values():
+                    parcourir(valeur)
+            elif isinstance(noeud, list):
+                for valeur in noeud:
+                    parcourir(valeur)
+
+        parcourir(yaml.safe_load(texte_compose))
+    except Exception:
+        chaines = [texte_compose]
+    requises = []
+    for chaine in chaines:
+        for m in _INTERPOLATION.finditer(chaine):
+            nom = m.group(1)
+            if not nom:
+                continue  # `$$` ou `$VAR` : jamais une erreur pour compose
+            if not (m.group(2) or "").lstrip(":").startswith("?"):
+                continue
+            if nom not in requises:
+                requises.append(nom)
+    return requises
+
+
+_AFFECTATION_ENV = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$")
+
+
+def completer_env(texte: str, noms: list, generer) -> tuple:
+    """Complète un texte .env : affectations vides remplies sur place, noms
+    absents ajoutés en fin. Pas de doublon : on ne dépend pas de celui que le
+    lecteur dotenv de compose garderait. Rend (texte, noms complétés)."""
+    lignes = texte.splitlines()
+    vus, completes = set(), []
+    for i, ligne in enumerate(lignes):
+        m = _AFFECTATION_ENV.match(ligne)
+        if not m or m.group(2) not in noms:
+            continue
+        vus.add(m.group(2))
+        if m.group(4).strip() in ("", '""', "''"):
+            lignes[i] = f"{m.group(1)}{m.group(2)}={generer()}"
+            completes.append(m.group(2))
+    for nom in noms:
+        if nom not in vus:
+            lignes.append(f"{nom}={generer()}")
+            completes.append(nom)
+    return "\n".join(lignes) + "\n", completes
+
+
 def chemins_nginx_declares(eval_dir: str, maxi: int = 8) -> list:
     """Les chemins que la copie déclare dans son nginx.conf.
 
@@ -300,6 +373,9 @@ class ComposeRunner(BaseRunner):
         # observés tant que les conteneurs existent afin de pouvoir nettoyer
         # fidèlement après la sortie du context manager.
         self._compose_project_names = set()
+        # Le .env écrit par le harnais (469217), retiré au nettoyage ; jamais
+        # celui de la copie.
+        self._env_cree = None
 
     @staticmethod
     def _nom_fixe_en_alias(service: dict) -> bool:
@@ -395,6 +471,85 @@ class ComposeRunner(BaseRunner):
         self._port_relaxation_exit_code = 0
         return relaxed_name
 
+    def _preparer_env(self, compose_file: str) -> None:
+        """Fournir le `.env` qu'une copie ne livre pas, sans lancer son Makefile.
+
+        469217 gardait `.env` hors de l'archive (`.gitignore`, bonne pratique)
+        et le générait par `make env`, appelé par `make start-project`. Le
+        moteur lance compose directement : « required variable
+        GRAFANA_ADMIN_PASSWORD is missing a value », stack à terre, faute du
+        harnais imputée à l'apprenant. Exécuter son Makefile sur l'hôte serait
+        du shell arbitraire hors conteneur : on fournit seulement les
+        variables que le compose exige sans défaut — l'exemple livré, complété,
+        sinon des valeurs aléatoires.
+
+        Le `.env` s'écrit dans le dossier du projet (compose l'y lit), qui est
+        la copie de travail extraite, comme `docker-compose.eval.yml`. L'étape
+        nomme les variables, jamais les valeurs. Un `.env` déjà présent, ou
+        aucune variable `:?`/`?` : on ne touche à rien (même un exemple livré
+        reste en place) et on ne consigne rien. Le `.env` créé ici est retiré
+        par `cleanup`, pour qu'un rejeu dans le même workdir donne la même
+        trace.
+        """
+        import secrets
+        import shutil
+
+        debut = time.time()
+        cible = os.path.join(self.eval_dir, ".env")
+        if os.path.lexists(cible):
+            return
+        try:
+            with open(compose_file, encoding="utf-8", errors="replace") as lecteur:
+                requises = variables_requises(lecteur.read())
+        except OSError:
+            return
+        if not requises:
+            return
+
+        def generer():
+            return secrets.token_hex(12)
+
+        # Un lien symbolique de la copie pourrait pointer hors du rendu : on
+        # ne recopie qu'un vrai fichier.
+        exemple = next((nom for nom in EXEMPLES_ENV
+                        if os.path.isfile(chemin := os.path.join(self.eval_dir, nom))
+                        and not os.path.islink(chemin)), None)
+        try:
+            if exemple:
+                shutil.copyfile(os.path.join(self.eval_dir, exemple), cible)
+                with open(cible, encoding="utf-8", errors="replace") as lecteur:
+                    texte, completes = completer_env(lecteur.read(), requises, generer)
+                source = f"exemple livré « {exemple} »" + (
+                    f", complété par le harnais pour : {', '.join(completes)}" if completes
+                    else "")
+            else:
+                texte, completes = completer_env("", requises, generer)
+                source = "généré par le harnais (valeurs aléatoires)"
+            with open(cible, "w", encoding="utf-8") as sortie:
+                sortie.write(texte)
+        except OSError as erreur:
+            if os.path.isfile(cible) and not os.path.islink(cible):
+                self._env_cree = cible  # copie partielle : la retirer aussi
+            self.record_step(
+                "Variables d'environnement de la copie",
+                command="préparation du .env manquant",
+                output=f"Échec explicite : .env non écrit ({erreur}).",
+                exit_code=2,
+                duration=time.time() - debut,
+            )
+            return
+        self._env_cree = cible
+        self.logger.info(f".env fourni par le harnais : {', '.join(requises)}")
+        self.record_step(
+            "Variables d'environnement de la copie",
+            command="préparation du .env manquant (valeurs non consignées)",
+            output=(f"Aucun .env livré ; le compose exige sans défaut : {', '.join(requises)}. "
+                    f"Source : {source}. La copie ne livre pas ses secrets (bonne pratique) ; "
+                    "le harnais les fournit comme le ferait sa préparation (make env)."),
+            exit_code=0,
+            duration=time.time() - debut,
+        )
+
     @staticmethod
     def _container_port_only(entry):
         """Ne garder que le port cote conteneur d'une declaration de ports.
@@ -468,6 +623,10 @@ class ComposeRunner(BaseRunner):
                 exit_code=0,
                 duration=time.time() - compose_resolution_started,
             )
+
+            # Avant tout `up` : sans ses variables requises, compose refuse
+            # d'interpoler et la stack ne démarre pas (469217).
+            self._preparer_env(compose_file)
 
             # Liberer les ports hote declares par l'apprenant. Deux copies du
             # meme examen, ou n'importe quel conteneur deja lance sur la
@@ -1462,6 +1621,16 @@ class ComposeRunner(BaseRunner):
             except Exception as e:
                 errors.append(str(e))
                 self.logger.warning(f"Cleanup error: {e}")
+        # Après `compose stop` : sans le .env, compose ne saurait plus
+        # interpoler le fichier pour démonter la stack (469217).
+        if self._env_cree:
+            try:
+                os.remove(self._env_cree)
+                self._env_cree = None
+            except FileNotFoundError:
+                self._env_cree = None
+            except OSError as e:
+                errors.append(f".env du harnais non retiré : {e}")
         self.record_step(
             "Nettoyage Compose",
             command="docker compose down et suppression des ressources d'examen",
