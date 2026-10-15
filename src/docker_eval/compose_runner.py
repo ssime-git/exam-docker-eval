@@ -328,6 +328,98 @@ def racine_du_port(sondes_racine: list, port: int):
     return None
 
 
+def _plage(texte: str) -> list:
+    """`"8080"` → [8080], `"6000-6001"` → [6000, 6001] ; [] si illisible."""
+    debut, _, fin = str(texte).strip().partition("-")
+    try:
+        debut, fin = int(debut), int(fin or debut)
+    except ValueError:
+        return []
+    return list(range(debut, fin + 1)) if 0 < debut <= fin else []
+
+
+def publications_hote(texte_compose: str, env: dict) -> dict:
+    """{port hôte : [(service, port conteneur)]} tel que le compose D'ORIGINE
+    les publie, variables `${PORT:-8082}` résolues contre `env`.
+
+    Formes : `"H:C"`, `"IP:H:C"`, `"[::1]:H:C"`, `H:C/tcp`, plages
+    `"H1-H2:C1-C2"`, forme longue `published`/`target`. Un port sans hôte fixe
+    (`"5000"`, `"IP::C"`, `target` seul) n'a pas d'adresse déclarée : absent."""
+    try:
+        import yaml
+        services = (yaml.safe_load(texte_compose) or {}).get("services") or {}
+    except Exception:
+        return {}
+    publies: dict = {}
+    if not isinstance(services, dict):
+        return publies
+    for nom, service in services.items():
+        if not isinstance(service, dict):
+            continue
+        for entree in service.get("ports") or []:
+            if isinstance(entree, dict):
+                hote, conteneur = entree.get("published"), entree.get("target")
+            elif isinstance(entree, str):
+                # Résoudre d'abord : `${P:-3033}:3000` porte un « : » dans son défaut.
+                entree = sondes_prometheus.resoudre_variable(entree, env)
+                parties = (entree or "").split("/")[0].rsplit(":", 2)
+                if len(parties) < 2:
+                    continue
+                hote, conteneur = parties[-2], parties[-1]
+            else:
+                continue
+            if hote is None or conteneur is None:
+                continue
+            hotes = _plage(sondes_prometheus.resoudre_variable(str(hote), env) or "")
+            conteneurs = _plage(sondes_prometheus.resoudre_variable(str(conteneur), env) or "")
+            if len(conteneurs) == 1:
+                conteneurs = conteneurs * len(hotes)
+            if not hotes or len(hotes) != len(conteneurs):
+                continue
+            for h, c in zip(hotes, conteneurs):
+                if (nom, c) not in publies.setdefault(h, []):
+                    publies[h].append((nom, c))
+    return publies
+
+
+def ports_hote_publies(dossier: str) -> dict:
+    """`publications_hote` du fichier Compose de `dossier` et de son .env."""
+    chemin = fichier_compose(dossier)
+    if not chemin:
+        return {}
+    try:
+        with open(chemin, encoding="utf-8", errors="replace") as lecteur:
+            texte = lecteur.read()
+    except OSError:
+        return {}
+    return publications_hote(texte, sondes_prometheus.lire_env(os.path.join(dossier, ".env")))
+
+
+def racine_du_port_hote(sondes_racine: list, port: int, publies: dict):
+    """L'URL relâchée d'une requête qui vise `localhost:<port>` (port hôte).
+
+    Rend (url ou None, cible « service:conteneur » ou None). 467379 : le
+    compose publie "8082:8080", Docker relâche 8080 vers 32801 ; la requête
+    du Makefile sur 8082 part vers 32801. Cible publiée mais muette : l'URL
+    http de ce port conteneur, le rejeu dira ce qu'il obtient. Hors compose
+    (pas de fichier lisible, port absent), on retombe sur le port conteneur."""
+    for service, conteneur in publies.get(port, []):
+        candidates = [s for s in sondes_racine
+                      if str(s.get("port", "")).split("/")[0] == str(conteneur)
+                      and not str(s.get("note", "")).startswith("échec attendu")]
+        avec_service = [s for s in candidates if s.get("compose_service") == service] or \
+                       [s for s in candidates if not s.get("compose_service")
+                        and service in str(s.get("service", ""))] or \
+                       [s for s in candidates if not s.get("compose_service")]
+        repond = [s for s in avec_service if isinstance(s.get("code"), int)]
+        choix = (repond or [s for s in avec_service if s["url"].startswith("http:")] or avec_service)
+        if choix:
+            return choix[0]["url"].rstrip("/"), f"{service}:{conteneur}"
+    if port in publies:
+        return None, ", ".join(f"{s}:{c}" for s, c in publies[port])
+    return racine_du_port(sondes_racine, port), None
+
+
 def annoter_bruit_de_sondes(sondes: list) -> None:
     """Qualifier le bruit mécanique du double sondage http/https.
 
@@ -948,7 +1040,9 @@ class ComposeRunner(BaseRunner):
                         # finissait en « Connection refused » : la chaîne est
                         # consignée, et une cible injoignable n'est pas une
                         # panne (#320).
-                        sonde = {"service": c.name, "port": interne, "url": url}
+                        sonde = {"service": c.name, "port": interne, "url": url,
+                                 "compose_service": (getattr(c, "labels", None) or {}).get(
+                                     "com.docker.compose.service")}
                         sonde.update(sonder(url))
                         sonde["duration_seconds"] = time.time() - started
                         sondes.append(sonde)
@@ -1146,18 +1240,25 @@ class ComposeRunner(BaseRunner):
         import base64
         requetes = requetes_declarees(self.eval_dir)
         vers_proxy = [r for r in requetes if r.get("port") in (None, 80, 443)]
+        # Le port déclaré est un port HÔTE du compose d'origine (467379 :
+        # "8082:8080", relâché par Docker vers 32801).
+        publies = ports_hote_publies(self.eval_dir)
         for requete in (r for r in requetes if r.get("port") not in (None, 80, 443)):
-            racine_url = racine_du_port(sondes_racine, requete["port"])
+            racine_url, cible = racine_du_port_hote(sondes_racine, requete["port"], publies)
             if not racine_url:
                 self.record_step(
                     f"Requête déclarée ({requete['source']}) : {requete['methode']} {requete['chemin']}",
                     command=f"{requete['methode']} localhost:{requete['port']}{requete['chemin']}",
-                    output=f"non rejouée : le port {requete['port']} n'est publié par aucun conteneur du projet",
-                    exit_code=0,
+                    output=(f"service publié mais absent : le port hôte {requete['port']} publie {cible}, "
+                            "et aucun conteneur debout ne l'expose") if cible else
+                           (f"non rejouée : {requete['source']} vise localhost:{requete['port']}, que le "
+                            "compose ne publie sur aucun port hôte — absence de mesure, pas une panne du service"),
+                    exit_code=1 if cible else 0,
                 )
                 continue
             resultats.append(self._rejouer_requete(requete, racine_url, contexte, {"service": None,
-                                                                                  "port": requete["port"]}))
+                                                                                  "port": requete["port"]},
+                                                   detour=cible and f"déclaré localhost:{requete['port']} → {cible}"))
         for base in bases:
             racine_url = base["url"].rstrip("/")
             for requete in vers_proxy:
@@ -1204,7 +1305,8 @@ class ComposeRunner(BaseRunner):
         )
         return [sonde]
 
-    def _rejouer_requete(self, requete: dict, racine_url: str, contexte, base: dict) -> dict:
+    def _rejouer_requete(self, requete: dict, racine_url: str, contexte, base: dict,
+                         detour: str | None = None) -> dict:
         """Une requête déclarée, rejouée et consignée en étape.
 
         Un 429/503 sur une copie qui déclare `limit_req` est la limitation de
@@ -1243,7 +1345,8 @@ class ComposeRunner(BaseRunner):
             f"Requête déclarée ({requete['source']}) : {requete['methode']} {requete['chemin']}",
             command=f"{requete['methode']} {url}"
                     + (" + corps JSON" if corps else "")
-                    + (" + Authorization Basic" if requete["identifiants"] else ""),
+                    + (" + Authorization Basic" if requete["identifiants"] else "")
+                    + (f" ({detour})" if detour else ""),
             output=f"{resume(sonde)}\n{note}{sonde.get('extrait', '')}"[:500],
             exit_code=0 if isinstance(code, int) else 1,
             duration=sonde["duration_seconds"],
