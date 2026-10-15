@@ -206,7 +206,7 @@ def requetes_declarees(eval_dir: str, maxi: int = 6) -> list:
                 continue
             for appel in re.finditer(r"curl\s+[^\n]+", texte):
                 ligne = appel.group(0)
-                url = re.search(r"https?://(?:localhost|127\.0\.0\.1)(?::(\d+))?(/[^\s\"']*)", ligne)
+                url = re.search(r"(https?)://(?:localhost|127\.0\.0\.1)(?::(\d+))?(/[^\s\"']*)", ligne)
                 if not url:
                     continue
                 methode = re.search(r"-X\s+(\w+)", ligne)
@@ -218,10 +218,13 @@ def requetes_declarees(eval_dir: str, maxi: int = 6) -> list:
                     "methode": (methode.group(1) if methode else "GET").upper(),
                     # Les curl vivent souvent dans un $(...) : ne pas avaler
                     # la parenthèse ou la quote de fermeture.
-                    "chemin": url.group(2).rstrip(")\"'"),
+                    "chemin": url.group(3).rstrip(")\"'"),
                     # Le port visé : `localhost:9090/api/v1/...` parle à
                     # Prometheus, pas au reverse proxy (469145).
-                    "port": int(url.group(1)) if url.group(1) else None,
+                    "port": int(url.group(2)) if url.group(2) else None,
+                    # Le schéma déclaré : sur un port TLS relâché, la sonde
+                    # http rend 400 (« preuve TLS »), pas une réponse à rejouer.
+                    "schema": url.group(1),
                     "corps": corps.group(1) if corps else None,
                     "entetes": entetes,
                     "identifiants": user.group(1) if user else None,
@@ -395,7 +398,7 @@ def ports_hote_publies(dossier: str) -> dict:
     return publications_hote(texte, sondes_prometheus.lire_env(os.path.join(dossier, ".env")))
 
 
-def racine_du_port_hote(sondes_racine: list, port: int, publies: dict):
+def racine_du_port_hote(sondes_racine: list, port: int, publies: dict, schema: str | None = None):
     """L'URL relâchée d'une requête qui vise `localhost:<port>` (port hôte).
 
     Rend (url ou None, cible « service:conteneur » ou None). 467379 : le
@@ -411,7 +414,9 @@ def racine_du_port_hote(sondes_racine: list, port: int, publies: dict):
                        [s for s in candidates if not s.get("compose_service")
                         and service in str(s.get("service", ""))] or \
                        [s for s in candidates if not s.get("compose_service")]
-        repond = [s for s in avec_service if isinstance(s.get("code"), int)]
+        repond = [s for s in avec_service if isinstance(s.get("code"), int)
+                  and not str(s.get("note", "")).startswith("preuve TLS")]
+        repond = [s for s in repond if schema and s["url"].startswith(f"{schema}:")] or repond
         choix = (repond or [s for s in avec_service if s["url"].startswith("http:")] or avec_service)
         if choix:
             return choix[0]["url"].rstrip("/"), f"{service}:{conteneur}"
@@ -1244,7 +1249,8 @@ class ComposeRunner(BaseRunner):
         # "8082:8080", relâché par Docker vers 32801).
         publies = ports_hote_publies(self.eval_dir)
         for requete in (r for r in requetes if r.get("port") not in (None, 80, 443)):
-            racine_url, cible = racine_du_port_hote(sondes_racine, requete["port"], publies)
+            racine_url, cible = racine_du_port_hote(sondes_racine, requete["port"], publies,
+                                                    requete.get("schema"))
             if not racine_url:
                 self.record_step(
                     f"Requête déclarée ({requete['source']}) : {requete['methode']} {requete['chemin']}",

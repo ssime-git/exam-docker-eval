@@ -200,3 +200,22 @@ def test_hote_prioritaire_sur_un_port_conteneur_homonyme(tmp_path, monkeypatch):
          "url": "http://127.0.0.1:32901/", "code": 200},
     ])
     assert appels == ["http://127.0.0.1:32901/health"]
+
+
+def test_port_tls_remappe_rejoue_en_https(tmp_path, monkeypatch):
+    """`"8443:443"` : la sonde http du port TLS rend 400 (« preuve TLS »),
+    sondée avant la https. `curl -k https://localhost:8443/health` part en
+    https, pas sur ce 400."""
+    ecrire(tmp_path / "docker-compose.yml", "services:\n  nginx:\n    ports: ['8443:443']\n")
+    ecrire(tmp_path / "Makefile", "t:\n\tcurl -k https://localhost:8443/health\n")
+    runner = ComposeRunner("x", str(tmp_path), timeout=60, logger=logging.getLogger("t"))
+    appels = []
+    monkeypatch.setattr(compose_runner, "sonder", lambda url, **k: appels.append(url) or {"code": 200})
+    runner._sonder_chemins_declares([
+        {"service": "x-nginx-1", "compose_service": "nginx", "port": "443/tcp",
+         "url": "http://127.0.0.1:32950/", "code": 400,
+         "note": "preuve TLS : ce port refuse le HTTP en clair, le TLS termine bien ici"},
+        {"service": "x-nginx-1", "compose_service": "nginx", "port": "443/tcp",
+         "url": "https://127.0.0.1:32950/", "code": 200},
+    ])
+    assert appels == ["https://127.0.0.1:32950/health"]
