@@ -47,7 +47,7 @@ def test_les_refus_et_le_contrat_sont_releves_sur_la_forme_qui_a_reussi(tmp_path
         {"input_data": {"cgpa": 8.5, "research": 1}}, {"Authorization": "Bearer jeton-valide-123"},
         {"prediction": [0.82]})
     assert resultat["securite"] == {"predict_sans_token": 401, "predict_token_falsifie": 401,
-                                    "login_mauvais_identifiants": 401}
+                                    "login_mauvais_identifiants": 401, "mecanisme": "jeton"}
     assert resultat["contrat"] == {"prediction": 0.82, "predict_entree_invalide": 422}
     assert resultat["identifiants_dans_la_copie"] is False
     assert any(s["title"] == "Sondes de sécurité et de contrat" for s in runner.steps

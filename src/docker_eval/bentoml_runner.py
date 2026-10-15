@@ -44,6 +44,151 @@ def premier_nombre(donnee):
     return None
 
 
+# Profil médian d'admission.csv, pour les sondes /predict. L'énoncé impose
+# « un modèle de régression linéaire », non borné : la chance d'admission
+# (« notée sur 1 ») d'un profil extrême peut dépasser 1 sur une copie juste.
+PROFIL_MEDIAN = {"gre": 316, "toefl": 107, "rating": 3, "sop": 3.5, "lor": 3.5,
+                 "cgpa": 8.6, "research": 1}
+
+
+def _variable_du_profil(nom: str) -> Optional[str]:
+    """La variable d'admission que désigne un nom de champ (GRE_Score,
+    gre, University Rating...), ou None. Les noms sont libres : l'énoncé
+    laisse supprimer des variables et ne fixe pas le schéma."""
+    n = re.sub(r"[^a-z]", "", nom.lower())
+    if "toefl" in n:
+        return "toefl"
+    if n.startswith("gre"):
+        return "gre"
+    if "rating" in n or n.startswith("univ"):
+        return "rating"
+    if n.startswith("sop"):
+        return "sop"
+    if n.startswith("lor"):
+        return "lor"
+    if "gpa" in n:
+        return "cgpa"
+    if "research" in n:
+        return "research"
+    return None
+
+
+def profil_median(noms) -> Dict[str, Any]:
+    """Un corps /predict au profil médian sous les noms de champs donnés."""
+    return {nom: PROFIL_MEDIAN[_variable_du_profil(nom)] for nom in noms}
+
+
+def appliquer_profil_median(corps):
+    """Le même corps, valeurs numériques reconnues remplacées par le profil
+    médian (enveloppes comprises). Un corps documenté au README part tel
+    quel au premier appel ; la sonde de contrat le ramène au profil médian."""
+    if isinstance(corps, dict):
+        sortie = {}
+        for nom, valeur in corps.items():
+            variable = _variable_du_profil(str(nom))
+            if variable and isinstance(valeur, (int, float)) and not isinstance(valeur, bool):
+                sortie[nom] = PROFIL_MEDIAN[variable]
+            else:
+                sortie[nom] = appliquer_profil_median(valeur)
+        return sortie
+    if isinstance(corps, list):
+        return [appliquer_profil_median(v) for v in corps]
+    return corps
+
+
+def profil_reconnu(corps) -> bool:
+    """Le corps porte-t-il au moins une variable d'admission reconnue ?"""
+    if isinstance(corps, dict):
+        return any((_variable_du_profil(str(nom)) and isinstance(v, (int, float)) and not isinstance(v, bool))
+                   or profil_reconnu(v) for nom, v in corps.items())
+    if isinstance(corps, list):
+        return any(profil_reconnu(v) for v in corps)
+    return False
+
+
+def _jetons_du_corps(donnee, profondeur: int = 0):
+    """(jetons, clés) d'un corps de réponse /login : `token` et
+    `access_token` d'abord, puis toute clé contenant « token », puis les clés
+    d'API. `token_type` (« bearer ») et `expires_*` ne sont pas des jetons :
+    les prendre ferait envoyer `Bearer bearer` à une copie JWT juste."""
+    jetons, cles = [], []
+    if not isinstance(donnee, dict) or profondeur > 2:
+        return jetons, cles
+    for nom in ("token", "access_token"):
+        valeur = donnee.get(nom)
+        if isinstance(valeur, str) and valeur:
+            jetons.append((nom, valeur))
+    for nom, valeur in donnee.items():
+        bas = str(nom).lower()
+        if isinstance(valeur, dict):
+            sous_jetons, sous_cles = _jetons_du_corps(valeur, profondeur + 1)
+            jetons += sous_jetons
+            cles += sous_cles
+            continue
+        if not isinstance(valeur, str) or bas in ("token", "access_token"):
+            continue
+        if "type" in bas or "expire" in bas:
+            continue
+        if "token" in bas and len(valeur) >= 16:
+            jetons.append((nom, valeur))
+        elif "key" in bas.replace("-", "_") and len(valeur) >= 8:
+            cles.append((nom, valeur))
+    return jetons, cles
+
+
+def acces_delivre(reponse) -> list:
+    """Les façons de présenter l'accès qu'une réponse /login a délivré, à
+    rejouer sur /predict, toutes exprimées en en-têtes.
+
+    « vous êtes libres de choisir la méthode de sécurisation que vous
+    voulez » (énoncé, 1.3) : jeton dans le corps (Bearer), cookie posé par
+    Set-Cookie, ou clé d'API. Chaque variante : {mecanisme, entete, valeur,
+    entetes}. Les faux objets de test n'ont pas toujours cookies/headers."""
+    variantes = []
+    try:
+        donnee = reponse.json()
+    except Exception:
+        donnee = None
+    jetons, cles = _jetons_du_corps(donnee)
+    vus = set()
+    for _, valeur in jetons:
+        if valeur in vus:
+            continue
+        vus.add(valeur)
+        variantes.append({"mecanisme": "jeton", "entete": "Authorization", "valeur": valeur,
+                          "entetes": {"Authorization": f"Bearer {valeur}"}})
+    for nom, valeur in cles:
+        if valeur in vus:
+            continue
+        vus.add(valeur)
+        noms_entete = ["X-API-Key"]
+        if str(nom).lower() != "x-api-key":
+            noms_entete.append(str(nom))
+        for entete in noms_entete:
+            variantes.append({"mecanisme": "cle", "entete": entete, "valeur": valeur,
+                              "entetes": {entete: valeur}})
+        variantes.append({"mecanisme": "cle", "entete": "Authorization", "valeur": valeur,
+                          "entetes": {"Authorization": f"Bearer {valeur}"}})
+    try:
+        cookies = dict(getattr(reponse, "cookies", None) or {})
+    except Exception:
+        cookies = {}
+    cookies = {str(k): str(v) for k, v in cookies.items() if v}
+    if cookies:
+        variantes.append({"mecanisme": "cookie", "entete": "Cookie",
+                          "valeur": "; ".join(f"{k}={v}" for k, v in cookies.items()),
+                          "cookies": cookies,
+                          "entetes": {"Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}})
+    return variantes
+
+
+def _alterer(valeur: str) -> str:
+    """Une valeur d'accès modifiée : même forme, derniers caractères changés."""
+    if len(valeur) <= 8:
+        return "faux"
+    return valeur[:-4] + ("AAAA" if not valeur.endswith("AAAA") else "BBBB")
+
+
 class BentoMLRunner(BaseRunner):
     """
     Runner for BentoML evaluations.
@@ -806,14 +951,18 @@ class BentoMLRunner(BaseRunner):
         return fields
 
     def _sample_value_for_field(self, field_name: str) -> Any:
+        # Profil médian du jeu admission.csv. L'énoncé impose une régression
+        # linéaire (« Créer un modèle de régression linéaire »), non bornée :
+        # sur un profil extrême (GRE 330, CGPA 9) une copie correcte peut
+        # rendre plus de 1 et perdre le critère de contrat.
         samples = {
-            'gre_score': 330,
-            'toefl_score': 115,
-            'university_rating': 5,
-            'sop': 4.5,
-            'lor': 4.5,
-            'cgpa': 9.0,
-            'research': 1,
+            'gre_score': PROFIL_MEDIAN['gre'],
+            'toefl_score': PROFIL_MEDIAN['toefl'],
+            'university_rating': PROFIL_MEDIAN['rating'],
+            'sop': PROFIL_MEDIAN['sop'],
+            'lor': PROFIL_MEDIAN['lor'],
+            'cgpa': PROFIL_MEDIAN['cgpa'],
+            'research': PROFIL_MEDIAN['research'],
             'authorization': 'Bearer {token}',
             'token': '{token}',
         }
@@ -834,24 +983,8 @@ class BentoMLRunner(BaseRunner):
             'login_wrappers': [None, 'credentials'],
             'predict_wrappers': [None, 'request'],
             'predict_bodies': [
-                {
-                    'GRE': 330,
-                    'TOEFL': 115,
-                    'University_Rating': 5,
-                    'SOP': 4.5,
-                    'LOR': 4.5,
-                    'CGPA': 9.0,
-                    'Research': 1,
-                },
-                {
-                    'gre_score': 320,
-                    'toefl_score': 110,
-                    'university_rating': 4,
-                    'sop': 4.0,
-                    'lor': 4.0,
-                    'cgpa': 8.5,
-                    'research': 1,
-                },
+                profil_median(('GRE', 'TOEFL', 'University_Rating', 'SOP', 'LOR', 'CGPA', 'Research')),
+                profil_median(('gre_score', 'toefl_score', 'university_rating', 'sop', 'lor', 'cgpa', 'research')),
             ],
         }
 
@@ -996,6 +1129,7 @@ class BentoMLRunner(BaseRunner):
 
         login_ok = None
         predict_ok = None
+        acces = []
         for payload in login_candidates:
             try:
                 self.logger.info("Testing /login endpoint with adaptive payload...")
@@ -1007,14 +1141,20 @@ class BentoMLRunner(BaseRunner):
                 results["login_attempt_statuses"].append(login_response.status_code)
                 if login_response.status_code != 200:
                     continue
-                data = login_response.json()
-                token = data.get("token") or data.get("access_token")
-                if token:
+                # « /login délivre un accès », quelle que soit sa forme : la
+                # méthode de sécurisation est libre (énoncé, 1.3). Seul un
+                # JSON {token|access_token} comptait : une copie à cookie de
+                # session ou à clé d'API ratait /login, puis tout le reste.
+                variantes = acces_delivre(login_response)
+                if variantes:
+                    acces = variantes
                     results["login_passed"] = True
-                    results["token"] = token
+                    results["token"] = variantes[0]["valeur"]
+                    results["mecanisme_acces"] = variantes[0]["mecanisme"]
                     login_ok = payload
                     self.logger.info(
-                        f"✓ Login successful, token: {token[:20]}..."
+                        f"✓ Login successful ({variantes[0]['mecanisme']}) : "
+                        f"{variantes[0]['valeur'][:20]}..."
                     )
                     break
             except Exception as e:
@@ -1031,48 +1171,35 @@ class BentoMLRunner(BaseRunner):
             )
 
         # Test 2: Predict endpoint (requires token), reusing the discovered wrapper when possible.
-        if results["token"]:
+        if acces:
             token = results["token"]
             predict_bodies = contract.get("predict_bodies", [])
             if not predict_bodies:
                 predict_bodies = [
-                    {
-                        "GRE": 330,
-                        "TOEFL": 115,
-                        "University_Rating": 5,
-                        "SOP": 4.5,
-                        "LOR": 4.5,
-                        "CGPA": 9.0,
-                        "Research": 1,
-                    },
-                    {
-                        "gre_score": 320,
-                        "toefl_score": 110,
-                        "university_rating": 4,
-                        "sop": 4.0,
-                        "lor": 4.0,
-                        "cgpa": 8.5,
-                        "research": 1,
-                    },
+                    profil_median(("GRE", "TOEFL", "University_Rating", "SOP", "LOR", "CGPA", "Research")),
+                    profil_median(("gre_score", "toefl_score", "university_rating", "sop", "lor", "cgpa", "research")),
                 ]
             for payload in predict_bodies:
                 normalized_payload = json.loads(json.dumps(payload).replace('{token}', token))
-                # Le token obtenu au login doit accompagner la requete. Il ne
+                # L'accès obtenu au login doit accompagner la requete. Il ne
                 # l'etait pas : les en-tetes partaient vides et /predict rendait
                 # 401, ce qui etait compte contre l'apprenant alors que son
-                # endpoint verifie correctement l'autorisation.
-                auth_headers = {"Authorization": f"Bearer {token}"} if token else {}
+                # endpoint verifie correctement l'autorisation. Une variante
+                # par façon de présenter l'accès (Bearer, cookie, clé).
                 request_variants = []
-                for wrapper in contract.get("predict_wrappers", [None, "request"]):
-                    if wrapper:
-                        request_variants.append(({wrapper: normalized_payload}, dict(auth_headers)))
-                    else:
-                        request_variants.append((normalized_payload, dict(auth_headers)))
+                for variante in acces:
+                    for wrapper in contract.get("predict_wrappers", [None, "request"]):
+                        if wrapper:
+                            request_variants.append(({wrapper: normalized_payload}, dict(variante["entetes"]), variante))
+                        else:
+                            request_variants.append((normalized_payload, dict(variante["entetes"]), variante))
                 if isinstance(normalized_payload, dict) and 'authorization' in normalized_payload:
                     body = dict(normalized_payload)
                     auth_value = body.pop('authorization')
-                    request_variants.append((body, {"Authorization": auth_value}))
-                for body, headers in request_variants:
+                    request_variants.append((body, {"Authorization": auth_value},
+                                             {"mecanisme": "jeton", "entete": "Authorization",
+                                              "valeur": str(auth_value).split(" ", 1)[-1]}))
+                for body, headers, variante in request_variants:
                     try:
                         self.logger.info("Testing /predict endpoint with adaptive payload...")
                         predict_response = requests.post(
@@ -1093,7 +1220,8 @@ class BentoMLRunner(BaseRunner):
                         # avec un autre nom etait recale pour rien.
                         results["predict_passed"] = True
                         results["predict_response"] = str(data)[:400]
-                        predict_ok = (body, headers, data)
+                        predict_ok = (body, headers, data, variante)
+                        results["mecanisme_acces"] = variante["mecanisme"]
                         self.logger.info(f"✓ Prediction successful : {str(data)[:200]}")
                         break
                     except Exception as e:
@@ -1117,56 +1245,111 @@ class BentoMLRunner(BaseRunner):
         return results
 
     def _sonder_securite_et_contrat(self, base_url: str, login_ok: dict, corps: dict,
-                                    entetes: dict, reponse) -> Dict[str, Any]:
+                                    entetes: dict, reponse, acces: Optional[dict] = None) -> Dict[str, Any]:
         """Ce que l'API refuse, et ce que /predict rend — sur la forme de
         requête qui a réussi, pour ne juger que le comportement.
 
         Les sondes nominales ne prouvaient que « ça répond » : une API sans
         aucune vérification de token avait la même note qu'une API sécurisée.
-        Codes relevés tels quels ; le barème décide."""
-        def code(methode, chemin, **kw):
+        Codes relevés tels quels ; le barème décide.
+
+        `acces` dit comment l'accès a été présenté (jeton, cookie, clé) : la
+        méthode de sécurisation est libre (énoncé, 1.3), la sonde « accès
+        falsifié » modifie donc la valeur là où elle voyage. Les clés de
+        résultat gardent leur nom (predict_token_falsifie...) pour que les
+        rapports antérieurs se lisent toujours ; `mecanisme` précise."""
+        def requete(methode, chemin, **kw):
             try:
                 return requests.request(methode, f"{base_url}{chemin}",
-                                        timeout=self._http_timeout(10), **kw).status_code
+                                        timeout=self._http_timeout(10), **kw)
             except Exception as erreur:  # une connexion coupée n'est pas un code
                 return f"erreur : {type(erreur).__name__}"
 
-        sans_auth = {k: v for k, v in entetes.items() if k.lower() != "authorization"}
-        token = (entetes.get("Authorization") or "").split(" ", 1)[-1]
-        falsifie = token[:-4] + ("AAAA" if not token.endswith("AAAA") else "BBBB") if len(token) > 8 else "faux"
+        def code(methode, chemin, **kw):
+            r = requete(methode, chemin, **kw)
+            return r if isinstance(r, str) else r.status_code
+
+        if acces is None:
+            # Appel historique : un Bearer dans les en-têtes.
+            acces = {"mecanisme": "jeton", "entete": "Authorization",
+                     "valeur": (entetes.get("Authorization") or "").split(" ", 1)[-1]}
+        porteurs = {"authorization", "cookie", "x-api-key", str(acces.get("entete", "")).lower()}
+        sans_auth = {k: v for k, v in entetes.items() if k.lower() not in porteurs}
+
+        valeur = str(acces.get("valeur") or "")
+        mecanisme = acces.get("mecanisme", "jeton")
+        if not valeur:
+            entetes_falsifies = None  # rien à modifier : critère non mesuré
+        elif mecanisme == "cookie" and acces.get("cookies"):
+            entetes_falsifies = {**sans_auth, "Cookie": "; ".join(
+                f"{k}={_alterer(v)}" for k, v in acces["cookies"].items())}
+        elif mecanisme == "cookie":
+            entetes_falsifies = {**sans_auth, "Cookie": _alterer(valeur)}
+        elif acces.get("entete", "Authorization").lower() == "authorization":
+            entetes_falsifies = {**sans_auth, "Authorization": f"Bearer {_alterer(valeur)}"}
+        else:
+            entetes_falsifies = {**sans_auth, acces["entete"]: _alterer(valeur)}
+
         mauvais_login = json.loads(json.dumps(login_ok))
         cible = mauvais_login.get("credentials", mauvais_login) if isinstance(mauvais_login, dict) else {}
         if isinstance(cible, dict) and "password" in cible:
             cible["password"] = "mauvais-mot-de-passe-scriptorium"
         invalide = json.loads(json.dumps(corps))
         cible_inv = next((v for v in invalide.values() if isinstance(v, dict)), invalide) if isinstance(invalide, dict) else {}
-        for cle, valeur in list(cible_inv.items()) if isinstance(cible_inv, dict) else []:
-            if isinstance(valeur, (int, float)) and not isinstance(valeur, bool):
+        for cle, val in list(cible_inv.items()) if isinstance(cible_inv, dict) else []:
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
                 cible_inv[cle] = "pas-un-nombre"
         securite = {
             "predict_sans_token": code("POST", "/predict", json=corps, headers=sans_auth),
-            "predict_token_falsifie": code("POST", "/predict", json=corps,
-                                           headers={**sans_auth, "Authorization": f"Bearer {falsifie}"}),
+            "predict_token_falsifie": (code("POST", "/predict", json=corps, headers=entetes_falsifies)
+                                       if entetes_falsifies is not None else None),
             "login_mauvais_identifiants": code("POST", "/login", json=mauvais_login),
+            "mecanisme": mecanisme,
         }
+
+        # La prédiction jugée vient du profil médian : la régression linéaire
+        # imposée n'est pas bornée, un profil extrême sort de [0, 1] sur une
+        # copie juste. Si le service refuse le corps médian, repli sur la
+        # réponse du premier appel.
+        prediction = premier_nombre(reponse)
+        profil = "nominal"
+        median = appliquer_profil_median(corps)
+        if median != corps:
+            r = requete("POST", "/predict", json=median, headers=entetes)
+            if not isinstance(r, str) and r.status_code == 200:
+                try:
+                    valeur_mediane = premier_nombre(r.json())
+                except Exception:
+                    valeur_mediane = None
+                if valeur_mediane is not None:
+                    prediction, profil = valeur_mediane, "median"
+        elif prediction is not None and profil_reconnu(corps):
+            # Corps déjà au profil médian. Aucun champ reconnu (liste
+            # positionnelle, noms inconnus) : le profil reste « nominal ».
+            profil = "median"
         contrat = {
-            "prediction": premier_nombre(reponse),
+            "prediction": prediction,
             "predict_entree_invalide": code("POST", "/predict", json=invalide, headers=entetes),
         }
         self.record_step(
             "Sondes de sécurité et de contrat",
-            command="POST /predict sans token, avec un token falsifié, avec une entrée invalide ; "
-                    "POST /login avec un mauvais mot de passe",
-            output="\n".join(f"{k} : {v}" for k, v in {**securite, **contrat}.items()),
+            command=f"POST /predict sans accès, avec un accès falsifié ({mecanisme}), avec une "
+                    "entrée invalide, au profil médian ; POST /login avec un mauvais mot de passe",
+            output="\n".join(f"{k} : {v}" for k, v in {**securite, **contrat, "profil": profil}.items()),
             exit_code=0,
         )
         return {"securite": securite, "contrat": contrat,
                 "identifiants_dans_la_copie": self._identifiants_dans_la_copie(login_ok)}
 
     def _identifiants_dans_la_copie(self, login_ok: dict) -> bool:
-        """Les identifiants qui ont ouvert /login figurent-ils dans un fichier
-        texte de la copie (README, tests, .env, code) ? Sinon le harnais les a
-        devinés, et un tiers ne saurait pas relancer les tests."""
+        """Les identifiants qui ont ouvert /login figurent-ils dans le README
+        ou les tests de la copie ? Sinon le harnais les a devinés (ou lus dans
+        le code du service), et un tiers ne saurait pas relancer les tests.
+
+        README et tests seulement : c'est ce que l'énoncé demande de livrer
+        (« README.md avec les commandes strictes et ordonnées pour [...]
+        lancer les tests », « Le dossier tests/ ») ; des identifiants écrits
+        dans src/service.py ne documentent rien pour qui relance pytest."""
         cible = login_ok.get("credentials", login_ok) if isinstance(login_ok, dict) else {}
         utilisateur, mot_de_passe = str(cible.get("username", "")), str(cible.get("password", ""))
         if not utilisateur or not mot_de_passe:
@@ -1174,9 +1357,13 @@ class BentoMLRunner(BaseRunner):
         for racine, dossiers, fichiers in os.walk(self.eval_dir):
             dossiers[:] = [d for d in dossiers if d not in (".git", ".venv", "venv", "node_modules",
                                                             "__pycache__", ".pytest_cache")]
+            dans_tests = "tests" in os.path.relpath(racine, self.eval_dir).replace("\\", "/").split("/")
             for nom in fichiers:
-                if not nom.lower().endswith((".md", ".txt", ".py", ".env", ".sh", ".yml", ".yaml", ".json", ".toml")) \
-                        and nom not in (".env", "Makefile"):
+                bas = nom.lower()
+                readme = bas.startswith("readme")
+                test = dans_tests or (bas.endswith(".py") and (bas.startswith("test_") or bas.endswith("_test.py")
+                                                              or bas == "conftest.py"))
+                if not (readme or test):
                     continue
                 try:
                     with open(os.path.join(racine, nom), encoding="utf-8", errors="ignore") as lecteur:
@@ -1431,6 +1618,12 @@ class BentoMLRunner(BaseRunner):
                 patched_tests_path,
                 "-v",
                 "--tb=short",
+                # Ni .pytest_cache ni __pycache__ déposés dans la copie par
+                # notre propre run : la grille compte les caches livrés
+                # (« N'envoyez jamais les caches locaux », énoncé 1.6) et
+                # pénalisait ceux que le correcteur venait de créer.
+                "-p",
+                "no:cacheprovider",
                 "-o",
                 "asyncio_mode=auto",
                 f"--junit-xml={junit_path}",
@@ -1441,6 +1634,7 @@ class BentoMLRunner(BaseRunner):
         env = os.environ.copy()
         env["BENTOML_BASE_URL"] = base_url
         env["BENTOML_PORT"] = base_url.rsplit(":", 1)[-1]
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         # Les apprenants propres lisent une variable d'environnement — mais
         # chacun la sienne. 459404 lisait BASE_URL, on n'exportait que
         # BENTOML_BASE_URL : son repli localhost:3000 partait en connexion
@@ -1500,6 +1694,8 @@ class BentoMLRunner(BaseRunner):
                     *discovered_files,
                     "-v",
                     "--tb=short",
+                    "-p",
+                    "no:cacheprovider",
                     "-o",
                     "asyncio_mode=auto",
                     f"--junit-xml={junit_path}",
