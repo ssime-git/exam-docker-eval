@@ -14,7 +14,7 @@ from typing import Dict, Any
 from testcontainers.compose import DockerCompose
 
 from .base_runner import BaseRunner
-from . import sondes_nginx
+from . import sondes_nginx, sondes_prometheus
 from .sonde_http import contexte_tls_permissif, resume, sonder
 from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN
 
@@ -266,6 +266,21 @@ COMPORTEMENT_NON_MESURE = {"ab": None, "rafale": None, "mauvais_identifiants": N
 MONITORING_NON_MESURE = {"exporter_nginx_up": None, "prometheus_cibles_up": None,
                          "prometheus_cibles_down": None, "grafana_datasources": None,
                          "grafana_dashboards": None}
+
+# Sondes de comportement prometheus-grafana (467439, 466056). L'API de ces
+# copies télécharge ses données et entraîne au démarrage : après l'attente
+# fixe, sa racine peut encore se taire. On lui laisse ATTENTE_API_S pour
+# exposer /metrics, puis ATTENTE_CIBLES_S à Prometheus pour la scraper (une
+# cible pas encore scrapée est `unknown`, pas `down`). Le rapport Evidently
+# de /trigger-drift dépasse largement les 10 s par défaut sur 2 vCPU.
+ATTENTE_API_S = 60
+ATTENTE_CIBLES_S = 30
+PAS_ATTENTE_S = 5
+DELAI_DERIVE_S = 90
+MAXI_TABLEAUX = 20
+# Ports et noms qui ne sont pas l'API : la stack de monitoring elle-même.
+PORTS_MONITORING = {"9090", "3000", "9100", "9113", "9093"}
+MOTS_MONITORING = ("prometheus", "grafana", "exporter", "alertmanager", "cadvisor")
 
 
 def limitation_de_debit_declaree(eval_dir: str) -> bool:
@@ -967,6 +982,17 @@ class ComposeRunner(BaseRunner):
                 self.record_step("Sondes de comportement nginx",
                                  output=f"non mesurées : erreur interne du harnais ({erreur})", exit_code=0)
 
+        # Même grille, examen prometheus-grafana (467439, 466056) : le barème
+        # lit `prometheus_comportement`, pas les mots-clés des fichiers.
+        prometheus = None
+        if comportement is None and sondes_prometheus.est_examen_prometheus(self.eval_dir):
+            try:
+                prometheus = self._sonder_comportement_prometheus(sondes)
+            except Exception as erreur:
+                prometheus = dict.fromkeys(sondes_prometheus.CHAMPS)
+                self.record_step("Sondes de comportement Prometheus",
+                                 output=f"non mesurées : erreur interne du harnais ({erreur})", exit_code=0)
+
         boucles = self._boucles_de_redemarrage()
         for nom in boucles:
             etats[nom] = ("restarting", etats.get(nom, ("", 1))[1] or 1)
@@ -1016,6 +1042,8 @@ class ComposeRunner(BaseRunner):
         }
         if comportement is not None:
             resultat["nginx_comportement"] = comportement
+        if prometheus is not None:
+            resultat["prometheus_comportement"] = prometheus
         return resultat
 
     def _sonder_chemins_declares(self, sondes_racine: list) -> list:
@@ -1393,24 +1421,30 @@ class ComposeRunner(BaseRunner):
 
     def _identifiants_grafana(self) -> str:
         """GF_SECURITY_ADMIN_USER/PASSWORD du compose, sinon admin:admin
-        (le défaut de l'image)."""
+        (le défaut de l'image). Jamais consignés : l'appelant ne les met pas
+        dans une étape."""
         utilisateur, mot_de_passe = "admin", "admin"
         try:
             import yaml
             with open(fichier_compose(self.eval_dir), encoding="utf-8") as lecteur:
                 services = (yaml.safe_load(lecteur) or {}).get("services") or {}
+            # `${GRAFANA_ADMIN_PASSWORD}` se résout contre le .env du projet :
+            # celui de la copie, ou celui que le harnais a écrit (469217),
+            # encore présent tant que la stack tourne.
+            env_fichier = sondes_prometheus.lire_env(os.path.join(self.eval_dir, ".env"))
             for nom, service in services.items():
                 if "grafana" not in f"{nom} {service.get('image', '')}".lower():
                     continue
                 env = service.get("environment") or {}
                 if isinstance(env, list):
                     env = dict(e.split("=", 1) for e in env if isinstance(e, str) and "=" in e)
-                u = str(env.get("GF_SECURITY_ADMIN_USER") or "")
-                p = str(env.get("GF_SECURITY_ADMIN_PASSWORD") or "")
-                # ${VAR} viendrait d'un .env que l'on ne résout pas ici.
-                if u and "${" not in u:
+                u = sondes_prometheus.resoudre_variable(str(env.get("GF_SECURITY_ADMIN_USER") or ""), env_fichier)
+                p = sondes_prometheus.resoudre_variable(str(env.get("GF_SECURITY_ADMIN_PASSWORD") or ""),
+                                                        env_fichier)
+                # Une variable sans valeur : Grafana démarre avec le défaut.
+                if u:
                     utilisateur = u
-                if p and "${" not in p:
+                if p:
                     mot_de_passe = p
                 break
         except Exception:
@@ -1460,6 +1494,201 @@ class ComposeRunner(BaseRunner):
                 except Exception:
                     monitoring[champ] = None
         return monitoring
+
+    @staticmethod
+    def _candidats_api(sondes_racine: list) -> list:
+        """Les URL hôte qui peuvent être l'API, quel que soit le code de leur
+        sonde racine : l'API de 467439/466056 entraîne au démarrage et sa
+        racine peut encore se taire. Le nom (api, bike, app) puis les ports
+        habituels (8000, 5000, 8080) passent devant ; la stack de monitoring
+        est écartée."""
+        candidats = []
+        for sonde in sondes_racine:
+            url = str(sonde.get("url", ""))
+            port = str(sonde.get("port", "")).split("/")[0]
+            nom = str(sonde.get("service", "")).lower()
+            if not url.startswith("http:") or port in PORTS_MONITORING or any(m in nom for m in MOTS_MONITORING):
+                continue
+            racine = url.rstrip("/")
+            if racine in [c for _, c in candidats]:
+                continue
+            rang = 0 if any(m in nom for m in ("api", "bike", "app")) else 1 if port in ("8000", "5000", "8080") else 2
+            candidats.append((rang, racine))
+        return [racine for _, racine in sorted(candidats, key=lambda c: c[0])]
+
+    def _trouver_api(self, sondes_racine: list):
+        """(racine, sonde /metrics) de l'API : le service dont /metrics expose
+        des métriques applicatives. À défaut, le premier candidat qui répond
+        (son code dit l'absence de /metrics). (None, None) sinon."""
+        candidats = self._candidats_api(sondes_racine)
+        if not candidats:
+            return None, None
+        limite = time.time() + ATTENTE_API_S
+        while True:
+            repondu, en_attente = None, False
+            for racine in candidats:
+                sonde = sonder(f"{racine}/metrics", taille_extrait=TAILLE_CORPS_SONDE)
+                code = sonde.get("code")
+                if code == 200:
+                    noms, _ = sondes_prometheus.familles_metriques(sonde.get("extrait", ""))
+                    if any(sondes_prometheus.est_metrique_applicative(n) for n in noms):
+                        return racine, sonde
+                if not isinstance(code, int) or code >= 500:
+                    en_attente = True
+                elif repondu is None:
+                    repondu = (racine, sonde)
+            if not en_attente or time.time() >= limite:
+                return repondu or (None, None)
+            time.sleep(PAS_ATTENTE_S)
+
+    def _lire_json(self, url: str, entetes: dict | None = None):
+        """Le JSON d'une réponse 200 ; None sinon. Un corps tronqué ou
+        illisible n'est jamais lu comme une liste vide."""
+        import json
+        sonde = sonder(url, entetes=entetes, taille_extrait=TAILLE_CORPS_SONDE)
+        if sonde.get("code") != 200:
+            return None
+        return json.loads(sonde.get("extrait", ""))
+
+    def _sonder_comportement_prometheus(self, sondes_racine: list) -> dict:
+        """Les exigences prometheus-grafana de la grille, prouvées en marche
+        (467439, 466056, grille du 15/10).
+
+        Chaque champ est au mieux : celui qui ne peut pas se mesurer vaut
+        None, jamais une exception. L'ordre compte : l'API d'abord (les
+        cibles ne sont up qu'une fois l'API scrapée), la dérive en dernier
+        (elle modifie les métriques que les autres sondes relèvent)."""
+        import base64
+
+        debut = time.time()
+        c = dict.fromkeys(sondes_prometheus.CHAMPS)
+        notes = []
+
+        try:
+            api, sonde_metrics = self._trouver_api(sondes_racine)
+        except Exception:
+            api, sonde_metrics = None, None
+        if sonde_metrics is not None:
+            noms, types = sondes_prometheus.familles_metriques(sonde_metrics.get("extrait", ""))
+            c["metriques_api"] = {"code": sonde_metrics.get("code"), "noms": noms, "types": types}
+
+        prometheus = self._racine_monitoring(sondes_racine, ("prometheus",), 9090, exclure="exporter")
+        if prometheus:
+            try:
+                code = sonder(f"{prometheus}/-/ready").get("code")
+                c["prometheus_pret"] = (code == 200) if isinstance(code, int) else None
+            except Exception:
+                c["prometheus_pret"] = None
+            try:
+                limite = time.time() + ATTENTE_CIBLES_S
+                donnees = self._lire_json(f"{prometheus}/api/v1/targets")
+                # Une cible pas encore scrapée, ou l'API montée pendant notre
+                # attente : on laisse quelques intervalles de scrape.
+                while donnees is not None and time.time() < limite \
+                        and sondes_prometheus.resumer_cibles(donnees)["down"]:
+                    time.sleep(PAS_ATTENTE_S)
+                    donnees = self._lire_json(f"{prometheus}/api/v1/targets")
+                if donnees is not None:
+                    c["cibles"] = sondes_prometheus.resumer_cibles(donnees)
+                    inconnues = sondes_prometheus.cibles_inconnues(donnees)
+                    if inconnues:
+                        notes.append(f"cibles jamais scrapées (unknown), comptées pas up : {', '.join(inconnues)}")
+            except Exception:
+                c["cibles"] = None
+            try:
+                donnees = self._lire_json(f"{prometheus}/api/v1/rules")
+                c["regles"] = sondes_prometheus.resumer_regles(donnees) if donnees is not None else None
+            except Exception:
+                c["regles"] = None
+
+        grafana = self._racine_monitoring(sondes_racine, ("grafana",), 3000)
+        if grafana:
+            try:
+                code = sonder(f"{grafana}/api/health").get("code")
+                c["grafana_sante"] = (code == 200) if isinstance(code, int) else None
+            except Exception:
+                c["grafana_sante"] = None
+            try:
+                jeton = base64.b64encode(self._identifiants_grafana().encode()).decode()
+                auth = {"Authorization": f"Basic {jeton}"}
+                sources = self._lire_json(f"{grafana}/api/datasources", auth)
+                tableaux = self._lire_json(f"{grafana}/api/search?type=dash-db", auth)
+                if isinstance(sources, list) and isinstance(tableaux, list):
+                    requetes = []
+                    for tableau in tableaux[:MAXI_TABLEAUX]:
+                        uid = tableau.get("uid") if isinstance(tableau, dict) else None
+                        if not uid or len(requetes) >= 100:
+                            continue
+                        try:
+                            detail = self._lire_json(f"{grafana}/api/dashboards/uid/{uid}", auth)
+                        except Exception:
+                            detail = None
+                        if isinstance(detail, dict):
+                            for expr in sondes_prometheus.requetes_des_panels(detail, maxi=100):
+                                if expr not in requetes and len(requetes) < 100:
+                                    requetes.append(expr)
+                    c["grafana"] = {
+                        "datasources": len(sources),
+                        "datasource_prometheus": any(isinstance(s, dict) and s.get("type") == "prometheus"
+                                                     for s in sources),
+                        "dashboards": len(tableaux),
+                        "requetes_panels": requetes,
+                        "alertes": None,
+                    }
+                    # Les alertes gérées par Grafana (provisioning/alerting) :
+                    # 467439 y met son alerte RMSE, invisible de
+                    # /api/v1/rules de Prometheus.
+                    try:
+                        regles = self._lire_json(f"{grafana}/api/v1/provisioning/alert-rules", auth)
+                        if isinstance(regles, list):
+                            c["grafana"]["alertes"] = sondes_prometheus.alertes_grafana(regles)
+                    except Exception:
+                        c["grafana"]["alertes"] = None
+            except Exception:
+                c["grafana"] = None
+
+        try:
+            declare = sondes_prometheus.endpoint_drift_declare(self.eval_dir)
+            if api and declare:
+                avant = sondes_prometheus.series_drift((sonde_metrics or {}).get("extrait", ""))
+                methode = declare["methode"]
+                reponse = sonder(f"{api}{declare['chemin']}", methode=methode, timeout=DELAI_DERIVE_S)
+                if reponse.get("code") == 405 and methode != "GET":
+                    reponse = sonder(f"{api}{declare['chemin']}", methode="GET", timeout=DELAI_DERIVE_S)
+                code = reponse.get("code")
+                modifiee = None
+                if isinstance(code, int) and 200 <= code < 300:
+                    relu = sonder(f"{api}/metrics", taille_extrait=TAILLE_CORPS_SONDE)
+                    if relu.get("code") == 200:
+                        apres = sondes_prometheus.series_drift(relu.get("extrait", ""))
+                        changees = sondes_prometheus.series_changees(avant, apres)
+                        modifiee = bool(changees)
+                        if changees:
+                            notes.append("jauge(s) de dérive modifiée(s) : " + ", ".join(
+                                f"{s} {avant.get(s, 'absente')} → {apres[s]}" for s in changees[:5]))
+                # Sans réponse HTTP (délai dépassé : Evidently sur 2 vCPU),
+                # rien n'est mesuré : le champ entier vaut null, le code du
+                # contrat reste toujours un entier.
+                if isinstance(code, int):
+                    c["endpoint_drift"] = {"chemin": declare["chemin"], "code": code, "metrique_modifiee": modifiee}
+                else:
+                    notes.append(f"endpoint de dérive {declare['chemin']} sans réponse : "
+                                 f"{reponse.get('erreur') or code}")
+        except Exception:
+            c["endpoint_drift"] = None
+
+        self.record_step(
+            "Sondes de comportement Prometheus",
+            command=(f"GET <api>/metrics ({api or 'API introuvable'}), "
+                     f"Prometheus {prometheus or 'non publié'} : /-/ready, /api/v1/targets, /api/v1/rules ; "
+                     f"Grafana {grafana or 'non publié'} : /api/health, /api/datasources, /api/search, "
+                     "/api/dashboards/uid, /api/v1/provisioning/alert-rules (identifiants du compose, non consignés) ; endpoint de dérive puis "
+                     "/metrics relu"),
+            output=sondes_prometheus.resume_comportement(c) + ("\n" + "\n".join(notes) if notes else ""),
+            exit_code=0,
+            duration=time.time() - debut,
+        )
+        return c
 
     def _record_service_states(self) -> dict:
         """Lire et consigner l'état de chaque conteneur du projet."""
