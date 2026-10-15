@@ -105,3 +105,15 @@ def test_la_requete_negative_de_la_copie_attend_son_401(tmp_path, monkeypatch):
     runner._sonder_chemins_declares(SONDES_RACINE)
     etape = next(s for s in runner.steps if "Requête déclarée" in (s.get("title") or s.get("titre") or ""))
     assert "requête négative" in etape["output"] and "attendue" in etape["output"]
+
+
+def test_sans_nginx_conf_les_requetes_declarees_se_rejouent(tmp_path, monkeypatch):
+    """prometheus-grafana n'a pas de reverse proxy : la sortie anticipée sans
+    nginx.conf empêchait de rejouer les curl du Makefile (:8000/metrics)."""
+    ecrire(tmp_path / "Makefile", "metrics:\n\tcurl -s http://localhost:8000/metrics\n")
+    runner = ComposeRunner("466056", str(tmp_path), timeout=60, logger=logging.getLogger("t"))
+    monkeypatch.setattr(compose_runner, "sonder", lambda url, **k: {"code": 200, "extrait": "bike_api_requests_total 3"})
+    sondes = [{"service": "bike-api", "port": "8000/tcp", "url": "http://127.0.0.1:32780/", "code": 200}]
+    runner._sonder_chemins_declares(sondes)
+    etape = next(s for s in runner.steps if "Requête déclarée" in (s.get("title") or s.get("titre") or ""))
+    assert "127.0.0.1:32780/metrics" in etape["command"] and "code 200" in etape["output"]
