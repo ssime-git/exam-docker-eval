@@ -262,7 +262,23 @@ PAUSE_LIMITATION_S = 1.5
 TAILLE_CORPS_SONDE = 200_000
 REQUETES_PAR_RAFALE = 20
 COMPORTEMENT_NON_MESURE = {"ab": None, "rafale": None, "mauvais_identifiants": None,
-                           "sans_identifiants": None, "repartition": None, "redirection_80_443": None}
+                           "sans_identifiants": None, "identifiants_acceptes": None, "repartition": None,
+                           "redirection_80_443": None, "make_test": None}
+
+# `make test`, la validation finale de l'énoncé, se joue dans un conteneur
+# jetable : jamais sur l'hôte (shell arbitraire de l'apprenant), jamais avec
+# le socket Docker. Image construite une fois, réutilisée ; surchargeable.
+IMAGE_MAKE_TEST = os.environ.get("EXAM_DOCKER_EVAL_IMAGE_MAKE_TEST", "scriptorium-make-test:1")
+DOCKERFILE_MAKE_TEST = ("FROM alpine:3.20\n"
+                        "RUN apk add --no-cache bash curl make socat coreutils grep sed gawk openssl jq\n")
+DELAI_MAKE_TEST_S = 120
+# Au-delà du délai du script : installation des relais, copie de l'archive.
+MARGE_MAKE_TEST_S = 60
+
+
+def client_docker():
+    import docker
+    return docker.from_env()
 MONITORING_NON_MESURE = {"exporter_nginx_up": None, "prometheus_cibles_up": None,
                          "prometheus_cibles_down": None, "grafana_datasources": None,
                          "grafana_dashboards": None}
@@ -1087,14 +1103,15 @@ class ComposeRunner(BaseRunner):
                 # README) — l'apprenant choisit ses identifiants, les lire fait
                 # partie de la correction.
                 if code == 401:
-                    candidats = []
+                    # admin:admin d'abord : les identifiants du cours.
+                    candidats = [(sondes_nginx.IDENTIFIANTS_DU_COURS, "du cours")]
                     enonce = os.environ.get("EXAM_DOCKER_EVAL_BASIC_AUTH", "")
-                    if enonce:
+                    if enonce and enonce != sondes_nginx.IDENTIFIANTS_DU_COURS:
                         candidats.append((enonce, "énoncé"))
                     candidats.extend(
                         (c, f"déclarés dans la copie ({src})")
                         for c, src in identifiants_declares(self.eval_dir)
-                        if c != enonce
+                        if c not in (enonce, sondes_nginx.IDENTIFIANTS_DU_COURS)
                     )
                     import base64
                     for identifiants, source in candidats:
@@ -1145,7 +1162,47 @@ class ComposeRunner(BaseRunner):
             racine_url = base["url"].rstrip("/")
             for requete in vers_proxy:
                 resultats.append(self._rejouer_requete(requete, racine_url, contexte, base))
+
+        # Aucune requête de la copie n'obtient de prédiction : le moteur joue
+        # la sienne, authentifiée, construite depuis le schéma de l'API.
+        if sondes_nginx.fichier_nginx_conf(self.eval_dir) and not any(
+                s.get("declared") and "/predict" in str(s.get("url", ""))
+                and isinstance(s.get("code"), int) and 200 <= s["code"] < 300 for s in resultats):
+            for base in bases[:1]:
+                resultats.extend(self._poster_predict_construit(base, contexte))
         return resultats
+
+    def _poster_predict_construit(self, base: dict, contexte) -> list:
+        """POST /predict construit, essayé avec chaque couple d'identifiants
+        jusqu'au premier qui passe le 401 ; une sonde `construite`."""
+        racine_url = base["url"].rstrip("/")
+        requete = self._requete_construite(racine_url, contexte)
+        if requete is None:
+            self.record_step("Requête construite par le correcteur : POST /predict",
+                             command=f"GET {racine_url}/openapi.json puis lecture de src/api/v1/main.py",
+                             output="non construite : ni schéma OpenAPI joignable ni modèle Pydantic lisible",
+                             exit_code=0)
+            return []
+        self._requete_construite_memo = requete
+        sonde = {}
+        for identifiants in self._identifiants_candidats(requete):
+            started = time.time()
+            sonde = {"service": base["service"], "port": base["port"], "url": f"{racine_url}/predict",
+                     "auth": True, "construite": True}
+            sonde.update(self._poster_predict(f"{racine_url}/predict", requete, identifiants, contexte))
+            sonde["duration_seconds"] = time.time() - started
+            if sonde.get("code") != 401:
+                break
+        code = sonde.get("code")
+        self.record_step(
+            "Requête construite par le correcteur : POST /predict",
+            command=f"POST {racine_url}/predict + corps JSON {requete['corps']} + Authorization Basic "
+                    f"({requete['source']})",
+            output=f"{resume(sonde)}\n{str(sonde.get('extrait', ''))[:400]}"[:500],
+            exit_code=0 if isinstance(code, int) else 1,
+            duration=sonde.get("duration_seconds", 0),
+        )
+        return [sonde]
 
     def _rejouer_requete(self, requete: dict, racine_url: str, contexte, base: dict) -> dict:
         """Une requête déclarée, rejouée et consignée en étape.
@@ -1199,19 +1256,51 @@ class ComposeRunner(BaseRunner):
         469145 déclare trois POST /predict : le nominal, la variante A/B
         (X-Experiment-Group: debug) et un cas négatif (admin:wrongpassword).
         On prend le premier qui vise le proxy avec des identifiants non
-        négatifs : c'est lui qui rend 200. Sans requête déclarée, un POST
+        négatifs : c'est lui qui rend 200. Sans requête déclarée, celle que
+        le moteur construit depuis le schéma de l'API ; à défaut, un POST
         sans corps : le code reste lisible (422 n'est pas 401 ni 503)."""
         for requete in requetes_declarees(self.eval_dir):
             if (requete["methode"] == "POST" and requete["chemin"].rstrip("/").endswith("/predict")
                     and requete.get("port") in (None, 80, 443)
                     and not (requete["identifiants"] and code_attendu_negatif(requete["identifiants"]))):
                 return requete
+        construite = getattr(self, "_requete_construite_memo", None)
+        if construite:
+            return construite
+        corps = sondes_nginx.corps_depuis_pydantic(self.eval_dir)
+        if corps is not None:
+            return self._requete_depuis_corps(corps, "modèle Pydantic de l'API")
         return {"methode": "POST", "chemin": "/predict", "corps": None, "entetes": {}, "identifiants": None}
 
+    @staticmethod
+    def _requete_depuis_corps(corps, origine: str) -> dict:
+        import json
+        return {"methode": "POST", "chemin": "/predict", "corps": json.dumps(corps, ensure_ascii=False),
+                "entetes": {"Content-Type": "application/json"}, "identifiants": None, "port": None,
+                "source": f"construite par le correcteur ({origine})"}
+
+    def _requete_construite(self, racine_url: str, contexte) -> dict | None:
+        """Un POST /predict que le moteur fabrique quand la copie n'en déclare
+        aucun qui passe : l'énoncé exige une API qui prédit, pas la forme de
+        la requête de test. Le schéma OpenAPI s'il traverse nginx (469145 ne
+        route que /predict : 404), sinon le modèle Pydantic de src/api/v1."""
+        import json
+        try:
+            sonde = sonder(f"{racine_url}/openapi.json", contexte=contexte, taille_extrait=TAILLE_CORPS_SONDE)
+            if sonde.get("code") == 200:
+                requete = sondes_prometheus.requete_depuis_openapi(json.loads(sonde.get("extrait", "")), "/predict")
+                if requete and requete.get("methode") == "POST" and requete.get("corps") is not None:
+                    return self._requete_depuis_corps(requete["corps"], "schéma OpenAPI servi par nginx")
+        except Exception:
+            pass
+        corps = sondes_nginx.corps_depuis_pydantic(self.eval_dir)
+        return self._requete_depuis_corps(corps, "modèle Pydantic de l'API") if corps is not None else None
+
     def _identifiants_candidats(self, requete: dict) -> list:
-        """Ceux de la requête déclarée, puis ceux que la copie écrit ailleurs,
-        puis ceux de l'énoncé (par env, jamais en dur dans ce dépôt public)."""
-        candidats = []
+        """admin:admin d'abord (le cours ; l'énoncé n'en fixe aucun), puis ceux
+        de la requête déclarée, ceux que la copie écrit ailleurs (tests,
+        README, Makefile), et ceux de l'énoncé passés par env."""
+        candidats = [sondes_nginx.IDENTIFIANTS_DU_COURS]
         if requete.get("identifiants"):
             candidats.append(requete["identifiants"])
         candidats.extend(c for c, _ in identifiants_declares(self.eval_dir))
@@ -1280,7 +1369,16 @@ class ComposeRunner(BaseRunner):
 
         if base is not None:
             url = base["url"].rstrip("/") + chemin
-            entete_ab = ab_declare["entete"] if ab_declare else None
+            # L'en-tête imposé par l'énoncé, toujours ; celui du map de la
+            # copie, s'il diffère, en information. La requête de base ne porte
+            # ni l'un ni l'autre (469145 déclare aussi sa variante debug).
+            entete_impose, valeur_imposee = sondes_nginx.ENTETE_AB_IMPOSE
+            copie_differe = bool(ab_declare) and (
+                ab_declare["entete"].lower(), ab_declare["valeur"]) != (entete_impose.lower(), valeur_imposee)
+            a_retirer = {entete_impose.lower()} | ({ab_declare["entete"].lower()} if ab_declare else set())
+            requete = dict(requete, entetes={k: v for k, v in (requete.get("entetes") or {}).items()
+                                             if k.lower() not in a_retirer})
+            entete_ab = None
             # Les sondes déclarées viennent de passer sur le même seau.
             time.sleep(PAUSE_LIMITATION_S)
             identifiants = None
@@ -1289,25 +1387,32 @@ class ComposeRunner(BaseRunner):
                 # Le POST nominal sert aussi à trouver les identifiants qui
                 # passent : le premier couple qui ne rend pas 401.
                 for couple in self._identifiants_candidats(requete) or [None]:
-                    defaut = self._poster_predict(url, requete, couple, contexte, entete_ab=entete_ab)
+                    defaut = self._poster_predict(url, requete, couple, contexte)
                     identifiants = couple
                     if defaut.get("code") != 401:
                         break
+                if isinstance(defaut.get("code"), int):
+                    comportement["identifiants_acceptes"] = defaut.get("code") != 401
             except Exception:
                 defaut = None
 
-            if ab_declare and defaut is not None:
+            def mesurer_variante(entete, valeur):
+                variante = self._poster_predict(url, requete, identifiants, contexte,
+                                                entete_ab=entete, valeur_ab=valeur)
+                deux_codes = isinstance(defaut.get("code"), int) and isinstance(variante.get("code"), int)
+                return {"code_variante": variante.get("code"),
+                        "corps_differents": (defaut.get("extrait") != variante.get("extrait")) if deux_codes else None}
+
+            if defaut is not None:
                 try:
-                    variante = self._poster_predict(url, requete, identifiants, contexte,
-                                                    entete_ab=entete_ab, valeur_ab=ab_declare["valeur"])
-                    deux_codes = isinstance(defaut.get("code"), int) and isinstance(variante.get("code"), int)
-                    comportement["ab"] = {
-                        "entete": entete_ab,
-                        "valeur": ab_declare["valeur"],
-                        "code_defaut": defaut.get("code"),
-                        "code_variante": variante.get("code"),
-                        "corps_differents": (defaut.get("extrait") != variante.get("extrait")) if deux_codes else None,
-                    }
+                    comportement["ab"] = {"entete": entete_impose, "valeur": valeur_imposee,
+                                          "code_defaut": defaut.get("code"),
+                                          **mesurer_variante(entete_impose, valeur_imposee),
+                                          "entete_copie": None}
+                    if copie_differe:
+                        comportement["ab"]["entete_copie"] = {
+                            "entete": ab_declare["entete"], "valeur": ab_declare["valeur"],
+                            **mesurer_variante(ab_declare["entete"], ab_declare["valeur"])}
                 except Exception:
                     comportement["ab"] = None
 
@@ -1396,18 +1501,158 @@ class ComposeRunner(BaseRunner):
                     tls[champ] = None
         comportement["tls"] = tls
 
+        # La validation finale de l'énoncé, en dernier : le seau de limit_req
+        # se remplit pendant la pause, et les logs des répliques sont déjà lus.
+        try:
+            time.sleep(PAUSE_LIMITATION_S)
+            comportement["make_test"] = self._executer_make_test()
+        except Exception as erreur:
+            comportement["make_test"] = {"code": None, "sortie": f"erreur interne du harnais : {erreur}"}
+
         self.record_step(
             "Sondes de comportement nginx",
-            command=(f"POST {base['url'].rstrip('/')}{chemin} (A/B, mauvais identifiants, sans identifiants, rafale de "
-                     f"{REQUETES_PAR_RAFALE}), logs des répliques v1, exporter/Prometheus/Grafana, "
-                     "redirection du port 80, poignée de main TLS 1.1 et certificat")
+            command=(f"POST {base['url'].rstrip('/')}{chemin} (A/B par X-Experiment-Group: debug, mauvais "
+                     f"identifiants, sans identifiants, rafale de {REQUETES_PAR_RAFALE}), logs des répliques v1, "
+                     "exporter/Prometheus/Grafana, redirection du port 80, poignée de main TLS 1.1 et certificat, "
+                     "make test dans un conteneur jetable")
                     if base is not None else
-                    "pas de port TLS nginx joignable : sondes /predict et TLS non lancées",
+                    "pas de port TLS nginx joignable : sondes /predict et TLS non lancées ; make test tenté",
             output=sondes_nginx.resume_comportement(comportement),
             exit_code=0,
             duration=time.time() - debut,
         )
         return comportement
+
+    def _image_make_test(self, client) -> str:
+        """L'image outillée (bash, curl, make, socat) du conteneur jetable,
+        construite au premier besoin puis réutilisée."""
+        import io
+        try:
+            client.images.get(IMAGE_MAKE_TEST)
+        except Exception:
+            client.images.build(fileobj=io.BytesIO(DOCKERFILE_MAKE_TEST.encode()), tag=IMAGE_MAKE_TEST, rm=True)
+        return IMAGE_MAKE_TEST
+
+    def _archive_de_la_copie(self) -> bytes:
+        """La copie de travail en tar, sous travail/ : elle entre dans le
+        conteneur par put_archive, sans montage de l'hôte."""
+        import io
+        import tarfile
+        tampon = io.BytesIO()
+        with tarfile.open(fileobj=tampon, mode="w") as archive:
+            for racine, dossiers, fichiers in os.walk(self.eval_dir):
+                dossiers[:] = [d for d in dossiers if d not in (".git", ".venv", "__pycache__", "node_modules")]
+                for nom in fichiers:
+                    chemin = os.path.join(racine, nom)
+                    if os.path.islink(chemin):
+                        continue  # un lien de la copie pourrait viser l'hôte
+                    archive.add(chemin, arcname=os.path.join("travail", os.path.relpath(chemin, self.eval_dir)),
+                                recursive=False)
+        return tampon.getvalue()
+
+    def _executer_make_test(self) -> dict:
+        """`make test` de la copie, joué comme sur la machine de l'apprenant
+        mais dans un conteneur jetable : {"code": int|None, "sortie": str}.
+
+        Isolation : image alpine outillée, pas de socket Docker, pas de
+        montage de l'hôte (la copie entre par archive), réseaux du projet
+        seulement, `timeout 120`, conteneur retiré dans tous les cas. Le
+        script vise `https://localhost` (le 443 que la copie publie) alors
+        que le moteur a relâché les ports : des relais socat rendent
+        localhost:<port publié> → <conteneur>:<port>, et la redirection
+        `https://$host/…` de nginx retombe sur le même relais."""
+        import secrets
+        debut = time.time()
+
+        def fin(code, sortie, commande="make test (conteneur jetable)"):
+            resultat = {"code": code, "sortie": sortie}
+            self.record_step(
+                "make test de la copie (conteneur jetable)",
+                command=commande,
+                output=(f"code {code}" if code is not None else "non mesuré") + f"\n{sortie}"[:1500],
+                # L'échec de make test est l'affaire du barème, pas une panne du harnais.
+                exit_code=0,
+                duration=time.time() - debut,
+            )
+            return resultat
+
+        commande, note = sondes_nginx.commande_make_test(self.eval_dir)
+        if commande is None:
+            return fin(None, note)
+        conteneurs = [c for c in self._conteneurs_du_projet() if getattr(c, "status", "running") == "running"]
+
+        def service(c):
+            return (getattr(c, "labels", None) or {}).get("com.docker.compose.service", c.name)
+
+        def reseaux(c):
+            return {nom: (info or {}).get("IPAddress")
+                    for nom, info in ((c.attrs.get("NetworkSettings") or {}).get("Networks") or {}).items()}
+
+        nginx = next((c for c in conteneurs if "nginx" in service(c).lower()
+                      and "exporter" not in service(c).lower()), None)
+        if nginx is None or not reseaux(nginx):
+            return fin(None, "pas de conteneur nginx debout : make test non lancé")
+        reseaux_utiles = list(reseaux(nginx))
+        relais = []
+        try:
+            with open(fichier_compose(self.eval_dir), encoding="utf-8", errors="replace") as lecteur:
+                publies = sondes_nginx.redirections_make_test(lecteur.read())
+        except Exception:
+            publies = []
+        for port_hote, nom_service, port_conteneur in publies:
+            cible = next((c for c in conteneurs if service(c) == nom_service), None)
+            if cible is None:
+                continue
+            ips = reseaux(cible)
+            reseau = next((r for r in reseaux_utiles if ips.get(r)), None) or next((r for r in ips if ips[r]), None)
+            if reseau is None:
+                continue
+            if reseau not in reseaux_utiles:
+                reseaux_utiles.append(reseau)
+            relais.append((port_hote, ips[reseau], port_conteneur, nom_service))
+        lignes = ["set -u"]
+        lignes += [f"socat TCP-LISTEN:{h},fork,reuseaddr,bind=127.0.0.1 TCP:{ip}:{c} &" for h, ip, c, _ in relais]
+        lignes += ["sleep 1", "cd /travail",
+                   f"timeout {DELAI_MAKE_TEST_S} {commande} 2>&1", "exit $?"]
+        script = "\n".join(lignes)
+        description = (f"{commande} dans {IMAGE_MAKE_TEST} (sans socket Docker, copie par archive, "
+                       f"timeout {DELAI_MAKE_TEST_S} s) ; relais localhost : "
+                       + (", ".join(f"{h} → {s}:{c}" for h, _, c, s in relais) or "aucun port publié"))
+        client = client_docker()
+        try:
+            image = self._image_make_test(client)
+        except Exception as erreur:
+            return fin(None, f"image du conteneur jetable indisponible ({erreur})", description)
+        conteneur = None
+        try:
+            conteneur = client.containers.create(
+                image, command=["sh", "-c", script],
+                name=f"{self.project_name}-make-test-{secrets.token_hex(3)}",
+                network=reseaux_utiles[0], labels={"scriptorium.make-test": self.project_name},
+                mem_limit="512m", pids_limit=256, security_opt=["no-new-privileges"],
+                cap_drop=["NET_RAW", "MKNOD", "SYS_CHROOT", "SETFCAP", "AUDIT_WRITE"])
+            for reseau in reseaux_utiles[1:]:
+                client.networks.get(reseau).connect(conteneur)
+            conteneur.put_archive("/", self._archive_de_la_copie())
+            conteneur.start()
+            try:
+                etat = conteneur.wait(timeout=DELAI_MAKE_TEST_S + MARGE_MAKE_TEST_S)
+            except Exception as erreur:
+                return fin(None, f"délai dépassé ({DELAI_MAKE_TEST_S + MARGE_MAKE_TEST_S} s) : {erreur}", description)
+            code = etat.get("StatusCode") if isinstance(etat, dict) else None
+            sortie = sondes_nginx.nettoyer_sortie(conteneur.logs())
+            if code == 124:
+                return fin(None, f"délai de {DELAI_MAKE_TEST_S} s dépassé\n{sortie}", description)
+            prefixe = f"{note}\n" if note else ""
+            return fin(code if isinstance(code, int) else None, prefixe + sortie, description)
+        except Exception as erreur:
+            return fin(None, f"conteneur jetable en échec ({erreur})", description)
+        finally:
+            if conteneur is not None:
+                try:
+                    conteneur.remove(force=True)
+                except Exception:
+                    pass
 
     def _racine_monitoring(self, sondes_racine: list, mots: tuple, port: int, exclure: str | None = None):
         """L'URL hôte d'un service de monitoring : par son nom de conteneur,
