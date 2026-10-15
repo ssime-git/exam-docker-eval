@@ -435,6 +435,20 @@ def test_un_endpoint_de_derive_en_erreur_ne_conclut_rien_sur_la_jauge(tmp_path, 
     assert c["endpoint_drift"] == {"chemin": "/trigger-drift", "code": 422, "metrique_modifiee": None}
 
 
+def test_un_endpoint_de_derive_muet_vaut_null(tmp_path, monkeypatch):
+    runner, _ = runner_467439(tmp_path, monkeypatch)
+    sonder_base = compose_runner.sonder
+
+    def sonder(url, **kw):
+        if url.endswith("/trigger-drift"):
+            return {"code": "non reçu", "erreur": "timed out", "extrait": "timed out"}
+        return sonder_base(url, **kw)
+    monkeypatch.setattr(compose_runner, "sonder", sonder)
+    assert runner._sonder_comportement_prometheus(SONDES_RACINE)["endpoint_drift"] is None
+    etape = next(s for s in runner.steps if s["title"] == "Sondes de comportement Prometheus")
+    assert "/trigger-drift sans réponse : timed out" in etape["output"]
+
+
 def _evaluer(runner, monkeypatch):
     monkeypatch.setattr(runner, "_record_service_states", lambda: {"bike-api": ("running", 0)})
     monkeypatch.setattr(runner, "_sonder_ports_publies", lambda: [dict(s) for s in SONDES_RACINE])

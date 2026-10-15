@@ -1656,10 +1656,14 @@ class ComposeRunner(BaseRunner):
                         if changees:
                             notes.append("jauge(s) de dérive modifiée(s) : " + ", ".join(
                                 f"{s} {avant.get(s, 'absente')} → {apres[s]}" for s in changees[:5]))
-                c["endpoint_drift"] = {"chemin": declare["chemin"], "code": code if isinstance(code, int) else None,
-                                       "metrique_modifiee": modifiee}
-                if not isinstance(code, int):
-                    notes.append(f"endpoint de dérive sans réponse : {reponse.get('erreur') or code}")
+                # Sans réponse HTTP (délai dépassé : Evidently sur 2 vCPU),
+                # rien n'est mesuré : le champ entier vaut null, le code du
+                # contrat reste toujours un entier.
+                if isinstance(code, int):
+                    c["endpoint_drift"] = {"chemin": declare["chemin"], "code": code, "metrique_modifiee": modifiee}
+                else:
+                    notes.append(f"endpoint de dérive {declare['chemin']} sans réponse : "
+                                 f"{reponse.get('erreur') or code}")
         except Exception:
             c["endpoint_drift"] = None
 
