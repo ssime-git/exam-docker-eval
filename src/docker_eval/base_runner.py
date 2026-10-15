@@ -4,10 +4,50 @@ Base runner class for Docker evaluations.
 Defines the common interface that all runners must implement.
 """
 
+import contextlib
 import logging
 import os
+import re
+import subprocess
 from abc import ABC, abstractmethod
 from typing import Dict, Any
+
+
+VERROU_IMAGES_DEFAUT = "/tmp/exam-docker-eval-images.lock"
+
+
+@contextlib.contextmanager
+def verrou_images():
+    """Un seul chargement d'image à la fois sur la machine.
+
+    15/10 : 459845 et 458990 livraient toutes deux
+    `admission_prediction_service:latest`. Corrigées en même temps, le
+    `docker load` de l'une réécrivait le tag de l'autre entre son chargement
+    et son lancement. Sous ce verrou, « charger puis retaguer au nom de la
+    copie » ne s'entrelace jamais avec une autre correction. Un verrou de
+    fichier : indépendant du stockage d'images de Docker (overlay2 ou
+    containerd), relâché par le noyau si le processus meurt.
+    """
+    import fcntl
+    chemin = os.environ.get("EXAM_IMAGES_VERROU", VERROU_IMAGES_DEFAUT)
+    with open(chemin, "a") as fichier:
+        fcntl.flock(fichier, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fichier, fcntl.LOCK_UN)
+
+
+def tag_propre_a_la_copie(student_name: str, image: str) -> str:
+    """Le tag sous lequel cette copie lance son image : eval_<copie>/<nom>:<tag>."""
+    copie = re.sub(r"[^a-z0-9_.-]", "_", str(student_name).lower())
+    if not image or image.startswith("sha256:"):
+        nom, tag = "image", "latest"
+    else:
+        nom, _, tag = image.rpartition(":") if ":" in image.split("/")[-1] else (image, "", "latest")
+    nom = re.sub(r"[^a-z0-9_.-]", "_", nom.lower()) or "image"
+    tag = re.sub(r"[^a-z0-9_.-]", "_", (tag or "latest").lower())
+    return f"eval_{copie}/{nom}:{tag}"
 
 
 class BaseRunner(ABC):
@@ -241,6 +281,29 @@ class BaseRunner(ABC):
             self._exam_images = getattr(self, "_exam_images", set())
             self._exam_images.add(image)
 
+    def adopter_image(self, chargee: str) -> str:
+        """Retaguer une image tout juste chargée au nom de la copie, et rendre
+        ce tag : c'est lui qu'on lance et qu'on supprime. À appeler sous
+        verrou_images(), dans le même bloc que le chargement.
+
+        Le tag partagé (celui de l'archive) est noté avec l'image qu'il
+        désigne : au ménage, il n'est retiré que s'il la désigne encore.
+        """
+        if not chargee:
+            return chargee
+        propre = tag_propre_a_la_copie(self.student_name, chargee)
+        subprocess.run(["docker", "tag", chargee, propre], check=True, capture_output=True, timeout=60)
+        identifiant = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", propre],
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        if not chargee.startswith("sha256:"):
+            self._tags_partages = getattr(self, "_tags_partages", {})
+            self._tags_partages[chargee] = identifiant
+        self.record_exam_image(propre)
+        self.logger.info(f"Image de la copie : {propre} ({identifiant[:19]}), chargée sous {chargee}")
+        return propre
+
     def remove_exam_images(self) -> list[str]:
         """Supprimer les images chargées ou construites pour cette correction.
 
@@ -261,6 +324,19 @@ class BaseRunner(ABC):
             except Exception as erreur:
                 self.logger.warning(f"Image {image} non supprimée : {erreur}")
                 errors.append(f"image {image}: {erreur}")
+        # Le tag partagé n'est retiré que s'il désigne encore notre image :
+        # une autre copie a pu le recharger depuis.
+        with verrou_images():
+            for tag, identifiant in sorted(getattr(self, "_tags_partages", {}).items()):
+                actuel = subprocess.run(
+                    ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
+                    capture_output=True, text=True, timeout=60,
+                ).stdout.strip()
+                if actuel and actuel == identifiant:
+                    subprocess.run(["docker", "image", "rm", tag], capture_output=True, timeout=120)
+                    self.logger.info(f"✓ Tag partagé retiré : {tag}")
+                elif actuel:
+                    self.logger.info(f"Tag partagé {tag} laissé : il désigne l'image d'une autre copie")
         return errors
 
     def _log_execution_start(self):
