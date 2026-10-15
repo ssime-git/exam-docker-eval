@@ -262,7 +262,7 @@ PAUSE_LIMITATION_S = 1.5
 TAILLE_CORPS_SONDE = 200_000
 REQUETES_PAR_RAFALE = 20
 COMPORTEMENT_NON_MESURE = {"ab": None, "rafale": None, "mauvais_identifiants": None,
-                           "repartition": None, "redirection_80_443": None}
+                           "sans_identifiants": None, "repartition": None, "redirection_80_443": None}
 MONITORING_NON_MESURE = {"exporter_nginx_up": None, "prometheus_cibles_up": None,
                          "prometheus_cibles_down": None, "grafana_datasources": None,
                          "grafana_dashboards": None}
@@ -1294,6 +1294,22 @@ class ComposeRunner(BaseRunner):
                 comportement["mauvais_identifiants"] = None
 
             try:
+                # 469217 (rejeu du 15/10) : /predict limité au POST, nginx rend
+                # 403 au GET avant auth_basic. Le GET sans identifiants des
+                # chemins déclarés ne montre alors jamais le défi : on le
+                # mesure sur la méthode que la copie sert, corps et en-têtes
+                # de la requête nominale, sans Authorization (même déclarée
+                # en en-tête explicite). Avant la rafale : seau encore plein.
+                anonyme = dict(requete, identifiants=None, entetes={
+                    k: v for k, v in (requete.get("entetes") or {}).items() if k.lower() != "authorization"})
+                sans = self._poster_predict(url, anonyme, None, contexte, entete_ab=entete_ab)
+                code = sans.get("code")
+                comportement["sans_identifiants"] = code if isinstance(code, int) else \
+                    f"erreur : {sans.get('erreur') or code}"
+            except Exception:
+                comportement["sans_identifiants"] = None
+
+            try:
                 # Seau plein avant la rafale : la mesure ne dépend pas des
                 # sondes qui précèdent.
                 time.sleep(PAUSE_LIMITATION_S)
@@ -1354,7 +1370,7 @@ class ComposeRunner(BaseRunner):
 
         self.record_step(
             "Sondes de comportement nginx",
-            command=(f"POST {base['url'].rstrip('/')}{chemin} (A/B, mauvais identifiants, rafale de "
+            command=(f"POST {base['url'].rstrip('/')}{chemin} (A/B, mauvais identifiants, sans identifiants, rafale de "
                      f"{REQUETES_PAR_RAFALE}), logs des répliques v1, exporter/Prometheus/Grafana, "
                      "redirection du port 80, poignée de main TLS 1.1 et certificat")
                     if base is not None else
