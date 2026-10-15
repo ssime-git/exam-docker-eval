@@ -618,10 +618,12 @@ class ComposeRunner(BaseRunner):
 
         Un service encore debout est sain. Un service sorti en 0 est un
         one-shot qui a fini son travail (init de certificats, migration).
-        Un service sorti autrement est mort.
+        Un service sorti autrement est mort, et un service qui redémarre en
+        boucle aussi : sur 461338, bike-api plantait à l'import et Docker le
+        relançait sans fin, la stack passait pour debout.
         """
         morts = {n: e for n, e in etats.items()
-                 if e[0] == "exited" and e[1] != 0 or e[0] == "dead"}
+                 if e[0] == "exited" and e[1] != 0 or e[0] in ("dead", "restarting")}
         return (not morts, morts)
 
     def _conteneurs_du_projet(self) -> list:
@@ -661,6 +663,38 @@ class ComposeRunner(BaseRunner):
             c.reload()
             etats[c.name] = (c.status, c.attrs.get("State", {}).get("ExitCode", 0))
         return etats
+
+    def _boucles_de_redemarrage(self, delai: float = 45, pas: float = 3) -> set:
+        """Les conteneurs qui redémarrent en boucle.
+
+        461338 : bike-api plantait à l'import ; Docker le relançait sans fin,
+        et à l'instant du relevé il était souvent « running » (code remis à
+        0). Seuls les conteneurs qui ont déjà redémarré sont observés, au
+        plus `delai` secondes : si le compteur de redémarrages augmente ou si
+        le conteneur repasse par restarting/exited, c'est une boucle. Un
+        service qui a redémarré en attendant sa base puis s'est stabilisé
+        n'est pas en boucle. Une stack sans redémarrage n'attend rien.
+        """
+        suivis = {}
+        for conteneur in self._conteneurs_du_projet():
+            conteneur.reload()
+            compte = conteneur.attrs.get("RestartCount", 0) or 0
+            if conteneur.status == "restarting":
+                suivis[conteneur.name] = (conteneur, -1)
+            elif compte > 0:
+                suivis[conteneur.name] = (conteneur, compte)
+        boucles = {nom for nom, (_, compte) in suivis.items() if compte == -1}
+        debut = time.time()
+        while suivis.keys() - boucles and time.time() - debut < delai:
+            time.sleep(pas)
+            for nom, (conteneur, compte) in suivis.items():
+                if nom in boucles:
+                    continue
+                conteneur.reload()
+                if (conteneur.status in ("restarting", "exited")
+                        or (conteneur.attrs.get("RestartCount", 0) or 0) > compte):
+                    boucles.add(nom)
+        return boucles
 
     def _pipeline_container(self):
         """Le conteneur pipeline réellement créé par Compose, s'il existe."""
@@ -746,6 +780,16 @@ class ComposeRunner(BaseRunner):
         # publié est l'architecture attendue, pas une API absente.
         sondes.extend(self._sonder_chemins_declares(sondes))
 
+        boucles = self._boucles_de_redemarrage()
+        for nom in boucles:
+            etats[nom] = ("restarting", etats.get(nom, ("", 1))[1] or 1)
+        if boucles:
+            self.record_step(
+                "Services qui redémarrent en boucle",
+                command="docker inspect : RestartCount observé pendant l'évaluation",
+                output="\n".join(sorted(boucles)),
+                exit_code=1,
+            )
         succes, morts = self._classer_services(etats)
         if not etats:
             # Ne jamais réussir sur du vide : si on ne voit aucun conteneur,

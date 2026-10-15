@@ -508,3 +508,42 @@ def test_built_images_are_those_of_the_copy_project(tmp_path, logger, monkeypatc
     runner._retenir_images_de_la_copie()
 
     assert retenues == ["eval_468469-api-v1:latest", "eval_468469-nginx:latest"]
+
+
+class Redemarreur(FakeContainer):
+    """Un conteneur dont chaque reload() avance d'un état dans `suite`."""
+
+    def __init__(self, name, suite, service=None):
+        super().__init__(name, service=service)
+        self.suite = list(suite)
+        self.reload()
+
+    def reload(self):
+        status, compte = self.suite.pop(0) if len(self.suite) > 1 else self.suite[0]
+        self.status = status
+        self.attrs["RestartCount"] = compte
+
+
+def test_crash_loop_is_detected_even_when_caught_running(tmp_path, logger, monkeypatch):
+    """461338 : à l'instant du relevé, le conteneur qui plante en boucle est
+    souvent « running » (code remis à 0). Son compteur de redémarrages, lui,
+    continue d'augmenter. Un service qui a redémarré une fois en attendant
+    sa base puis s'est stabilisé n'est pas en boucle."""
+    runner = make_runner(tmp_path, logger)
+    boucle = Redemarreur("bike-api-1", [("running", 4), ("running", 4), ("restarting", 5)])
+    stabilise = Redemarreur("api-1", [("running", 1)] * 50)
+    sain = Redemarreur("nginx-1", [("running", 0)])
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [boucle, stabilise, sain])
+    horloge = iter(range(0, 1000, 5))
+    monkeypatch.setattr(module.time, "time", lambda: next(horloge))
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+
+    assert runner._boucles_de_redemarrage() == {"bike-api-1"}
+
+
+def test_no_restart_no_wait(tmp_path, logger, monkeypatch):
+    runner = make_runner(tmp_path, logger)
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [Redemarreur("nginx-1", [("running", 0)])])
+    monkeypatch.setattr(module.time, "sleep", lambda _s: (_ for _ in ()).throw(AssertionError("attente inutile")))
+
+    assert runner._boucles_de_redemarrage() == set()
