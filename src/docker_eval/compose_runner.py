@@ -145,7 +145,7 @@ def requetes_declarees(eval_dir: str, maxi: int = 6) -> list:
                 continue
             for appel in re.finditer(r"curl\s+[^\n]+", texte):
                 ligne = appel.group(0)
-                url = re.search(r"https?://(?:localhost|127\.0\.0\.1)(?::\d+)?(/[^\s\"']*)", ligne)
+                url = re.search(r"https?://(?:localhost|127\.0\.0\.1)(?::(\d+))?(/[^\s\"']*)", ligne)
                 if not url:
                     continue
                 methode = re.search(r"-X\s+(\w+)", ligne)
@@ -157,7 +157,10 @@ def requetes_declarees(eval_dir: str, maxi: int = 6) -> list:
                     "methode": (methode.group(1) if methode else "GET").upper(),
                     # Les curl vivent souvent dans un $(...) : ne pas avaler
                     # la parenthèse ou la quote de fermeture.
-                    "chemin": url.group(1).rstrip(")\"'"),
+                    "chemin": url.group(2).rstrip(")\"'"),
+                    # Le port visé : `localhost:9090/api/v1/...` parle à
+                    # Prometheus, pas au reverse proxy (469145).
+                    "port": int(url.group(1)) if url.group(1) else None,
                     "corps": corps.group(1) if corps else None,
                     "entetes": entetes,
                     "identifiants": user.group(1) if user else None,
@@ -168,6 +171,38 @@ def requetes_declarees(eval_dir: str, maxi: int = 6) -> list:
                 if len(requetes) >= maxi:
                     return requetes
     return requetes
+
+
+PAUSE_LIMITATION_S = 1.5
+
+
+def limitation_de_debit_declaree(eval_dir: str) -> bool:
+    """La copie configure-t-elle une limitation de débit nginx (limit_req) ?"""
+    import re
+    for racine, dossiers, fichiers in os.walk(eval_dir):
+        dossiers[:] = [d for d in dossiers if d not in (".git", ".venv", "__pycache__", "node_modules")]
+        for nom in fichiers:
+            if not nom.endswith(".conf"):
+                continue
+            try:
+                with open(os.path.join(racine, nom), encoding="utf-8", errors="replace") as lecteur:
+                    # `limit_req zone=…`, pas `limit_req_zone` (la déclaration de la zone).
+                    if re.search(r"\blimit_req\s+zone=", lecteur.read()):
+                        return True
+            except OSError:
+                continue
+    return False
+
+
+def racine_du_port(sondes_racine: list, port: int):
+    """L'URL hôte où le port de conteneur `port` est publié, dans le schéma
+    qui y répond ; None s'il n'est publié nulle part."""
+    for sonde in sondes_racine:
+        if str(sonde.get("port", "")).split("/")[0] != str(port):
+            continue
+        if isinstance(sonde.get("code"), int) and not str(sonde.get("note", "")).startswith("échec attendu"):
+            return sonde["url"].rstrip("/")
+    return None
 
 
 def annoter_bruit_de_sondes(sondes: list) -> None:
@@ -774,37 +809,74 @@ class ComposeRunner(BaseRunner):
                             break
 
         # La preuve de fonction : rejouer les requêtes que la copie déclare
-        # (méthode, corps, en-têtes, identifiants), sur les mêmes bases TLS.
+        # (méthode, corps, en-têtes, identifiants), sur les mêmes bases TLS —
+        # sauf celles qui visent explicitement un autre port : elles partent
+        # vers le port hôte où ce port de conteneur est publié, ou ne partent
+        # pas. 469145 : `curl http://localhost:9090/api/v1/status/runtimeinfo`
+        # (Prometheus) rejoué sur le 443 de nginx rendait un 404 « bloquant ».
         import base64
-        for base in bases:
-            racine_url = base["url"].rstrip("/")
-            for requete in requetes_declarees(self.eval_dir):
-                url = f"{racine_url}{requete['chemin']}"
-                entetes = dict(requete["entetes"])
-                if requete["identifiants"]:
-                    entetes["Authorization"] = "Basic " + base64.b64encode(
-                        requete["identifiants"].encode()).decode()
-                corps = requete["corps"].encode() if requete["corps"] else None
-                if corps and "Content-Type" not in entetes:
-                    entetes["Content-Type"] = "application/json"
-                started = time.time()
-                sonde = {"service": base["service"], "port": base["port"], "url": url,
-                         "auth": bool(requete["identifiants"]), "declared": True}
-                sonde.update(sonder(url, entetes=entetes, corps=corps, methode=requete["methode"],
-                                    timeout=15, contexte=contexte))
-                sonde["duration_seconds"] = time.time() - started
-                code = sonde.get("code")
+        requetes = requetes_declarees(self.eval_dir)
+        vers_proxy = [r for r in requetes if r.get("port") in (None, 80, 443)]
+        for requete in (r for r in requetes if r.get("port") not in (None, 80, 443)):
+            racine_url = racine_du_port(sondes_racine, requete["port"])
+            if not racine_url:
                 self.record_step(
                     f"Requête déclarée ({requete['source']}) : {requete['methode']} {requete['chemin']}",
-                    command=f"{requete['methode']} {url}"
-                            + (" + corps JSON" if corps else "")
-                            + (" + Authorization Basic" if requete["identifiants"] else ""),
-                    output=f"{resume(sonde)}\n{sonde.get('extrait', '')}"[:500],
-                    exit_code=0 if isinstance(code, int) else 1,
-                    duration=sonde["duration_seconds"],
+                    command=f"{requete['methode']} localhost:{requete['port']}{requete['chemin']}",
+                    output=f"non rejouée : le port {requete['port']} n'est publié par aucun conteneur du projet",
+                    exit_code=0,
                 )
-                resultats.append(sonde)
+                continue
+            resultats.append(self._rejouer_requete(requete, racine_url, contexte, {"service": None,
+                                                                                  "port": requete["port"]}))
+        for base in bases:
+            racine_url = base["url"].rstrip("/")
+            for requete in vers_proxy:
+                resultats.append(self._rejouer_requete(requete, racine_url, contexte, base))
         return resultats
+
+    def _rejouer_requete(self, requete: dict, racine_url: str, contexte, base: dict) -> dict:
+        """Une requête déclarée, rejouée et consignée en étape.
+
+        Un 429/503 sur une copie qui déclare `limit_req` est la limitation de
+        débit que l'énoncé demande, déclenchée par nos propres sondes en
+        rafale (469145 : 10 r/s, burst 5 — le 503 par défaut de nginx). La
+        requête est rejouée une fois après une pause, et l'étape le dit."""
+        import base64
+        url = f"{racine_url}{requete['chemin']}"
+        entetes = dict(requete["entetes"])
+        if requete["identifiants"]:
+            entetes["Authorization"] = "Basic " + base64.b64encode(
+                requete["identifiants"].encode()).decode()
+        corps = requete["corps"].encode() if requete["corps"] else None
+        if corps and "Content-Type" not in entetes:
+            entetes["Content-Type"] = "application/json"
+        started = time.time()
+        sonde = {"service": base["service"], "port": base["port"], "url": url,
+                 "auth": bool(requete["identifiants"]), "declared": True}
+        sonde.update(sonder(url, entetes=entetes, corps=corps, methode=requete["methode"],
+                            timeout=15, contexte=contexte))
+        note = ""
+        if sonde.get("code") in (429, 503) and limitation_de_debit_declaree(self.eval_dir):
+            premiere = sonde.get("code")
+            time.sleep(PAUSE_LIMITATION_S)
+            sonde.update(sonder(url, entetes=entetes, corps=corps, methode=requete["methode"],
+                                timeout=15, contexte=contexte))
+            sonde["limitation_de_debit"] = premiere
+            note = (f"limitation de débit de la copie (limit_req) atteinte par les sondes du "
+                    f"harnais : {premiere} d'abord, rejouée après {PAUSE_LIMITATION_S:g} s\n")
+        sonde["duration_seconds"] = time.time() - started
+        code = sonde.get("code")
+        self.record_step(
+            f"Requête déclarée ({requete['source']}) : {requete['methode']} {requete['chemin']}",
+            command=f"{requete['methode']} {url}"
+                    + (" + corps JSON" if corps else "")
+                    + (" + Authorization Basic" if requete["identifiants"] else ""),
+            output=f"{resume(sonde)}\n{note}{sonde.get('extrait', '')}"[:500],
+            exit_code=0 if isinstance(code, int) else 1,
+            duration=sonde["duration_seconds"],
+        )
+        return sonde
 
     def _record_service_states(self) -> dict:
         """Lire et consigner l'état de chaque conteneur du projet."""
