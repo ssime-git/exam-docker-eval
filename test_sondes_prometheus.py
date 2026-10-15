@@ -151,6 +151,14 @@ def test_les_series_de_derive_sont_toutes_celles_dont_le_nom_dit_drift():
     assert series_drift(METRIQUES_APRES)["evidently_drift_share"] == 0.91
 
 
+def test_une_jauge_restee_nan_n_est_pas_modifiee():
+    # e2e 467439 : les jauges Evidently valent NaN avant la première dérive.
+    avant = series_drift("evidently_drift_share NaN\nevidently_x_drift 1.0\n")
+    assert sondes_prometheus.series_changees(avant, dict(avant)) == []
+    apres = series_drift("evidently_drift_share 0.9\nevidently_x_drift 1.0\nnew_drift 0\n")
+    assert sondes_prometheus.series_changees(avant, apres) == ["evidently_drift_share", "new_drift"]
+
+
 # Forme réelle de /api/v1/targets (Prometheus 2.x/3.x).
 CIBLES = {"status": "success", "data": {"activeTargets": [
     {"discoveredLabels": {"__address__": "bike-api:8080"}, "labels": {"instance": "bike-api:8080", "job": "bike-api"},

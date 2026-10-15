@@ -12,6 +12,7 @@ Ce module garde les lectures et les conclusions pures ; les requêtes passent
 par le runner (`ComposeRunner._sonder_comportement_prometheus`).
 """
 
+import math
 import os
 import re
 
@@ -84,6 +85,16 @@ def series_drift(texte: str) -> dict:
         except ValueError:
             continue
     return series
+
+
+def series_changees(avant: dict, apres: dict) -> list:
+    """Les séries de dérive qui ont bougé ou sont apparues.
+
+    Une jauge Evidently jamais posée vaut NaN (467439, e2e du 15/10) : NaN
+    != NaN, une jauge restée NaN passerait pour modifiée."""
+    def meme(a, b):
+        return a == b or (isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b))
+    return sorted(s for s, v in apres.items() if s not in avant or not meme(avant[s], v))
 
 
 def resumer_cibles(donnees: dict) -> dict:

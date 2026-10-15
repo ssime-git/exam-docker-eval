@@ -1651,7 +1651,7 @@ class ComposeRunner(BaseRunner):
                     relu = sonder(f"{api}/metrics", taille_extrait=TAILLE_CORPS_SONDE)
                     if relu.get("code") == 200:
                         apres = sondes_prometheus.series_drift(relu.get("extrait", ""))
-                        changees = sorted(s for s, v in apres.items() if avant.get(s) != v)
+                        changees = sondes_prometheus.series_changees(avant, apres)
                         modifiee = bool(changees)
                         if changees:
                             notes.append("jauge(s) de dérive modifiée(s) : " + ", ".join(
