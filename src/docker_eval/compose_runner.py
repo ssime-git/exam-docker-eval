@@ -14,6 +14,7 @@ from typing import Dict, Any
 from testcontainers.compose import DockerCompose
 
 from .base_runner import BaseRunner
+from . import sondes_nginx
 from .sonde_http import contexte_tls_permissif, resume, sonder
 from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN
 
@@ -67,22 +68,8 @@ def chemins_nginx_declares(eval_dir: str, maxi: int = 8) -> list:
     précisément l'architecture attendue (vu sur 458925). On lit les
     `location` pour sonder ce que la copie promet de servir.
     """
-    import re
-    conf = None
-    for racine, dossiers, fichiers in os.walk(eval_dir):
-        dossiers[:] = [d for d in dossiers if d not in (".git", ".venv", "__pycache__", "node_modules")]
-        for nom in fichiers:
-            if nom.lower() == "nginx.conf":
-                conf = os.path.join(racine, nom)
-                break
-        if conf:
-            break
-    if not conf:
-        return []
-    try:
-        with open(conf, encoding="utf-8", errors="replace") as lecteur:
-            texte = lecteur.read()
-    except OSError:
+    texte = sondes_nginx.lire_nginx_conf(eval_dir)
+    if texte is None:
         return []
     chemins = []
     for correspondance in re.finditer(r"location\s+(?:=\s*)?(/[^\s{]*)", texte):
@@ -195,6 +182,17 @@ def code_attendu_negatif(identifiants: str):
 
 
 PAUSE_LIMITATION_S = 1.5
+
+# Sondes de comportement nginx (469145). `sonder` coupe les corps à 300
+# octets : assez pour un code, trop peu pour comparer deux réponses A/B ou
+# trouver `nginx_up` sous le préambule go_/process_ d'un /metrics.
+TAILLE_CORPS_SONDE = 200_000
+REQUETES_PAR_RAFALE = 20
+COMPORTEMENT_NON_MESURE = {"ab": None, "rafale": None, "mauvais_identifiants": None,
+                           "repartition": None, "redirection_80_443": None}
+MONITORING_NON_MESURE = {"exporter_nginx_up": None, "prometheus_cibles_up": None,
+                         "prometheus_cibles_down": None, "grafana_datasources": None,
+                         "grafana_dashboards": None}
 
 
 def limitation_de_debit_declaree(eval_dir: str) -> bool:
@@ -797,6 +795,19 @@ class ComposeRunner(BaseRunner):
         # publié est l'architecture attendue, pas une API absente.
         sondes.extend(self._sonder_chemins_declares(sondes))
 
+        # Les exigences nginx prouvées en marche (469145, grille du 15/10) :
+        # le barème lit `nginx_comportement`, plus la présence des directives.
+        comportement = None
+        if sondes_nginx.fichier_nginx_conf(self.eval_dir):
+            try:
+                comportement = self._sonder_comportement_nginx(sondes)
+            except Exception as erreur:
+                # Une sonde de comportement ne fait jamais échouer l'évaluation.
+                comportement = dict(COMPORTEMENT_NON_MESURE, monitoring=dict(MONITORING_NON_MESURE),
+                                    tls={"tls_ancien_refuse": None, "certificat_valide": None})
+                self.record_step("Sondes de comportement nginx",
+                                 output=f"non mesurées : erreur interne du harnais ({erreur})", exit_code=0)
+
         boucles = self._boucles_de_redemarrage()
         for nom in boucles:
             etats[nom] = ("restarting", etats.get(nom, ("", 1))[1] or 1)
@@ -835,7 +846,7 @@ class ComposeRunner(BaseRunner):
                     exit_code=0,
                 )
         logs = self._capture_logs()
-        return {
+        resultat = {
             "success": succes,
             "exit_code": 0 if succes else 1,
             "error": None if succes else f"service(s) en échec : {sorted(morts)}",
@@ -844,6 +855,9 @@ class ComposeRunner(BaseRunner):
             "logs": logs,
             "steps": self.steps,
         }
+        if comportement is not None:
+            resultat["nginx_comportement"] = comportement
+        return resultat
 
     def _sonder_chemins_declares(self, sondes_racine: list) -> list:
         """Sonder, à travers le port TLS du reverse proxy, les chemins que la
@@ -991,6 +1005,286 @@ class ComposeRunner(BaseRunner):
             duration=sonde["duration_seconds"],
         )
         return sonde
+
+    def _requete_predict(self) -> dict:
+        """Le POST /predict à rejouer : celui que la copie déclare.
+
+        469145 déclare trois POST /predict : le nominal, la variante A/B
+        (X-Experiment-Group: debug) et un cas négatif (admin:wrongpassword).
+        On prend le premier qui vise le proxy avec des identifiants non
+        négatifs : c'est lui qui rend 200. Sans requête déclarée, un POST
+        sans corps : le code reste lisible (422 n'est pas 401 ni 503)."""
+        for requete in requetes_declarees(self.eval_dir):
+            if (requete["methode"] == "POST" and requete["chemin"].rstrip("/").endswith("/predict")
+                    and requete.get("port") in (None, 80, 443)
+                    and not (requete["identifiants"] and code_attendu_negatif(requete["identifiants"]))):
+                return requete
+        return {"methode": "POST", "chemin": "/predict", "corps": None, "entetes": {}, "identifiants": None}
+
+    def _identifiants_candidats(self, requete: dict) -> list:
+        """Ceux de la requête déclarée, puis ceux que la copie écrit ailleurs,
+        puis ceux de l'énoncé (par env, jamais en dur dans ce dépôt public)."""
+        candidats = []
+        if requete.get("identifiants"):
+            candidats.append(requete["identifiants"])
+        candidats.extend(c for c, _ in identifiants_declares(self.eval_dir))
+        if os.environ.get("EXAM_DOCKER_EVAL_BASIC_AUTH"):
+            candidats.append(os.environ["EXAM_DOCKER_EVAL_BASIC_AUTH"])
+        uniques = []
+        for couple in candidats:
+            if couple not in uniques and not code_attendu_negatif(couple):
+                uniques.append(couple)
+        return uniques
+
+    def _poster_predict(self, url: str, requete: dict, identifiants, contexte, *,
+                        entete_ab: str | None = None, valeur_ab: str | None = None,
+                        reessayer: bool = True) -> dict:
+        """Un POST /predict, corps et en-têtes de la copie, en-tête A/B fixé.
+
+        `limit_req` agit avant `auth_basic` (phase preaccess de nginx) : nos
+        propres sondes peuvent vider le seau, même avec de mauvais
+        identifiants. Un 429/503 est rejoué une fois après la pause."""
+        import base64
+        entetes = {k: v for k, v in (requete.get("entetes") or {}).items()
+                   if not entete_ab or k.lower() != entete_ab.lower()}
+        if entete_ab and valeur_ab is not None:
+            entetes[entete_ab] = valeur_ab
+        if identifiants:
+            entetes["Authorization"] = "Basic " + base64.b64encode(identifiants.encode()).decode()
+        corps = requete["corps"].encode() if requete.get("corps") else None
+        if corps and not any(k.lower() == "content-type" for k in entetes):
+            entetes["Content-Type"] = "application/json"
+        sonde = sonder(url, entetes=entetes, corps=corps, methode="POST", timeout=15, contexte=contexte,
+                       taille_extrait=TAILLE_CORPS_SONDE)
+        if reessayer and sonde.get("code") in (429, 503):
+            time.sleep(PAUSE_LIMITATION_S)
+            sonde = sonder(url, entetes=entetes, corps=corps, methode="POST", timeout=15, contexte=contexte,
+                           taille_extrait=TAILLE_CORPS_SONDE)
+        return sonde
+
+    def _sonder_comportement_nginx(self, sondes_racine: list) -> dict:
+        """Les exigences nginx de la grille, prouvées en marche (469145).
+
+        Chaque sonde est au mieux : celle qui ne peut pas tourner vaut None,
+        jamais une exception, jamais un échec de l'évaluation. La rafale
+        passe en dernier parmi les POST : elle vide le seau de `limit_req`
+        et fausserait les autres."""
+        from collections import Counter
+        from concurrent.futures import ThreadPoolExecutor
+        from urllib.parse import urlsplit
+
+        debut = time.time()
+        texte = sondes_nginx.lire_nginx_conf(self.eval_dir) or ""
+        contexte = contexte_tls_permissif()
+        comportement = dict(COMPORTEMENT_NON_MESURE)
+        base = next((
+            s for s in sondes_racine
+            if "nginx" in str(s.get("service", "")).lower()
+            and "exporter" not in str(s.get("service", "")).lower()
+            and s.get("url", "").startswith("https")
+            and isinstance(s.get("code"), int)
+        ), None)
+        requete = self._requete_predict()
+        chemin = requete["chemin"]
+        try:
+            ab_declare = sondes_nginx.routage_ab_declare(texte)
+        except Exception:
+            ab_declare = None
+
+        if base is not None:
+            url = base["url"].rstrip("/") + chemin
+            entete_ab = ab_declare["entete"] if ab_declare else None
+            # Les sondes déclarées viennent de passer sur le même seau.
+            time.sleep(PAUSE_LIMITATION_S)
+            identifiants = None
+            defaut = None
+            try:
+                # Le POST nominal sert aussi à trouver les identifiants qui
+                # passent : le premier couple qui ne rend pas 401.
+                for couple in self._identifiants_candidats(requete) or [None]:
+                    defaut = self._poster_predict(url, requete, couple, contexte, entete_ab=entete_ab)
+                    identifiants = couple
+                    if defaut.get("code") != 401:
+                        break
+            except Exception:
+                defaut = None
+
+            if ab_declare and defaut is not None:
+                try:
+                    variante = self._poster_predict(url, requete, identifiants, contexte,
+                                                    entete_ab=entete_ab, valeur_ab=ab_declare["valeur"])
+                    deux_codes = isinstance(defaut.get("code"), int) and isinstance(variante.get("code"), int)
+                    comportement["ab"] = {
+                        "entete": entete_ab,
+                        "valeur": ab_declare["valeur"],
+                        "code_defaut": defaut.get("code"),
+                        "code_variante": variante.get("code"),
+                        "corps_differents": (defaut.get("extrait") != variante.get("extrait")) if deux_codes else None,
+                    }
+                except Exception:
+                    comportement["ab"] = None
+
+            try:
+                utilisateur = (identifiants or "admin").split(":", 1)[0]
+                mauvais = self._poster_predict(url, requete, f"{utilisateur}:mauvais-mot-de-passe-scriptorium",
+                                               contexte, entete_ab=entete_ab)
+                code = mauvais.get("code")
+                comportement["mauvais_identifiants"] = code if isinstance(code, int) else \
+                    f"erreur : {mauvais.get('erreur') or code}"
+            except Exception:
+                comportement["mauvais_identifiants"] = None
+
+            try:
+                # Seau plein avant la rafale : la mesure ne dépend pas des
+                # sondes qui précèdent.
+                time.sleep(PAUSE_LIMITATION_S)
+                with ThreadPoolExecutor(max_workers=REQUETES_PAR_RAFALE) as pool:
+                    reponses = list(pool.map(
+                        lambda _: self._poster_predict(url, requete, identifiants, contexte,
+                                                       entete_ab=entete_ab, reessayer=False),
+                        range(REQUETES_PAR_RAFALE)))
+                codes = Counter(str(r.get("code")) for r in reponses)
+                time.sleep(PAUSE_LIMITATION_S)
+                apres = self._poster_predict(url, requete, identifiants, contexte,
+                                             entete_ab=entete_ab, reessayer=False).get("code")
+                comportement["rafale"] = {
+                    "envoyees": REQUETES_PAR_RAFALE,
+                    "codes": dict(codes),
+                    "limite_declenchee": bool(codes.get("429") or codes.get("503")),
+                    "retour_2xx_apres_pause": isinstance(apres, int) and 200 <= apres < 300,
+                }
+            except Exception:
+                comportement["rafale"] = None
+
+        # Répartition : après la rafale, chaque réplique v1 a-t-elle servi ?
+        # Les services v1 sont les serveurs de l'upstream par défaut du map ;
+        # à défaut, les noms de service en api-v1 / api_v1 / apis-v1.
+        try:
+            services_v1 = sondes_nginx.serveurs_upstream(texte, (ab_declare or {}).get("upstream_defaut"))
+            conteneurs = list(self._conteneurs_du_projet())
+
+            def service(c):
+                return (getattr(c, "labels", None) or {}).get("com.docker.compose.service", c.name)
+            repliques = [c for c in conteneurs if sondes_nginx.est_replique_v1(service(c), services_v1)]
+            if not repliques and services_v1:
+                repliques = [c for c in conteneurs if sondes_nginx.est_replique_v1(service(c), [])]
+            if repliques:
+                compte = {c.name: sondes_nginx.compter_requetes(c.logs(), chemin) for c in repliques}
+                comportement["repartition"] = {"conteneurs": compte,
+                                               "recoivent": sum(1 for n in compte.values() if n > 0)}
+        except Exception:
+            comportement["repartition"] = None
+
+        comportement["monitoring"] = self._sonder_monitoring(sondes_racine)
+
+        try:
+            comportement["redirection_80_443"] = sondes_nginx.redirection_vers_https(sondes_racine)
+        except Exception:
+            comportement["redirection_80_443"] = None
+
+        tls = {"tls_ancien_refuse": None, "certificat_valide": None}
+        if base is not None:
+            cible = urlsplit(base["url"])
+            for champ, sonde_tls in (("tls_ancien_refuse", sondes_nginx.tls_ancien_refuse),
+                                     ("certificat_valide", sondes_nginx.certificat_valide)):
+                try:
+                    tls[champ] = sonde_tls(cible.hostname, cible.port or 443)
+                except Exception:
+                    tls[champ] = None
+        comportement["tls"] = tls
+
+        self.record_step(
+            "Sondes de comportement nginx",
+            command=(f"POST {base['url'].rstrip('/')}{chemin} (A/B, mauvais identifiants, rafale de "
+                     f"{REQUETES_PAR_RAFALE}), logs des répliques v1, exporter/Prometheus/Grafana, "
+                     "redirection du port 80, poignée de main TLS 1.1 et certificat")
+                    if base is not None else
+                    "pas de port TLS nginx joignable : sondes /predict et TLS non lancées",
+            output=sondes_nginx.resume_comportement(comportement),
+            exit_code=0,
+            duration=time.time() - debut,
+        )
+        return comportement
+
+    def _racine_monitoring(self, sondes_racine: list, mots: tuple, port: int, exclure: str | None = None):
+        """L'URL hôte d'un service de monitoring : par son nom de conteneur,
+        sinon par son port de conteneur habituel."""
+        for sonde in sondes_racine:
+            nom = str(sonde.get("service", "")).lower()
+            if all(m in nom for m in mots) and not (exclure and exclure in nom) and isinstance(sonde.get("code"), int) \
+                    and not str(sonde.get("note", "")).startswith("échec attendu"):
+                return sonde["url"].rstrip("/")
+        return racine_du_port(sondes_racine, port)
+
+    def _identifiants_grafana(self) -> str:
+        """GF_SECURITY_ADMIN_USER/PASSWORD du compose, sinon admin:admin
+        (le défaut de l'image)."""
+        utilisateur, mot_de_passe = "admin", "admin"
+        try:
+            import yaml
+            with open(fichier_compose(self.eval_dir), encoding="utf-8") as lecteur:
+                services = (yaml.safe_load(lecteur) or {}).get("services") or {}
+            for nom, service in services.items():
+                if "grafana" not in f"{nom} {service.get('image', '')}".lower():
+                    continue
+                env = service.get("environment") or {}
+                if isinstance(env, list):
+                    env = dict(e.split("=", 1) for e in env if isinstance(e, str) and "=" in e)
+                u = str(env.get("GF_SECURITY_ADMIN_USER") or "")
+                p = str(env.get("GF_SECURITY_ADMIN_PASSWORD") or "")
+                # ${VAR} viendrait d'un .env que l'on ne résout pas ici.
+                if u and "${" not in u:
+                    utilisateur = u
+                if p and "${" not in p:
+                    mot_de_passe = p
+                break
+        except Exception:
+            pass
+        return f"{utilisateur}:{mot_de_passe}"
+
+    def _sonder_monitoring(self, sondes_racine: list) -> dict:
+        """exporter `nginx_up 1`, cibles Prometheus, provisionnement Grafana,
+        par les ports publiés. Injoignable : None pour le champ."""
+        import base64
+        import json
+        monitoring = dict(MONITORING_NON_MESURE)
+
+        try:
+            racine = self._racine_monitoring(sondes_racine, ("nginx", "exporter"), 9113)
+            if racine:
+                sonde = sonder(f"{racine}/metrics", taille_extrait=TAILLE_CORPS_SONDE)
+                if sonde.get("code") == 200:
+                    valeur = re.search(r"^nginx_up\s+(\S+)", sonde.get("extrait", ""), re.MULTILINE)
+                    monitoring["exporter_nginx_up"] = bool(valeur) and float(valeur.group(1)) == 1
+        except Exception:
+            monitoring["exporter_nginx_up"] = None
+
+        try:
+            racine = self._racine_monitoring(sondes_racine, ("prometheus",), 9090, exclure="exporter")
+            if racine:
+                sonde = sonder(f"{racine}/api/v1/targets", taille_extrait=TAILLE_CORPS_SONDE)
+                if sonde.get("code") == 200:
+                    cibles = json.loads(sonde.get("extrait", ""))["data"]["activeTargets"]
+                    monitoring["prometheus_cibles_up"] = sum(1 for c in cibles if c.get("health") == "up")
+                    monitoring["prometheus_cibles_down"] = sum(1 for c in cibles if c.get("health") == "down")
+        except Exception:
+            monitoring["prometheus_cibles_up"] = monitoring["prometheus_cibles_down"] = None
+
+        racine = self._racine_monitoring(sondes_racine, ("grafana",), 3000)
+        if racine:
+            jeton = base64.b64encode(self._identifiants_grafana().encode()).decode()
+            for champ, chemin in (("grafana_datasources", "/api/datasources"),
+                                  ("grafana_dashboards", "/api/search?type=dash-db")):
+                try:
+                    sonde = sonder(f"{racine}{chemin}", entetes={"Authorization": f"Basic {jeton}"},
+                                   taille_extrait=TAILLE_CORPS_SONDE)
+                    if sonde.get("code") == 200:
+                        liste = json.loads(sonde.get("extrait", ""))
+                        if isinstance(liste, list):
+                            monitoring[champ] = len(liste)
+                except Exception:
+                    monitoring[champ] = None
+        return monitoring
 
     def _record_service_states(self) -> dict:
         """Lire et consigner l'état de chaque conteneur du projet."""
