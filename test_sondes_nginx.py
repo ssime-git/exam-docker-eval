@@ -631,3 +631,32 @@ def test_sans_nginx_debout_make_test_non_mesure(tmp_path, monkeypatch):
     runner = runner_make_test(tmp_path, monkeypatch, FauxDemon())
     monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [])
     assert runner._executer_make_test()["code"] is None
+
+
+def test_l_echec_de_notre_image_n_est_pas_un_make_test_qui_echoue(tmp_path, monkeypatch):
+    # Pull, apk ou build en échec : absence de mesure (code null, revue côté
+    # barème), jamais un code entier imputé à la copie.
+    demon = FauxDemon()
+
+    class ImagesCassees:
+        def get(self, tag):
+            raise RuntimeError("image absente")
+
+        def build(self, **kwargs):
+            raise RuntimeError("pull access denied for alpine")
+    demon.images = ImagesCassees()
+    runner = runner_make_test(tmp_path, monkeypatch, demon)
+    resultat = runner._executer_make_test()
+    assert resultat["code"] is None and "image du conteneur jetable indisponible" in resultat["sortie"]
+    assert demon.cree is None  # aucun conteneur lancé
+
+
+def test_sans_cible_test_rien_n_est_lance(tmp_path, monkeypatch):
+    # Faute de l'apprenant (l'énoncé exige `make test`) : le barème met 0 en
+    # lisant le Makefile ; le moteur ne lance rien et le dit.
+    demon = FauxDemon()
+    runner = runner_make_test(tmp_path, monkeypatch, demon)
+    ecrire(tmp_path / "Makefile", "start-project:\n\tdocker compose up -d\n")
+    resultat = runner._executer_make_test()
+    assert resultat == {"code": None, "sortie": "pas de cible `test` dans le Makefile"}
+    assert demon.cree is None
