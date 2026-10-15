@@ -7,6 +7,13 @@ Prometheus UP. Une directive présente dans le nginx.conf ne prouve rien de
 tout ça : on lit la configuration seulement pour savoir quoi envoyer (en-tête
 du map, upstream par défaut), puis on regarde ce que la stack répond.
 
+L'énoncé fait foi (Learn_Content, nginx_fr/06_nginx_fr.md) : l'en-tête A/B
+`X-Experiment-Group: debug` est imposé et toujours envoyé, celui du map de la
+copie n'est qu'une information ; `make test`, la validation finale, se joue
+dans un conteneur jetable (`commande_make_test`, `redirections_make_test`) ;
+un POST /predict se construit depuis le modèle Pydantic de l'API quand la
+copie n'en déclare aucun qui passe (`corps_depuis_pydantic`).
+
 Ce module garde les lectures et les conclusions pures ; les requêtes passent
 par le runner (`ComposeRunner._sonder_comportement_nginx`). Les deux sondes
 TLS ouvrent elles-mêmes leur socket : `sonder` ne sait pas fixer la version
@@ -215,6 +222,185 @@ def certificat_valide(hote: str, port: int, timeout: float = 10) -> bool | None:
     return certificat_pem_valide(pem)
 
 
+# L'en-tête A/B que l'énoncé impose (06_nginx_fr.md, objectif 6) : « Nginx
+# devra router le trafic vers `api-v2` uniquement si la requête contient
+# l'en-tête HTTP `X-Experiment-Group: debug` ». Le map de la copie n'est
+# qu'une information de plus.
+ENTETE_AB_IMPOSE = ("X-Experiment-Group", "debug")
+
+# Identifiants du cours (04_nginx_fr.md : `htpasswd -c … admin`, admin/admin) :
+# publics, pas un secret de l'examen. L'énoncé n'en fixe aucun.
+IDENTIFIANTS_DU_COURS = "admin:admin"
+
+PHRASE_EXEMPLE = "Oh yeah, that was soooo cool!"
+_EXEMPLES_PAR_TYPE = {"str": PHRASE_EXEMPLE, "int": 1, "float": 1.0, "bool": True}
+
+
+def _modeles_pydantic(texte: str) -> dict:
+    """{classe: {champ: type}} des `class X(BaseModel):` d'un module."""
+    modeles = {}
+    for bloc in re.finditer(r"^class\s+(\w+)\s*\(\s*(?:pydantic\.)?BaseModel\s*\)\s*:\s*\n((?:[ \t]+.*\n?|\s*\n)*)",
+                            texte, re.MULTILINE):
+        champs = {}
+        for nom, genre in re.findall(r"^[ \t]+(\w+)\s*:\s*([\w\[\], .|]+?)\s*(?:=.*)?$", bloc.group(2), re.MULTILINE):
+            champs[nom] = genre.strip()
+        modeles[bloc.group(1)] = champs
+    return modeles
+
+
+def _exemple_pour(genre: str):
+    base = re.sub(r"^(Optional|typing\.Optional)\[(.*)\]$", r"\2", genre).split("|")[0].strip()
+    liste = re.match(r"^(list|List)\[(\w+)\]$", base)
+    if liste:
+        return [_EXEMPLES_PAR_TYPE.get(liste.group(2), PHRASE_EXEMPLE)]
+    return _EXEMPLES_PAR_TYPE.get(base, PHRASE_EXEMPLE)
+
+
+def corps_depuis_pydantic(eval_dir: str) -> dict | None:
+    """Le corps JSON que l'API v1 attend sur POST /predict, lu dans son modèle
+    Pydantic (le schéma de l'énoncé : « une API FastAPI […] qui prend une
+    phrase en entrée »). Le modèle du paramètre de la route d'abord, sinon le
+    premier BaseModel du module. None sans main.py lisible."""
+    candidats = []
+    for racine, dossiers, fichiers in os.walk(eval_dir):
+        dossiers[:] = [d for d in dossiers if d not in _DOSSIERS_IGNORES]
+        for nom in fichiers:
+            if nom.endswith(".py"):
+                chemin = os.path.join(racine, nom)
+                # api/v1 d'abord : l'A/B ne doit pas dépendre du schéma de v2.
+                candidats.append((0 if re.search(r"v1", os.path.relpath(chemin, eval_dir)) else 1, chemin))
+    for _, chemin in sorted(candidats):
+        try:
+            with open(chemin, encoding="utf-8", errors="replace") as lecteur:
+                texte = lecteur.read()
+        except OSError:
+            continue
+        route = re.search(r"@\w+\.post\(\s*[\"']/predict/?[\"'][^)]*\)\s*\n\s*(?:async\s+)?def\s+\w+\s*\(([^)]*)\)", texte)
+        if not route:
+            continue
+        modeles = _modeles_pydantic(texte)
+        modele = next((m for m in re.findall(r"\w+\s*:\s*(\w+)", route.group(1)) if m in modeles), None)
+        champs = modeles.get(modele) if modele else next(iter(modeles.values()), None)
+        if champs:
+            return {nom: _exemple_pour(genre) for nom, genre in champs.items()}
+    return None
+
+
+def redirections_make_test(texte_compose: str) -> list:
+    """(port hôte, service, port conteneur) de chaque port que la copie publie.
+
+    run_tests.sh vise `https://localhost/predict`, donc le 443 que la copie
+    publie sur SA machine. Le moteur relâche ces ports (Docker en choisit
+    d'autres) : le conteneur jetable de `make test` relaie localhost:<hôte>
+    vers <service>:<conteneur>, et le script tourne tel qu'il est écrit. Un
+    port sans hôte fixe (« 5000 ») n'était joignable qu'au hasard : ignoré."""
+    try:
+        import yaml
+        services = (yaml.safe_load(texte_compose) or {}).get("services") or {}
+    except Exception:
+        return []
+    redirections = []
+    for nom, service in services.items():
+        if not isinstance(service, dict):
+            continue
+        for entree in service.get("ports") or []:
+            hote = conteneur = None
+            if isinstance(entree, dict):
+                hote, conteneur = entree.get("published"), entree.get("target")
+            elif isinstance(entree, str):
+                parties = entree.split("/")[0].split(":")
+                if len(parties) >= 2:
+                    hote, conteneur = parties[-2], parties[-1]
+            try:
+                hote, conteneur = int(hote), int(conteneur)
+            except (TypeError, ValueError):
+                continue  # plage, variable ou port seul
+            if all(h != hote for h, _, _ in redirections):
+                redirections.append((hote, nom, conteneur))
+    return redirections
+
+
+def _recettes_makefile(texte: str) -> dict:
+    """{cible: (prérequis, lignes de recette)} d'un Makefile, sans exécuter."""
+    cibles = {}
+    lignes = texte.replace("\\\n", " ").splitlines()
+    for i, ligne in enumerate(lignes):
+        m = re.match(r"^([A-Za-z0-9_.%/ -]+?)\s*::?(?!=)(.*)$", ligne)
+        if not m or ligne.startswith(("\t", " ", "#")):
+            continue
+        prerequis = m.group(2).split("#")[0].split(";")[0].split()
+        recette = []
+        for suite in lignes[i + 1:]:
+            if not (suite.startswith("\t") or not suite.strip()):
+                break
+            recette.append(suite.strip())
+        for cible in m.group(1).split():
+            cibles[cible] = (prerequis, recette)
+    return cibles
+
+
+_APPEL_DOCKER = re.compile(r"\bdocker\b|\bdocker-compose\b|\$[({]COMPOSE[)}]|\bpodman\b", re.IGNORECASE)
+
+
+def commande_make_test(eval_dir: str) -> tuple:
+    """(commande, note) pour jouer la validation finale dans un conteneur
+    jetable, ou (None, raison) quand c'est impossible.
+
+    Le conteneur n'a pas le démon Docker (jamais de socket monté) : une cible
+    `test` qui lance la stack (`test: start-project`, `docker compose …`) ne
+    peut pas y tourner, on joue alors tests/run_tests.sh — la stack, le
+    moteur l'a déjà démarrée. Un script qui appelle docker lui-même : non
+    mesuré, ne pas deviner."""
+    makefile = next((os.path.join(eval_dir, n) for n in ("Makefile", "makefile", "GNUmakefile")
+                     if os.path.isfile(os.path.join(eval_dir, n))), None)
+    if not makefile:
+        return None, "pas de Makefile"
+    try:
+        with open(makefile, encoding="utf-8", errors="replace") as lecteur:
+            recettes = _recettes_makefile(lecteur.read())
+    except OSError:
+        return None, "Makefile illisible"
+    if "test" not in recettes:
+        return None, "pas de cible `test` dans le Makefile"
+    vues, a_voir, appels_docker = set(), ["test"], []
+    while a_voir:
+        cible = a_voir.pop()
+        if cible in vues or cible not in recettes:
+            continue
+        vues.add(cible)
+        prerequis, recette = recettes[cible]
+        a_voir.extend(prerequis)
+        if any(_APPEL_DOCKER.search(l) and not l.lstrip("@-+ ").startswith("#") for l in recette):
+            appels_docker.append(cible)
+    script = os.path.join(eval_dir, "tests", "run_tests.sh")
+    if os.path.isfile(script):
+        try:
+            with open(script, encoding="utf-8", errors="replace") as lecteur:
+                code = [l for l in lecteur.read().splitlines() if not l.lstrip().startswith("#")]
+        except OSError:
+            code = []
+        if any(_APPEL_DOCKER.search(l) for l in code):
+            return None, "tests/run_tests.sh appelle docker : non jouable sans le démon, à trancher en revue"
+    if not appels_docker:
+        return "make test", ""
+    if os.path.isfile(script):
+        return "bash tests/run_tests.sh", (
+            f"la cible test appelle docker (via {', '.join(sorted(appels_docker))}) : stack déjà démarrée "
+            "par le moteur, tests/run_tests.sh joué directement")
+    return None, "la cible test appelle docker et il n'y a pas de tests/run_tests.sh"
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def nettoyer_sortie(texte, maxi: int = 1500) -> str:
+    """La fin de la sortie d'un script, sans ses couleurs ANSI."""
+    if isinstance(texte, bytes):
+        texte = texte.decode("utf-8", "replace")
+    propre = _ANSI.sub("", str(texte)).replace("\r", "").strip()
+    return propre if len(propre) <= maxi else propre[-maxi:]
+
+
 def _oui_non(valeur, oui="oui", non="non", inconnu="non mesuré") -> str:
     return inconnu if valeur is None else (oui if valeur else non)
 
@@ -224,11 +410,19 @@ def resume_comportement(c: dict) -> str:
     lignes = []
     ab = c.get("ab")
     if ab is None:
-        lignes.append("routage A/B : non mesuré (pas de `map $http_…` dans nginx.conf, ou pas de base TLS)")
+        lignes.append("routage A/B : non mesuré (pas de base TLS)")
     else:
         lignes.append(
-            f"routage A/B : POST sans en-tête → {ab['code_defaut']}, avec {ab['entete']}: {ab['valeur']} → "
-            f"{ab['code_variante']} ; corps différents : {_oui_non(ab['corps_differents'])}")
+            f"routage A/B (en-tête de l'énoncé) : POST sans en-tête → {ab['code_defaut']}, avec {ab['entete']}: "
+            f"{ab['valeur']} → {ab['code_variante']} ; corps différents : {_oui_non(ab['corps_differents'])}")
+        copie = ab.get("entete_copie")
+        if copie:
+            lignes.append(
+                f"routage A/B (en-tête du map de la copie) : avec {copie['entete']}: {copie['valeur']} → "
+                f"{copie['code_variante']} ; corps différents : {_oui_non(copie['corps_differents'])}")
+    acceptes = c.get("identifiants_acceptes")
+    if acceptes is False:
+        lignes.append("identifiants : aucun identifiant accepté (admin:admin du cours, puis ceux de la copie)")
     rafale = c.get("rafale")
     if rafale is None:
         lignes.append("rafale : non mesurée")
@@ -262,4 +456,12 @@ def resume_comportement(c: dict) -> str:
     tls = c.get("tls") or {}
     lignes.append(f"TLS 1.1 refusé : {_oui_non(tls.get('tls_ancien_refuse'))} ; "
                   f"certificat dans sa période de validité : {_oui_non(tls.get('certificat_valide'))}")
+    make_test = c.get("make_test")
+    if not make_test:
+        lignes.append("make test : non mesuré")
+    elif make_test.get("code") is None:
+        lignes.append(f"make test : non mesuré ({make_test.get('sortie', '')[:200]})")
+    else:
+        derniere = (make_test.get("sortie") or "").strip().splitlines()[-1:] or [""]
+        lignes.append(f"make test : code {make_test['code']}" + (f" — {derniere[0][:200]}" if derniere[0] else ""))
     return "\n".join(lignes)
