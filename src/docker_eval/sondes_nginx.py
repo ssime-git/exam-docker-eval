@@ -402,7 +402,14 @@ def resume_comportement(c: dict) -> str:
                 f"{copie['code_variante']} ; corps différents : {_oui_non(copie['corps_differents'])}")
     acceptes = c.get("identifiants_acceptes")
     if acceptes is False:
-        lignes.append("identifiants : aucun identifiant accepté (admin:admin du cours, puis ceux de la copie)")
+        lignes.append("identifiants : aucun identifiant accepté (ceux de la copie, puis admin:admin du cours)")
+    elif acceptes:
+        source = c.get("identifiants_source")
+        lignes.append("identifiants : " + {
+            "copie": "ceux que la copie écrit (tests, README, Makefile) sont acceptés",
+            "énoncé": "seuls les identifiants de l'énoncé passent ; la copie ne les écrit nulle part",
+            "cours": "seuls les identifiants du cours (admin:admin) passent ; la copie ne les écrit nulle part",
+        }.get(source, "acceptés (source non relevée)"))
     rafale = c.get("rafale")
     if rafale is None:
         lignes.append("rafale : non mesurée")

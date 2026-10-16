@@ -18,6 +18,7 @@ from . import sondes_nginx, sondes_prometheus
 from .sonde_http import contexte_tls_permissif, resume, sonder
 from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN, REESSAI_SANTE_MAX
 from . import diagnostic_demarrage
+from . import lancement
 
 
 # Les quatre noms que docker compose accepte lui-meme, dans son ordre de
@@ -184,6 +185,36 @@ def identifiants_declares(eval_dir: str, maxi: int = 3) -> list:
     return candidats[:maxi]
 
 
+def identifiants_mentionnes(eval_dir: str, couple: str) -> str | None:
+    """Le fichier de la copie qui écrit ce couple, hors `--user`/`-u` : le
+    couple littéral `user:pass`, ou l'utilisateur et le mot de passe sur une
+    même ligne qui parle d'identifiants (« `admin` / mot de passe `admin` »).
+    Un `.htpasswd` ne compte pas : il porte un hash, pas le mot de passe."""
+    utilisateur, _, mot_de_passe = couple.partition(":")
+    if not utilisateur or not mot_de_passe:
+        return None
+    mot = re.compile(rf"(?<![\w$]){re.escape(mot_de_passe)}(?![\w])")
+    contexte = re.compile(r"pass|mot de passe|mdp|identifiant|credential|login|user|utilisateur|auth", re.IGNORECASE)
+    for racine, dossiers, fichiers in os.walk(eval_dir):
+        dossiers[:] = sorted(d for d in dossiers if d not in (".git", ".venv", "__pycache__", "node_modules"))
+        for nom in sorted(fichiers):
+            if not (nom.lower().endswith((".sh", ".md", ".yml", ".yaml", ".txt", ".py", ".json", ".http"))
+                    or nom in ("Makefile", "makefile")):
+                continue
+            try:
+                with open(os.path.join(racine, nom), encoding="utf-8", errors="replace") as lecteur:
+                    texte = lecteur.read()
+            except OSError:
+                continue
+            source = os.path.relpath(os.path.join(racine, nom), eval_dir)
+            if couple in texte:
+                return source
+            for ligne in texte.splitlines():
+                if utilisateur in ligne and mot.search(ligne.replace(utilisateur, "", 1)) and contexte.search(ligne):
+                    return source
+    return None
+
+
 def requetes_declarees(eval_dir: str, maxi: int = 6) -> list:
     """Les requêtes que la copie déclare dans ses propres tests (curl).
 
@@ -266,15 +297,22 @@ PAUSE_LIMITATION_S = 1.5
 TAILLE_CORPS_SONDE = 200_000
 REQUETES_PAR_RAFALE = 20
 COMPORTEMENT_NON_MESURE = {"ab": None, "rafale": None, "mauvais_identifiants": None,
-                           "sans_identifiants": None, "identifiants_acceptes": None, "repartition": None,
+                           "sans_identifiants": None, "identifiants_acceptes": None, "identifiants_source": None,
+                           "repartition": None,
                            "redirection_80_443": None, "make_test": None}
 
 # `make test`, la validation finale de l'énoncé, se joue dans un conteneur
 # jetable : jamais sur l'hôte (shell arbitraire de l'apprenant), jamais avec
 # le socket Docker. Image construite une fois, réutilisée ; surchargeable.
-IMAGE_MAKE_TEST = os.environ.get("EXAM_DOCKER_EVAL_IMAGE_MAKE_TEST", "scriptorium-make-test:1")
+# Le même conteneur joue la commande de lancement de l'énoncé (lancement.py) :
+# ses prérequis génèrent certificats, .htpasswd et .env avec openssl,
+# htpasswd (apache2-utils), envsubst (gettext) ou python3. Un outil absent
+# rend le lancement « non mesuré » (code 127), jamais un zéro ; la version
+# du tag change avec la liste pour ne pas réutiliser une image en cache.
+IMAGE_MAKE_TEST = os.environ.get("EXAM_DOCKER_EVAL_IMAGE_MAKE_TEST", "scriptorium-make-test:2")
 DOCKERFILE_MAKE_TEST = ("FROM alpine:3.20\n"
-                        "RUN apk add --no-cache bash curl make socat coreutils grep sed gawk openssl jq\n")
+                        "RUN apk add --no-cache bash curl make socat coreutils grep sed gawk openssl jq "
+                        "apache2-utils gettext python3\n")
 DELAI_MAKE_TEST_S = 120
 # Au-delà du délai du script : installation des relais, copie de l'archive.
 MARGE_MAKE_TEST_S = 60
@@ -469,11 +507,15 @@ class _DemarrageSansDemontage:
     encore debout : il relève les services non sains et rend True pour
     relancer le `up` une fois (healthcheck seulement trop lent, 467094)."""
 
-    def __init__(self, compose, sur_echec=None):
+    def __init__(self, compose, sur_echec=None, deja_demarre=False):
         self.compose = compose
         self.sur_echec = sur_echec
+        # Stack déjà levée avec les arguments de la recette de la copie.
+        self.deja_demarre = deja_demarre
 
     def __enter__(self):
+        if self.deja_demarre:
+            return self.compose
         try:
             self.compose.start()
         except Exception as exc:
@@ -524,6 +566,15 @@ class ComposeRunner(BaseRunner):
         # que nous n'avons pas pu mesurer.
         self._cause_demarrage = None
         self._debut_evaluation = time.time()
+        # Passage « lancement tel que livré » (16/10) : la commande de l'énoncé
+        # jouée dans le conteneur jetable, et les réparations du moteur quand
+        # elle échoue. Fichiers produits par la recette et rapatriés : retirés
+        # (ou rendus à leur contenu d'origine) au nettoyage.
+        self._lancement = None
+        self._reparations = []
+        self._env_fabrique = None
+        self._fichiers_rapatries = []
+        self._originaux = {}
 
     @staticmethod
     def _nom_fixe_en_alias(service: dict) -> bool:
@@ -549,7 +600,7 @@ class ComposeRunner(BaseRunner):
         del service["container_name"]
         return True
 
-    def _relax_host_ports(self, compose_file: str) -> str:
+    def _relax_host_ports(self, compose_file: str, nom_sortie: str = "docker-compose.eval.yml") -> str:
         """Ecrit une copie du compose sans port hote fige, et rend son nom.
 
         Une declaration `"3000:3000"` reserve le port 3000 de la machine. Deux
@@ -566,7 +617,7 @@ class ComposeRunner(BaseRunner):
             self.logger.warning("pyyaml absent : ports hote laisses tels quels")
             self._port_relaxation_outcome = "Échec explicite : pyyaml est indisponible."
             self._port_relaxation_exit_code = 2
-            return os.path.basename(compose_file)
+            return os.path.relpath(compose_file, self.eval_dir)
 
         try:
             with open(compose_file, encoding="utf-8") as handle:
@@ -575,12 +626,12 @@ class ComposeRunner(BaseRunner):
             self.logger.warning(f"docker-compose.yml illisible ({exc}) : ports laisses tels quels")
             self._port_relaxation_outcome = f"Échec explicite : compose illisible ({exc})."
             self._port_relaxation_exit_code = 2
-            return os.path.basename(compose_file)
+            return os.path.relpath(compose_file, self.eval_dir)
 
         if not isinstance(doc, dict) or not isinstance(doc.get("services"), dict):
             self._port_relaxation_outcome = "Absence explicite : aucun service Compose exploitable."
             self._port_relaxation_exit_code = 0
-            return os.path.basename(compose_file)
+            return os.path.relpath(compose_file, self.eval_dir)
 
         changed = False
         alias = []
@@ -600,9 +651,9 @@ class ComposeRunner(BaseRunner):
         if not changed:
             self._port_relaxation_outcome = "Absence explicite : aucun port hôte fixe à relâcher."
             self._port_relaxation_exit_code = 0
-            return os.path.basename(compose_file)
+            return os.path.relpath(compose_file, self.eval_dir)
 
-        relaxed_name = "docker-compose.eval.yml"
+        relaxed_name = nom_sortie
         relaxed_path = os.path.join(self.eval_dir, relaxed_name)
         try:
             with open(relaxed_path, "w", encoding="utf-8") as handle:
@@ -611,7 +662,7 @@ class ComposeRunner(BaseRunner):
             self.logger.warning(f"Copie du compose impossible ({exc}) : ports laisses tels quels")
             self._port_relaxation_outcome = f"Échec explicite : copie impossible ({exc})."
             self._port_relaxation_exit_code = 2
-            return os.path.basename(compose_file)
+            return os.path.relpath(compose_file, self.eval_dir)
 
         self.logger.info("Ports hote relaches : Docker en attribuera de libres")
         self._port_relaxation_outcome = f"Ports hôte relâchés dans {relaxed_name}." + (
@@ -619,7 +670,7 @@ class ComposeRunner(BaseRunner):
         self._port_relaxation_exit_code = 0
         return relaxed_name
 
-    def _preparer_env(self, compose_file: str) -> None:
+    def _preparer_env(self, compose_file: str, fichiers: list | None = None) -> None:
         """Fournir le `.env` qu'une copie ne livre pas, sans lancer son Makefile.
 
         469217 gardait `.env` hors de l'archive (`.gitignore`, bonne pratique)
@@ -644,18 +695,49 @@ class ComposeRunner(BaseRunner):
 
         debut = time.time()
         cible = os.path.join(self.eval_dir, ".env")
-        if os.path.lexists(cible):
+        # Un .env produit par la recette de la copie (make env, rapatrié du
+        # conteneur jetable) se complète s'il lui manque une variable requise ;
+        # un .env livré ne se touche jamais.
+        produit = cible in self._fichiers_rapatries and os.path.isfile(cible) and not os.path.islink(cible)
+        if os.path.lexists(cible) and not produit:
             return
-        try:
-            with open(compose_file, encoding="utf-8", errors="replace") as lecteur:
-                requises = variables_requises(lecteur.read())
-        except OSError:
-            return
+        requises = []
+        for fichier in fichiers or [compose_file]:
+            try:
+                with open(fichier, encoding="utf-8", errors="replace") as lecteur:
+                    requises += [n for n in variables_requises(lecteur.read()) if n not in requises]
+            except OSError:
+                continue
+        if produit:
+            requises = [n for n in requises if n not in lancement.variables_definies(cible)]
         if not requises:
             return
 
         def generer():
             return secrets.token_hex(12)
+
+        if produit:
+            try:
+                with open(cible, encoding="utf-8", errors="replace") as lecteur:
+                    texte, completes = completer_env(lecteur.read(), requises, generer)
+                with open(cible, "w", encoding="utf-8") as sortie:
+                    sortie.write(texte)
+            except OSError as erreur:
+                self.record_step("Variables d'environnement de la copie", command="complément du .env produit",
+                                 output=f"Échec explicite : .env non complété ({erreur}).", exit_code=2,
+                                 duration=time.time() - debut)
+                return
+            self._env_fabrique = {"variables": completes,
+                                  "source": "le .env produit par la recette, complété par le harnais"}
+            self.record_step(
+                "Variables d'environnement de la copie",
+                command="complément du .env produit par la recette (valeurs non consignées)",
+                output=(f"Le .env produit par la commande de lancement ne définit pas : {', '.join(completes)}, "
+                        "que le compose exige sans défaut. Complété par le harnais : réparation."),
+                exit_code=0,
+                duration=time.time() - debut,
+            )
+            return
 
         # Un lien symbolique de la copie pourrait pointer hors du rendu : on
         # ne recopie qu'un vrai fichier.
@@ -687,6 +769,7 @@ class ComposeRunner(BaseRunner):
             )
             return
         self._env_cree = cible
+        self._env_fabrique = {"variables": list(requises), "source": source}
         self.logger.info(f".env fourni par le harnais : {', '.join(requises)}")
         self.record_step(
             "Variables d'environnement de la copie",
@@ -772,9 +855,64 @@ class ComposeRunner(BaseRunner):
                 duration=time.time() - compose_resolution_started,
             )
 
+            # Passage « lancement tel que livré » (politique du 16/10) : la
+            # commande de l'énoncé, jouée par make dans le conteneur jetable.
+            # Avant le .env du harnais et le compose relâché : ce que la
+            # recette produit doit venir d'elle.
+            passage = self._jouer_lancement()
+            up = None
+            if passage is not None:
+                self._lancement = passage["tel_que_livre"]
+                up = passage["up"]
+            fichiers_recette = [os.path.join(self.eval_dir, f) for f in (up or {}).get("fichiers", [])]
+            absents = [os.path.relpath(f, self.eval_dir) for f in fichiers_recette if not os.path.isfile(f)]
+            if absents:
+                self._lancement = dict(self._lancement, code=1, cause="copie", motif="up_en_echec",
+                                       extrait=f"`{' '.join(self._lancement['up'])}` vise un fichier Compose absent "
+                                               f"de la copie : {', '.join(absents)} (constat statique)")
+                up, fichiers_recette = None, []
+            env_recette = [os.path.join(self.eval_dir, f) for f in (up or {}).get("env_files", [])]
+
+            # La recette atteint `compose up`, mais sans ses variables requises
+            # compose refuserait d'interpoler (469217 sans `make env`) : la
+            # commande échoue telle que livrée. `config` le constate, avant que
+            # le harnais ne fabrique le .env.
+            reussi = bool(self._lancement) and self._lancement["code"] == 0 and self._lancement["cause"] is None
+            manquantes = self._variables_env_manquantes(compose_file, fichiers_recette, env_recette)
+            config_tel_que_livre = None
+            if reussi and manquantes:
+                code, extrait = self._config_tel_que_livre(
+                    [os.path.relpath(f, self.eval_dir) for f in fichiers_recette] or
+                    [os.path.relpath(compose_file, self.eval_dir)],
+                    [os.path.relpath(f, self.eval_dir) for f in env_recette])
+                config_tel_que_livre = (code, extrait)
+                if code != 0:
+                    self._lancement = dict(
+                        self._lancement, code=code if isinstance(code, int) else 1, cause="copie",
+                        motif="variables_requises",
+                        extrait=(f"après `{self._lancement['commande']}`, le compose exige sans valeur : "
+                                 f"{', '.join(manquantes)}\n{extrait}").strip())
+
             # Avant tout `up` : sans ses variables requises, compose refuse
             # d'interpoler et la stack ne démarre pas (469217).
-            self._preparer_env(compose_file)
+            self._preparer_env(compose_file, fichiers_recette or None)
+            if self._env_fabrique:
+                lance = self._lancement or {}
+                if config_tel_que_livre is not None:
+                    tel = {"commande": " ".join(lance.get("up") or ["docker", "compose", "up"]),
+                           "code": config_tel_que_livre[0], "extrait": config_tel_que_livre[1]}
+                else:
+                    tel = {"commande": "docker compose up", "code": None,
+                           "extrait": "variables requises sans valeur dans la copie livrée : "
+                                      f"{', '.join(self._env_fabrique['variables'])} (constat statique : compose "
+                                      "refuse d'interpoler)"}
+                self._reparations.append({
+                    "id": "env_fabrique",
+                    "critere_touche": "services_debout",
+                    "tel_que_livre": tel,
+                    "applique": f".env fourni par le harnais ({self._env_fabrique['source']}) pour : "
+                                f"{', '.join(self._env_fabrique['variables'])} — valeurs non consignées",
+                })
 
             # Liberer les ports hote declares par l'apprenant. Deux copies du
             # meme examen, ou n'importe quel conteneur deja lance sur la
@@ -803,22 +941,87 @@ class ComposeRunner(BaseRunner):
             # alors un projet et se démontaient l'une l'autre (« No such
             # container »). Chaque commande compose hérite de cette variable.
             os.environ["COMPOSE_PROJECT_NAME"] = self.project_name
-            self.compose = DockerCompose(
-                context=self.eval_dir,
-                compose_file_name=compose_name,
-                pull=False,  # Use local builds
-                build=True,  # Build images before starting
-                env_file=None  # No .env file needed
-            )
+
+            # Le `up` de la recette, s'il diffère de celui du moteur (fichiers
+            # `-f`, profils, --env-file, services) : joué tel quel d'abord. Un
+            # échec là, puis le up par défaut : la commande de l'énoncé échoue
+            # telle que livrée, le reste se mesure avec la réparation.
+            commande_up = f"docker compose -f {compose_name} up --build"
+            deja_demarre = False
+            relatifs = [os.path.relpath(f, self.eval_dir) for f in fichiers_recette]
+            personnalise = up is not None and (
+                relatifs not in ([], [os.path.relpath(compose_file, self.eval_dir)])
+                or bool(up["profils"] or up["env_files"] or up["services"]))
+            if personnalise:
+                noms = []
+                for chemin in fichiers_recette or [compose_file]:
+                    if os.path.samefile(chemin, compose_file):
+                        noms.append(compose_name)
+                        continue
+                    relatif = os.path.relpath(chemin, self.eval_dir)
+                    racine, extension = os.path.splitext(relatif)
+                    noms.append(self._relax_host_ports(chemin, nom_sortie=f"{racine}.eval{extension or '.yml'}"))
+                commande_recette = (f"docker compose {' '.join(f'-f {n}' for n in noms)}"
+                                    + "".join(f" --profile {p}" for p in up["profils"])
+                                    + "".join(f" --env-file {e}" for e in up["env_files"])
+                                    + " up --build" + "".join(f" {s}" for s in up["services"]))
+                recette_started = time.time()
+                try:
+                    self.compose = DockerCompose(
+                        context=self.eval_dir, compose_file_name=noms if len(noms) > 1 else noms[0],
+                        pull=False, build=True, env_file=up["env_files"] or None,
+                        profiles=up["profils"] or None, services=up["services"] or None)
+                    # Même démarrage que le up du moteur : réessai sur un
+                    # healthcheck seulement lent (467094), cause classée.
+                    _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate).__enter__()
+                    deja_demarre = True
+                    commande_up = commande_recette
+                except Exception as exc:
+                    imputation = (self._cause_demarrage or {}).get("imputation")
+                    self.record_step(
+                        "Build et démarrage Compose (arguments de la recette)",
+                        command=commande_recette,
+                        output=(f"imputation : {imputation or 'non classée'}\n"
+                                + lancement.masquer_secrets(str(exc))[-800:]),
+                        exit_code=1,
+                        duration=time.time() - recette_started,
+                    )
+                    try:
+                        if self.compose is not None:
+                            self.compose.stop()
+                    except Exception:
+                        pass
+                    self.compose = None
+                    # Le up par défaut repart sans la cause du premier.
+                    self._cause_demarrage = None
+                    extrait = (f"`{' '.join(self._lancement['up'])}` (le up de la recette) échoue "
+                               f"(imputation {imputation or 'non classée'}) : "
+                               f"{lancement.masquer_secrets(str(exc))[-600:]}")
+                    # Seule une faute établie de la copie coûte : un up
+                    # interrompu par le réseau, un délai ou une cause
+                    # indéterminée n'est pas mesuré.
+                    self._lancement = dict(self._lancement, code=1, cause="copie", motif="up_en_echec",
+                                           extrait=extrait) if imputation == "copie" else \
+                        dict(self._lancement, code=None, cause="non_mesure", motif="up_en_echec_non_impute",
+                             extrait=extrait)
+            if not deja_demarre:
+                self._noter_reparations_de_lancement(compose_name)
+                self.compose = DockerCompose(
+                    context=self.eval_dir,
+                    compose_file_name=compose_name,
+                    pull=False,  # Use local builds
+                    build=True,  # Build images before starting
+                    env_file=None  # No .env file needed
+                )
 
             # Start services with context manager (auto-cleanup on exit)
             self.logger.info("Starting Docker Compose services...")
             compose_started = time.time()
             try:
-                with _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate):
+                with _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate, deja_demarre):
                     self.record_step(
                         "Build et démarrage Compose",
-                        command=f"docker compose -f {compose_name} up --build",
+                        command=commande_up,
                         output="Entrée dans le contexte testcontainers réussie (stdout non disponible).",
                         exit_code=0,
                         duration=time.time() - compose_started,
@@ -892,7 +1095,7 @@ class ComposeRunner(BaseRunner):
                 if not any(step["title"] == "Build et démarrage Compose" for step in self.steps):
                     self.record_step(
                         "Build et démarrage Compose",
-                        command=f"docker compose -f {compose_name} up --build",
+                        command=commande_up,
                         output=self._diagnostic_up_rate(exc),
                         exit_code=2,
                         duration=time.time() - compose_started,
@@ -1223,16 +1426,10 @@ class ComposeRunner(BaseRunner):
                 # README) — l'apprenant choisit ses identifiants, les lire fait
                 # partie de la correction.
                 if code == 401:
-                    # admin:admin d'abord : les identifiants du cours.
-                    candidats = [(sondes_nginx.IDENTIFIANTS_DU_COURS, "du cours")]
-                    enonce = os.environ.get("EXAM_DOCKER_EVAL_BASIC_AUTH", "")
-                    if enonce and enonce != sondes_nginx.IDENTIFIANTS_DU_COURS:
-                        candidats.append((enonce, "énoncé"))
-                    candidats.extend(
-                        (c, f"déclarés dans la copie ({src})")
-                        for c, src in identifiants_declares(self.eval_dir)
-                        if c not in (enonce, sondes_nginx.IDENTIFIANTS_DU_COURS)
-                    )
+                    # Ceux de la copie d'abord, le cours en dernier (16/10).
+                    candidats = [(c, f"déclarés dans la copie ({fichier})" if origine == "copie" else
+                                  "énoncé" if origine == "énoncé" else "du cours")
+                                 for c, origine, fichier in self._identifiants_candidats({})]
                     import base64
                     for identifiants, source in candidats:
                         jeton = base64.b64encode(identifiants.encode()).decode()
@@ -1313,7 +1510,7 @@ class ComposeRunner(BaseRunner):
             return []
         self._requete_construite_memo = requete
         sonde = {}
-        for identifiants in self._identifiants_candidats(requete):
+        for identifiants, _, _ in self._identifiants_candidats(requete):
             started = time.time()
             sonde = {"service": base["service"], "port": base["port"], "url": f"{racine_url}/predict",
                      "auth": True, "construite": True}
@@ -1427,19 +1624,31 @@ class ComposeRunner(BaseRunner):
         return self._requete_depuis_corps(corps, "modèle Pydantic de l'API") if corps is not None else None
 
     def _identifiants_candidats(self, requete: dict) -> list:
-        """admin:admin d'abord (le cours ; l'énoncé n'en fixe aucun), puis ceux
-        de la requête déclarée, ceux que la copie écrit ailleurs (tests,
-        README, Makefile), et ceux de l'énoncé passés par env."""
-        candidats = [sondes_nginx.IDENTIFIANTS_DU_COURS]
+        """[(couple, origine, fichier)] dans l'ordre d'essai (politique du
+        16/10 : on note ce qui a été livré) : la requête déclarée, ce que la
+        copie écrit ailleurs (tests, README, Makefile), ceux de l'énoncé passés
+        par env, et admin:admin du cours en dernier. Un couple écrit par la
+        copie est « copie » même s'il vaut celui du cours (469217 : `-u
+        admin:admin` dans son README) : l'ancien code l'étiquetait « du
+        cours ». Le couple du cours que la copie cite autrement (« admin /
+        mot de passe admin ») reste le sien."""
+        candidats = []
         if requete.get("identifiants"):
-            candidats.append(requete["identifiants"])
-        candidats.extend(c for c, _ in identifiants_declares(self.eval_dir))
+            candidats.append((requete["identifiants"], "copie", requete.get("source")))
+        candidats.extend((c, "copie", src) for c, src in identifiants_declares(self.eval_dir))
         if os.environ.get("EXAM_DOCKER_EVAL_BASIC_AUTH"):
-            candidats.append(os.environ["EXAM_DOCKER_EVAL_BASIC_AUTH"])
-        uniques = []
-        for couple in candidats:
-            if couple not in uniques and not code_attendu_negatif(couple):
-                uniques.append(couple)
+            candidats.append((os.environ["EXAM_DOCKER_EVAL_BASIC_AUTH"], "énoncé", None))
+        candidats.append((sondes_nginx.IDENTIFIANTS_DU_COURS, "cours", None))
+        uniques, vus = [], set()
+        for couple, origine, fichier in candidats:
+            if couple in vus or code_attendu_negatif(couple):
+                continue
+            vus.add(couple)
+            if origine != "copie":
+                cite = identifiants_mentionnes(self.eval_dir, couple)
+                if cite:
+                    origine, fichier = "copie", cite
+            uniques.append((couple, origine, fichier))
         return uniques
 
     def _poster_predict(self, url: str, requete: dict, identifiants, contexte, *,
@@ -1516,13 +1725,18 @@ class ComposeRunner(BaseRunner):
             try:
                 # Le POST nominal sert aussi à trouver les identifiants qui
                 # passent : le premier couple qui ne rend pas 401.
-                for couple in self._identifiants_candidats(requete) or [None]:
+                origine = None
+                for couple, origine, _ in self._identifiants_candidats(requete) or [(None, None, None)]:
                     defaut = self._poster_predict(url, requete, couple, contexte)
                     identifiants = couple
                     if defaut.get("code") != 401:
                         break
                 if isinstance(defaut.get("code"), int):
                     comportement["identifiants_acceptes"] = defaut.get("code") != 401
+                    # D'où vient le couple accepté : le barème retire le critère
+                    # « documenté » quand ce n'est pas la copie qui l'écrit.
+                    if comportement["identifiants_acceptes"]:
+                        comportement["identifiants_source"] = origine
             except Exception:
                 defaut = None
 
@@ -1784,6 +1998,182 @@ class ComposeRunner(BaseRunner):
                     conteneur.remove(force=True)
                 except Exception:
                     pass
+
+    def _variables_env_manquantes(self, compose_file: str, fichiers: list, env_files: list) -> list:
+        """Les variables requises (`:?`) que ni le .env du projet ni les
+        --env-file de la recette ne définissent. Un .env livré par la copie
+        n'est jamais complété (règle de `_preparer_env`) : rien ne manque."""
+        cible = os.path.join(self.eval_dir, ".env")
+        if os.path.lexists(cible) and cible not in self._fichiers_rapatries:
+            return []
+        requises = []
+        for fichier in fichiers or [compose_file]:
+            try:
+                with open(fichier, encoding="utf-8", errors="replace") as lecteur:
+                    requises += [n for n in variables_requises(lecteur.read()) if n not in requises]
+            except OSError:
+                continue
+        definies = set()
+        for env in [cible, *env_files]:
+            definies |= lancement.variables_definies(env)
+        return [n for n in requises if n not in definies]
+
+    def _jouer_lancement(self) -> dict | None:
+        """La commande de lancement de l'énoncé, jouée telle que livrée dans le
+        conteneur jetable de `make test` (voir lancement.py) :
+        {"tel_que_livre": {commande, code, cause, motif, extrait, up}, "up":
+        arguments du moteur ou None}, ou None hors nginx/prometheus-grafana.
+
+        Avant `_preparer_env` et `_relax_host_ports` : l'archive ne doit
+        porter ni notre .env (la cible `.env:` de 469217 ne tournerait pas) ni
+        notre compose relâché. Le conteneur n'a ni socket Docker ni montage de
+        l'hôte ; seul un `docker` factice répond. Ce que la recette produit
+        (.env, certificats) revient dans le projet : fichiers réguliers,
+        bornés, retirés au nettoyage."""
+        import secrets
+        commande = lancement.commande_de_lancement(self.eval_dir)
+        if commande is None:
+            return None
+        debut = time.time()
+        description = (f"{commande} dans {IMAGE_MAKE_TEST} (docker factice, sans socket Docker, copie par archive, "
+                       f"timeout {lancement.DELAI_LANCEMENT_S} s)")
+
+        def fin(tel, rapatries=()):
+            up = None
+            if tel.get("up"):
+                up = lancement.traduire_up(tel["up"])
+                if up is None:
+                    tel = lancement.non_mesure(commande, "up_non_reproductible",
+                                               f"`{' '.join(tel['up'])}` : options que le moteur ne sait pas rejouer "
+                                               "fidèlement\n" + tel["extrait"])
+            self.record_step(
+                "Lancement tel que livré (conteneur jetable)",
+                command=description,
+                output=(f"code {tel['code']}" if tel["code"] is not None else "non mesuré")
+                       + (f" — {tel['cause']} ({tel['motif']})" if tel["cause"] else "")
+                       + (f"\nfichiers produits par la recette, rapatriés : {', '.join(rapatries)}" if rapatries else "")
+                       + f"\n{tel['extrait']}"[:1500],
+                # L'échec de la commande est l'affaire du barème, pas une panne.
+                exit_code=0,
+                duration=time.time() - debut,
+            )
+            return {"tel_que_livre": tel, "up": up}
+
+        if lancement.makefile_de(self.eval_dir) is None:
+            return fin(lancement.sans_makefile(commande))
+        try:
+            client = client_docker()
+            image = self._image_make_test(client)
+        except Exception as erreur:
+            return fin(lancement.non_mesure(commande, "conteneur_jetable",
+                                            f"image du conteneur jetable indisponible ({erreur})"))
+        script = "\n".join(["set -u", "cd /travail",
+                            f"timeout {lancement.DELAI_LANCEMENT_S} {commande} 2>&1", "exit $?"])
+        conteneur = None
+        try:
+            conteneur = client.containers.create(
+                image, command=["sh", "-c", script],
+                name=f"{self.project_name}-lancement-{secrets.token_hex(3)}",
+                labels={"scriptorium.lancement": self.project_name},
+                mem_limit="512m", pids_limit=256, security_opt=["no-new-privileges"],
+                cap_drop=["NET_RAW", "MKNOD", "SYS_CHROOT", "SETFCAP", "AUDIT_WRITE"])
+            conteneur.put_archive("/", self._archive_de_la_copie())
+            conteneur.put_archive("/", lancement.archive_du_factice())
+            conteneur.start()
+            try:
+                etat = conteneur.wait(timeout=lancement.DELAI_LANCEMENT_S + lancement.MARGE_LANCEMENT_S)
+            except Exception as erreur:
+                return fin(lancement.non_mesure(commande, "delai", f"délai dépassé : {erreur}"))
+            code = etat.get("StatusCode") if isinstance(etat, dict) else None
+            sortie = conteneur.logs()
+            sortie = sortie.decode("utf-8", "replace") if isinstance(sortie, bytes) else str(sortie)
+            flux, _ = conteneur.get_archive(lancement.FICHIER_APPELS)
+            appels = lancement.lire_appels(lancement.contenu_tar(b"".join(flux), "appels"))
+            tel = lancement.classer(commande, code, sortie, appels)
+            flux, _ = conteneur.get_archive("/travail")
+            nouveaux, originaux = lancement.rapatrier(b"".join(flux), self.eval_dir)
+            self._fichiers_rapatries.extend(nouveaux)
+            for chemin, contenu in originaux.items():
+                self._originaux.setdefault(chemin, contenu)
+            rapatries = sorted(os.path.relpath(c, self.eval_dir) for c in [*nouveaux, *originaux])
+            return fin(tel, rapatries)
+        except Exception as erreur:
+            return fin(lancement.non_mesure(commande, "conteneur_jetable", f"conteneur jetable en échec ({erreur})"))
+        finally:
+            if conteneur is not None:
+                try:
+                    conteneur.remove(force=True)
+                except Exception:
+                    pass
+
+    def _retirer_rapatries(self) -> list:
+        """Remettre le projet dans l'état livré : fichiers produits par la
+        recette retirés, fichiers modifiés rendus. Rend les erreurs."""
+        erreurs = []
+        for chemin in reversed(self._fichiers_rapatries):
+            try:
+                os.remove(chemin)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                erreurs.append(f"{os.path.relpath(chemin, self.eval_dir)} non retiré : {e}")
+                continue
+            dossier = os.path.dirname(chemin)
+            while os.path.realpath(dossier).startswith(os.path.realpath(self.eval_dir) + os.sep):
+                try:
+                    os.rmdir(dossier)  # vide seulement
+                except OSError:
+                    break
+                dossier = os.path.dirname(dossier)
+        for chemin, contenu in self._originaux.items():
+            try:
+                with open(chemin, "wb") as f:
+                    f.write(contenu)
+            except OSError as e:
+                erreurs.append(f"{os.path.relpath(chemin, self.eval_dir)} non restauré : {e}")
+        self._fichiers_rapatries, self._originaux = [], {}
+        return erreurs
+
+    def _config_tel_que_livre(self, fichiers: list, env_files: list) -> tuple:
+        """(code, extrait) de `docker compose config -q` sur la copie telle
+        que livrée, avant que le moteur ne fabrique le .env. `config`
+        interpole sans rien construire ni lancer ; l'extrait est masqué."""
+        import subprocess
+        argv = ["docker", "compose", "-p", self.project_name]
+        for fichier in fichiers:
+            argv += ["-f", fichier]
+        for env in env_files:
+            argv += ["--env-file", env]
+        try:
+            fini = subprocess.run(argv + ["config", "-q"], cwd=self.eval_dir, capture_output=True, text=True,
+                                  timeout=30)
+        except Exception as erreur:
+            return None, f"docker compose config non joué ({erreur})"
+        return fini.returncode, lancement.masquer_secrets((fini.stderr or fini.stdout or "").strip())[-800:]
+
+    def _noter_reparations_de_lancement(self, compose_name: str) -> None:
+        """Le compose du moteur à la place de la commande de l'énoncé : une
+        réparation, consignée pour le barème (critère services/stack)."""
+        tel = self._lancement
+        if not tel or tel["code"] == 0 and tel["cause"] is None:
+            return
+        if tel.get("motif") == "variables_requises" or any(
+                r["id"] == "compose_au_lieu_de_make" for r in self._reparations):
+            return
+        self._reparations.insert(0, {
+            "id": "compose_au_lieu_de_make",
+            "critere_touche": "services_debout",
+            "tel_que_livre": {"commande": tel["commande"], "code": tel["code"], "extrait": tel["extrait"]},
+            "applique": f"docker compose -f {compose_name} up --build lancé par le moteur à la place de "
+                        f"`{tel['commande']}`",
+        })
+
+    def _avec_lancement(self, result: dict) -> dict:
+        if isinstance(result, dict) and self._lancement is not None:
+            result["lancement_tel_que_livre"] = {k: v for k, v in self._lancement.items() if k != "up"}
+        if isinstance(result, dict):
+            result["reparations"] = list(self._reparations)
+        return result
 
     def _racine_monitoring(self, sondes_racine: list, mots: tuple, port: int, exclure: str | None = None):
         """L'URL hôte d'un service de monitoring : par son nom de conteneur,
@@ -2260,6 +2650,7 @@ class ComposeRunner(BaseRunner):
         return statut, sonde
 
     def _avec_cause(self, result: dict) -> dict:
+        self._avec_lancement(result)
         if self._cause_demarrage is not None and isinstance(result, dict):
             result["cause_demarrage"] = self._cause_demarrage
             # Un `up` relancé avec succès laisse l'évaluation imputer seule.
@@ -2465,7 +2856,9 @@ class ComposeRunner(BaseRunner):
                 errors.append(str(e))
                 self.logger.warning(f"Cleanup error: {e}")
         # Après `compose stop` : sans le .env, compose ne saurait plus
-        # interpoler le fichier pour démonter la stack (469217).
+        # interpoler le fichier pour démonter la stack (469217). Les fichiers
+        # produits par la recette (rapatriés) suivent la même règle.
+        errors.extend(self._retirer_rapatries())
         if self._env_cree:
             try:
                 os.remove(self._env_cree)
