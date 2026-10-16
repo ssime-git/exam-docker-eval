@@ -102,4 +102,7 @@ def test_des_tests_qui_echouent_ne_relancent_rien(tmp_path, monkeypatch):
         return _Resultat(1, "1 failed")
     monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
     resultat = runner._run_pytest("http://localhost:32773")
-    assert len(appels) == 1 and resultat["failed"] == 1 and resultat["evaluable"] is True
+    # Deux passages : tel que livré, puis réparé (politique du 16/10) ;
+    # aucun autre Python essayé.
+    assert len(appels) == 2 and resultat["failed"] == 1 and resultat["evaluable"] is True
+    assert {c[c.index("--python") + 1] for c in appels} == {"3.11"}, appels
