@@ -2190,19 +2190,46 @@ class ComposeRunner(BaseRunner):
                     pass
                 code = conteneur.attrs.get("State", {}).get("ExitCode")
                 service = conteneur.labels.get("com.docker.compose.service", conteneur.name)
+                sante, _ = self._sante_du_conteneur(conteneur)
                 lignes.append(f"{service} ({conteneur.name}) : {conteneur.status}"
-                              + (f" ({code})" if conteneur.status != "running" else ""))
+                              + (f" ({code})" if conteneur.status != "running" else "")
+                              + (f", {sante}" if sante else ""))
             parties.append("--- services ---\n" + "\n".join(lignes))
             for conteneur in conteneurs:
-                if conteneur.status == "running":
+                sante, sonde = self._sante_du_conteneur(conteneur)
+                # 467094 : « bike-api is unhealthy » est un conteneur `running`.
+                # Seul un conteneur running dont la santé n'est pas tranchée
+                # en bien (unhealthy, starting) garde ses logs ; sain ou sans
+                # healthcheck, il reste omis.
+                if conteneur.status == "running" and sante not in ("unhealthy", "starting"):
                     continue
+                service = conteneur.labels.get("com.docker.compose.service", conteneur.name)
+                if sonde is not None:
+                    code_sonde, sortie_sonde = sonde
+                    parties.append(f"--- dernière sonde de santé de {service} (code {code_sonde}) ---\n"
+                                   f"{sortie_sonde[-1000:].strip()}")
                 try:
                     logs = conteneur.logs(tail=40).decode("utf-8", errors="replace").strip()
                 except Exception as erreur:
                     logs = f"logs illisibles : {erreur}"
-                service = conteneur.labels.get("com.docker.compose.service", conteneur.name)
                 parties.append(f"--- logs de {service} (fin) ---\n{logs}")
         return "\n".join(parties)
+
+    @staticmethod
+    def _sante_du_conteneur(conteneur):
+        """(état de santé, (code, sortie) de la dernière sonde), None si absent.
+
+        Pas de healthcheck ou attrs sans `Health` : (None, None), jamais
+        d'exception.
+        """
+        sante = (conteneur.attrs.get("State") or {}).get("Health") or {}
+        statut = sante.get("Status") or None
+        journal = sante.get("Log") or []
+        sonde = None
+        if journal:
+            derniere = journal[-1] or {}
+            sonde = (derniere.get("ExitCode"), str(derniere.get("Output") or ""))
+        return statut, sonde
 
     def _capture_logs(self) -> str:
         """

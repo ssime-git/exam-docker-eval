@@ -620,3 +620,97 @@ def test_failed_up_is_diagnosed_before_teardown(tmp_path, logger, monkeypatch):
     runner.run_evaluation()
 
     assert ordre[0] == "relevé", ordre
+
+
+# --- Conteneur « unhealthy » : running, donc jadis sans logs dans le diagnostic ---
+
+def _conteneur_avec_sante(nom, sante, service, sortie_sonde="", code_sonde=1, logs=b""):
+    """Conteneur `running` avec un healthcheck ; `sante=None` : sans healthcheck."""
+    conteneur = FakeContainer(nom, status="running", service=service)
+    if sante is not None:
+        conteneur.attrs["State"]["Health"] = {
+            "Status": sante,
+            "Log": [{"ExitCode": 9, "Output": "ancienne sonde"},
+                    {"ExitCode": code_sonde, "Output": sortie_sonde}],
+        }
+    conteneur.logs = lambda tail=None: logs
+    return conteneur
+
+
+def test_diagnostic_unhealthy_running_container_shows_health_probe_and_log_tail(tmp_path, logger, monkeypatch):
+    """467094 : `up --wait` échoue sur « bike-api is unhealthy ». Le conteneur
+    est `running` : ses logs étaient sautés, la cause restait inconnue."""
+    runner = make_runner(tmp_path, logger)
+    api = _conteneur_avec_sante("eval_467094-bike-api-1", "unhealthy", "bike-api",
+                                sortie_sonde="curl: (7) Failed to connect to localhost port 8000",
+                                code_sonde=7, logs=b"Downloading UCI dataset...\nTraining model\n")
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [api])
+
+    sortie = runner._diagnostic_up_rate(RuntimeError("up a échoué"))
+
+    assert "bike-api (eval_467094-bike-api-1) : running, unhealthy" in sortie
+    assert "Failed to connect to localhost port 8000" in sortie
+    assert "code 7" in sortie
+    assert "ancienne sonde" not in sortie
+    assert "--- logs de bike-api (fin) ---" in sortie
+    assert "Training model" in sortie
+
+
+def test_diagnostic_unhealthy_container_logs_are_the_tail_of_40_lines(tmp_path, logger, monkeypatch):
+    runner = make_runner(tmp_path, logger)
+    appels = []
+    api = _conteneur_avec_sante("api-1", "unhealthy", "api")
+    api.logs = lambda tail=None: appels.append(tail) or b"fin"
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [api])
+
+    runner._diagnostic_up_rate(RuntimeError("x"))
+
+    assert appels == [40]
+
+
+def test_diagnostic_starting_container_is_treated_as_unhealthy(tmp_path, logger, monkeypatch):
+    runner = make_runner(tmp_path, logger)
+    api = _conteneur_avec_sante("api-1", "starting", "api", logs=b"entrainement en cours")
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [api])
+
+    sortie = runner._diagnostic_up_rate(RuntimeError("x"))
+
+    assert "api (api-1) : running, starting" in sortie
+    assert "entrainement en cours" in sortie
+
+
+def test_diagnostic_healthy_or_unmonitored_running_containers_stay_without_logs(tmp_path, logger, monkeypatch):
+    runner = make_runner(tmp_path, logger)
+    sain = _conteneur_avec_sante("db-1", "healthy", "db", logs=b"LOG-SAIN")
+    sans = _conteneur_avec_sante("nginx-1", None, "nginx", logs=b"LOG-SANS-SONDE")
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [sain, sans])
+
+    sortie = runner._diagnostic_up_rate(RuntimeError("x"))
+
+    assert "db (db-1) : running, healthy" in sortie
+    assert "nginx (nginx-1) : running\n" in sortie + "\n"
+    assert "LOG-SAIN" not in sortie and "LOG-SANS-SONDE" not in sortie
+    assert "--- logs de" not in sortie
+
+
+def test_diagnostic_unhealthy_without_probe_log_does_not_crash(tmp_path, logger, monkeypatch):
+    runner = make_runner(tmp_path, logger)
+    api = _conteneur_avec_sante("api-1", "unhealthy", "api", logs=b"trace")
+    api.attrs["State"]["Health"]["Log"] = []
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [api])
+
+    sortie = runner._diagnostic_up_rate(RuntimeError("x"))
+
+    assert "running, unhealthy" in sortie and "trace" in sortie
+
+
+def test_diagnostic_attrs_without_state_or_health_does_not_crash(tmp_path, logger, monkeypatch):
+    runner = make_runner(tmp_path, logger)
+    nu = FakeContainer("nu-1", service="nu")
+    nu.attrs = {}
+    nu.logs = lambda tail=None: b"jamais lu"
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [nu])
+
+    sortie = runner._diagnostic_up_rate(RuntimeError("x"))
+
+    assert "nu (nu-1) : running" in sortie and "jamais lu" not in sortie
