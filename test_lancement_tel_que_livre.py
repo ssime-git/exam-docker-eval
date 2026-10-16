@@ -446,3 +446,72 @@ def test_467094_les_services_de_la_recette_sont_rejoues():
     tel = lancement.classer("make", 2, "make: *** [Makefile:15: all] Error 97\n", appels)
     assert tel["code"] == 0 and tel["cause"] is None
     assert lancement.traduire_up(tel["up"])["services"] == ["bike-api", "prometheus", "node-exporter", "grafana"]
+
+
+# --- le up de la recette : même réessai et même classement que le up du moteur -
+
+def _run_recette(tmp_path, monkeypatch, starts, imputation, reessai):
+    """467094 : `up --build -d bike-api prometheus …` (services listés) prend
+    le chemin des arguments de la recette. `starts` : issue de chaque
+    start() successif (True = passe)."""
+    from test_env_requis_compose import COMPOSE_469217
+    ecrire(tmp_path / "docker-compose.yml", COMPOSE_469217)
+    ecrire(tmp_path / "deployments" / "nginx" / "nginx.conf", tsn.NGINX)
+    ecrire(tmp_path / "Makefile", MAKEFILE_469217)
+    construits, issues = [], list(starts)
+
+    class ComposeDouble:
+        def __init__(self, **kwargs):
+            construits.append(kwargs)
+
+        def start(self):
+            if not issues.pop(0):
+                raise RuntimeError("container eval-grafana-1 is unhealthy")
+
+        def stop(self):
+            pass
+
+        def __exit__(self, *exc):
+            self.stop()
+
+    monkeypatch.setattr(compose_runner, "DockerCompose", ComposeDouble)
+    runner = ComposeRunner("467094", str(tmp_path), timeout=60, logger=logging.getLogger("t"))
+    up = ["docker", "compose", "up", "--build", "-d", "grafana"]
+    tel = dict(ATTEINT, up=up)
+    monkeypatch.setattr(runner, "_jouer_lancement", lambda: (
+        ecrire(tmp_path / ".env", "GRAFANA_ADMIN_PASSWORD=x\n"),
+        runner._fichiers_rapatries.append(str(tmp_path / ".env")),
+        {"tel_que_livre": dict(tel), "up": lancement.traduire_up(up)})[-1])
+
+    def diagnostiquer(exc, reessai_possible):
+        runner._cause_demarrage = {"imputation": imputation, "cause": "delai_depasse", "services": {}, "reessai": None}
+        return reessai and reessai_possible
+    monkeypatch.setattr(runner, "_diagnostiquer_up_rate", diagnostiquer)
+
+    def arret():
+        raise _Arret("arrêt après le up")
+    monkeypatch.setattr(runner, "_retenir_images_de_la_copie", arret)
+    return runner.run_evaluation(), construits
+
+
+def test_up_de_la_recette_lent_puis_sain_au_reessai(tmp_path, monkeypatch):
+    resultat, construits = _run_recette(tmp_path, monkeypatch, [False, True], "non_mesure", reessai=True)
+    assert len(construits) == 1 and construits[0]["services"] == ["grafana"]
+    assert resultat["lancement_tel_que_livre"]["code"] == 0
+    assert resultat["reparations"] == []
+
+
+def test_up_de_la_recette_en_echec_impute_a_la_copie(tmp_path, monkeypatch):
+    resultat, construits = _run_recette(tmp_path, monkeypatch, [False, True], "copie", reessai=False)
+    assert len(construits) == 2 and "services" not in construits[1] or not construits[1].get("services")
+    tel = resultat["lancement_tel_que_livre"]
+    assert tel["code"] == 1 and tel["cause"] == "copie" and tel["motif"] == "up_en_echec"
+    assert [r["id"] for r in resultat["reparations"]] == ["compose_au_lieu_de_make"]
+    # La cause du premier up ne pollue pas le second, qui a réussi.
+    assert "cause_demarrage" not in resultat
+
+
+def test_up_de_la_recette_en_echec_non_impute_n_est_pas_un_zero(tmp_path, monkeypatch):
+    resultat, _ = _run_recette(tmp_path, monkeypatch, [False, True], "non_mesure", reessai=False)
+    tel = resultat["lancement_tel_que_livre"]
+    assert tel["code"] is None and tel["cause"] == "non_mesure"

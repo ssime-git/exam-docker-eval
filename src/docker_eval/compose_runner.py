@@ -971,14 +971,18 @@ class ComposeRunner(BaseRunner):
                         context=self.eval_dir, compose_file_name=noms if len(noms) > 1 else noms[0],
                         pull=False, build=True, env_file=up["env_files"] or None,
                         profiles=up["profils"] or None, services=up["services"] or None)
-                    self.compose.start()
+                    # Même démarrage que le up du moteur : réessai sur un
+                    # healthcheck seulement lent (467094), cause classée.
+                    _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate).__enter__()
                     deja_demarre = True
                     commande_up = commande_recette
                 except Exception as exc:
+                    imputation = (self._cause_demarrage or {}).get("imputation")
                     self.record_step(
                         "Build et démarrage Compose (arguments de la recette)",
                         command=commande_recette,
-                        output=lancement.masquer_secrets(str(exc))[-800:],
+                        output=(f"imputation : {imputation or 'non classée'}\n"
+                                + lancement.masquer_secrets(str(exc))[-800:]),
                         exit_code=1,
                         duration=time.time() - recette_started,
                     )
@@ -988,10 +992,18 @@ class ComposeRunner(BaseRunner):
                     except Exception:
                         pass
                     self.compose = None
-                    self._lancement = dict(
-                        self._lancement, code=1, cause="copie", motif="up_en_echec",
-                        extrait=(f"`{' '.join(self._lancement['up'])}` (le up de la recette) échoue : "
-                                 f"{lancement.masquer_secrets(str(exc))[-600:]}"))
+                    # Le up par défaut repart sans la cause du premier.
+                    self._cause_demarrage = None
+                    extrait = (f"`{' '.join(self._lancement['up'])}` (le up de la recette) échoue "
+                               f"(imputation {imputation or 'non classée'}) : "
+                               f"{lancement.masquer_secrets(str(exc))[-600:]}")
+                    # Seule une faute établie de la copie coûte : un up
+                    # interrompu par le réseau, un délai ou une cause
+                    # indéterminée n'est pas mesuré.
+                    self._lancement = dict(self._lancement, code=1, cause="copie", motif="up_en_echec",
+                                           extrait=extrait) if imputation == "copie" else \
+                        dict(self._lancement, code=None, cause="non_mesure", motif="up_en_echec_non_impute",
+                             extrait=extrait)
             if not deja_demarre:
                 self._noter_reparations_de_lancement(compose_name)
                 self.compose = DockerCompose(
