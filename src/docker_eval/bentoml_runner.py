@@ -128,6 +128,20 @@ def source_du_corps(contrat: Dict[str, Any], corps) -> str:
     return (contrat.get("predict_body_sources") or {}).get(_cle_corps(corps), "devine")
 
 
+def source_avec_enveloppe(contrat: Dict[str, Any], corps, enveloppe: Optional[str]) -> str:
+    """Provenance de la requête /predict réellement acceptée : celle du
+    corps, dégradée par celle de l'enveloppe ajoutée par le correcteur.
+
+    Un corps du README qui ne passe qu'enveloppé dans un `input_data` que la
+    copie ne documente pas n'est pas un corps documenté : l'enveloppe lue
+    dans la signature du service donne `image`/`source`, une enveloppe
+    essayée au hasard (`request`, noms courants) donne `devine`."""
+    source = source_du_corps(contrat, corps)
+    if not enveloppe or source not in CORPS_DOCUMENTES:
+        return source
+    return (contrat.get("predict_wrapper_sources") or {}).get(enveloppe, "devine")
+
+
 def _provenance_documentee(chemin: str) -> str:
     """readme, tests, image ou source, d'après le fichier où un corps a été lu."""
     if "(dans l'image)" in chemin:
@@ -229,6 +243,91 @@ def fichiers_de_tests(dossier: str) -> list:
 # Que pytest ignore lui-même ces parasites : `._x_test.py` correspond au motif
 # `*_test.py` et serait collecté.
 IGNORER_PARASITES_MACOS = ["--ignore-glob=*/._*", "--ignore-glob=*/__MACOSX/*"]
+
+
+# uv n'a pas pu joindre l'index de paquets : notre réseau, pas la copie.
+_RESEAU_UV = re.compile(
+    r"^.*(?:Failed to fetch|error sending request|dns error|failed to lookup address|"
+    r"tcp connect error|Connection reset by peer|operation timed out).*$", re.M | re.I)
+_CONNEXION_REFUSEE = re.compile(r"ConnectionError|Connection refused|NewConnectionError|ConnectionRefused")
+# Ce que pytest écrit quand des tests `async def` ne tournent pas faute de
+# plugin configuré : la seule preuve que le mode auto a servi.
+_ASYNC = re.compile(r"^.*(?:async def functions are not natively supported|"
+                    r"PytestUnhandledCoroutineWarning|was never awaited).*$", re.M)
+_JETON = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*")
+_LIGNES_UV = re.compile(r"\s*(Downloading|Downloaded|Installed \d|Resolved \d|Prepared \d|Built |Audited |Uninstalled )")
+
+
+def _paquets_avec(commande) -> list:
+    """Les paquets que la commande uvx injecte (`--with`), avant le lanceur."""
+    avant = commande[:_position_pytest(commande)]
+    return [avant[i + 1] for i, a in enumerate(avant[:-1]) if a == "--with"]
+
+
+def _paquets_declares(requirements_path: str) -> list:
+    """Noms des paquets du requirements.txt, normalisés (minuscules, `-`)."""
+    try:
+        with open(requirements_path, encoding="utf-8") as f:
+            lignes = f.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    noms = []
+    for ligne in lignes:
+        ligne = ligne.split("#", 1)[0].strip()
+        if not ligne or ligne.startswith("-"):
+            continue
+        nom = re.split(r"[\s<>=!~\[;@]", ligne, maxsplit=1)[0].lower().replace("_", "-")
+        if nom:
+            noms.append(nom)
+    return noms
+
+
+def _tests_async(tests_path: str) -> bool:
+    for chemin in fichiers_de_tests(tests_path):
+        try:
+            with open(chemin, encoding="utf-8") as f:
+                if re.search(r"^\s*async\s+def\s+test", f.read(), re.M):
+                    return True
+        except (OSError, UnicodeDecodeError):
+            continue
+    return False
+
+
+def _nomme_dans_les_tests(tests_path: str, nom: str) -> bool:
+    motif = re.compile(rf"\b{re.escape(nom)}\b")
+    for chemin in fichiers_de_tests(tests_path):
+        try:
+            with open(chemin, encoding="utf-8") as f:
+                if motif.search(f.read()):
+                    return True
+        except (OSError, UnicodeDecodeError):
+            continue
+    return False
+
+
+def _expurger(texte: str, valeurs=()) -> str:
+    """Ni jeton, ni secret du conteneur dans ce qu'on expose."""
+    texte = _JETON.sub("<jeton>", texte)
+    texte = re.sub(r"(Bearer\s+)\S+", r"\1<jeton>", texte)
+    for valeur in valeurs or ():
+        texte = texte.replace(valeur, "<secret>")
+    return texte
+
+
+def _extrait(sortie: str, motif=None, valeurs=()) -> str:
+    """Les lignes qui prouvent l'échec du premier passage : celles du motif,
+    sinon la fin utile de la sortie (sans le bruit d'installation de uv)."""
+    lignes = []
+    if motif is not None:
+        lignes = [m.group(0).strip() for m in motif.finditer(sortie or "")][:3]
+    if not lignes:
+        utiles = [l for l in (sortie or "").strip().splitlines() if l.strip() and not _LIGNES_UV.match(l)]
+        lignes = utiles[-5:]
+    return _expurger("\n".join(lignes), valeurs)[:600]
+
+
+def _commande_lisible(commande) -> str:
+    return " ".join(commande)
 
 
 def _position_pytest(commande) -> int:
@@ -1121,6 +1220,9 @@ class BentoMLRunner(BaseRunner):
                 profil_median(('gre_score', 'toefl_score', 'university_rating', 'sop', 'lor', 'cgpa', 'research')),
             ],
             'predict_body_sources': {},
+            # Provenance de chaque enveloppe essayée autour du corps :
+            # `request` est un essai à l'aveugle.
+            'predict_wrapper_sources': {'request': 'devine'},
         }
         sources = contract['predict_body_sources']
 
@@ -1222,8 +1324,11 @@ class BentoMLRunner(BaseRunner):
                 positional = re.search(
                     r'def\s+predict\s*\([\s\S]{0,300}?^\s*/\s*,', text, re.M
                 )
-                if predict_wrapper not in contract['predict_wrappers'] and not positional and not route_fastapi:
-                    contract['predict_wrappers'].insert(0, predict_wrapper)
+                if not positional and not route_fastapi:
+                    if predict_wrapper not in contract['predict_wrappers']:
+                        contract['predict_wrappers'].insert(0, predict_wrapper)
+                    contract['predict_wrapper_sources'][predict_wrapper] = (
+                        "image" if "(dans l'image)" in source_path else "source")
                 request_type = predict_signature.group(3)
                 request_fields = self._extract_class_fields(text, request_type)
                 if request_fields:
@@ -1259,6 +1364,8 @@ class BentoMLRunner(BaseRunner):
         if not signature_lue:
             contract['predict_wrappers'] += [nom for nom in ENVELOPPES_COURANTES
                                              if nom not in contract['predict_wrappers']]
+            for nom in ENVELOPPES_COURANTES:
+                contract['predict_wrapper_sources'].setdefault(nom, "devine")
 
         return contract
 
@@ -1363,16 +1470,17 @@ class BentoMLRunner(BaseRunner):
                 for variante in acces:
                     for wrapper in contract.get("predict_wrappers", [None, "request"]):
                         if wrapper:
-                            request_variants.append(({wrapper: normalized_payload}, dict(variante["entetes"]), variante))
+                            request_variants.append(({wrapper: normalized_payload}, dict(variante["entetes"]),
+                                                     variante, wrapper))
                         else:
-                            request_variants.append((normalized_payload, dict(variante["entetes"]), variante))
+                            request_variants.append((normalized_payload, dict(variante["entetes"]), variante, None))
                 if isinstance(normalized_payload, dict) and 'authorization' in normalized_payload:
                     body = dict(normalized_payload)
                     auth_value = body.pop('authorization')
                     request_variants.append((body, {"Authorization": auth_value},
                                              {"mecanisme": "jeton", "entete": "Authorization",
-                                              "valeur": str(auth_value).split(" ", 1)[-1]}))
-                for body, headers, variante in request_variants:
+                                              "valeur": str(auth_value).split(" ", 1)[-1]}, None))
+                for body, headers, variante, enveloppe in request_variants:
                     try:
                         self.logger.info("Testing /predict endpoint with adaptive payload...")
                         predict_response = requests.post(
@@ -1395,7 +1503,11 @@ class BentoMLRunner(BaseRunner):
                         results["predict_response"] = str(data)[:400]
                         predict_ok = (body, headers, data, variante)
                         results["mecanisme_acces"] = variante["mecanisme"]
-                        results["corps_source"] = source_du_corps(contract, payload)
+                        # L'enveloppe gagnante compte autant que le corps :
+                        # un corps du README à plat accepté seulement sous
+                        # un `input_data` deviné n'est pas documenté.
+                        results["corps_enveloppe"] = enveloppe
+                        results["corps_source"] = source_avec_enveloppe(contract, payload, enveloppe)
                         self.logger.info(f"✓ Prediction successful : {str(data)[:200]}")
                         break
                     except Exception as e:
@@ -1836,7 +1948,6 @@ class BentoMLRunner(BaseRunner):
             ]
         )
 
-        self.logger.info("Running pytest against running API...")
         env = os.environ.copy()
         env["BENTOML_BASE_URL"] = base_url
         env["BENTOML_PORT"] = base_url.rsplit(":", 1)[-1]
@@ -1852,15 +1963,21 @@ class BentoMLRunner(BaseRunner):
                     if n.strip()]
         for nom in noms_env:
             env.setdefault(nom, base_url)
-        # Le meme secret que le conteneur : des tests qui forgent leur propre
-        # jeton (459884 : JWT_SECRET_KEY partage via .env) doivent signer avec
-        # la cle que le service verifie.
-        for nom, valeur in self._env_required_by_image().items():
-            env.setdefault(nom, valeur)
         # Les tests importent le code de l'apprenant, qui vit dans le projet.
         env["PYTHONPATH"] = os.pathsep.join(
             [p for p in (projet, env.get("PYTHONPATH")) if p]
         )
+        # L'environnement du premier passage, tel que livré : l'adresse du
+        # service (port éphémère) et rien d'autre de notre part.
+        env_livre = dict(env)
+        # Le meme secret que le conteneur : des tests qui forgent leur propre
+        # jeton (459884 : JWT_SECRET_KEY partage via .env) doivent signer avec
+        # la cle que le service verifie.
+        secrets_image = self._env_required_by_image()
+        for nom, valeur in secrets_image.items():
+            env.setdefault(nom, valeur)
+        self._valeurs_a_masquer = [str(v) for v in secrets_image.values() if v and len(str(v)) >= 4]
+        self._noms_secrets_image = sorted(secrets_image)
 
         def lancer(commande, environnement_pytest=None):
             # Un rapport laissé par un passage précédent ne doit jamais être
@@ -1870,50 +1987,26 @@ class BentoMLRunner(BaseRunner):
             return subprocess.run(commande, cwd=projet, capture_output=True, text=True,
                                   env=environnement_pytest or env)
 
-        result = lancer(command)
-        # uv n'a pas pu installer les dépendances de la copie pour ce Python
-        # (rien n'a tourné, pas de rapport) : le suivant, consigné.
-        essais = [pythons[0]]
-        position = command.index("--python") + 1
-        for suivant in pythons[1:]:
-            sortie = (result.stdout or "") + (result.stderr or "")
-            if (result.returncode in (0, 5) or os.path.exists(junit_path)
-                    or not environnement.installation_impossible(sortie)):
-                break
-            self.logger.info(
-                f"Dépendances des tests non installables en Python {command[position]} : essai en {suivant}")
-            command[position] = suivant
-            essais.append(suivant)
-            result = lancer(command)
-        results["python"] = command[position]
-        results["pythons_essayes"] = essais
-
-        if result.returncode == 5:
-            # Pytest exit code 5 means nothing collected; retry with explicit python files.
-            discovered_files = fichiers_de_tests(patched_tests_path)
-            if discovered_files:
-                # Le lanceur pytest, pas l'argument de `--with pytest` : le
-                # premier « pytest » de la commande est un paquet à installer.
-                prefixe = command[: _position_pytest(command)]
-                retry_command = prefixe + [
-                    "pytest",
-                    *discovered_files,
-                    "-v",
-                    "--tb=short",
-                    "-p",
-                    "no:cacheprovider",
-                    "-o",
-                    "asyncio_mode=auto",
-                    *IGNORER_PARASITES_MACOS,
-                    f"--junit-xml={junit_path}",
-                ]
-                self.logger.info(
-                    "Pytest collected no tests by default pattern; retrying with explicit test files"
-                )
-                result = lancer(retry_command)
-
-        result = self._replis_pytest(result, command, env, lancer, patched_tests_path, projet,
-                                     junit_path, results)
+        # « On note ce qui a été livré, on mesure le reste avec la
+        # réparation » (responsable, 16/10). La checklist de l'énoncé demande
+        # « pytest -v passe » avec la seule archive livrée : premier passage
+        # sans rien de notre part, puis les réparations comme avant.
+        result, tel_que_livre = self._pytest_tel_que_livre(
+            pythons, requirements_path, patched_tests_path, junit_path, env_livre, lancer)
+        results["pytest_tel_que_livre"] = {k: v for k, v in tel_que_livre.items() if k != "sortie"}
+        if tel_que_livre["passe"]:
+            # Rien à réparer : le second passage n'apprendrait rien et coûte
+            # une installation de plus sur la VM.
+            results["python"] = tel_que_livre["python"]
+            results["pythons_essayes"] = tel_que_livre["pythons_essayes"]
+            results["paquets_injectes"] = []
+            results["reparations"] = []
+        else:
+            result = self._pytest_repare(command, pythons, patched_tests_path, projet, junit_path,
+                                         env, lancer, results)
+            results["paquets_injectes"] = _paquets_avec(command)
+            results["reparations"] = self._reparations(
+                tel_que_livre, command, requirements_path, patched_tests_path, projet, results)
 
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         with open(output_file, "w", encoding="utf-8") as handle:
@@ -1998,6 +2091,212 @@ class BentoMLRunner(BaseRunner):
         results["problem_lines"] = problem_lines[:50]
 
         return results
+
+    def _compter_tests(self, sortie: str, junit_path: str):
+        """(passed, failed, errors, total) : le rapport JUnit, sinon la prose
+        de pytest (qui ment quand la collecte échoue)."""
+        compte = self._read_junit_report(junit_path)
+        if compte is not None:
+            return compte
+        passed = sum(int(m) for m in re.findall(r"(\d+)\s+passed", sortie))
+        failed = sum(int(m) for m in re.findall(r"(\d+)\s+failed", sortie))
+        errors = sum(int(m) for m in re.findall(r"(\d+)\s+error", sortie))
+        return passed, failed, errors, passed + failed + errors
+
+    def _pytest_tel_que_livre(self, pythons, requirements_path, tests_path, junit_path, env, lancer):
+        """`pytest -v` avec le seul requirements.txt de la copie.
+
+        Aucun paquet injecté, pas d'`asyncio_mode=auto`, pas de code lu dans
+        l'image, pas de secret du conteneur, pas de relance. Restent à nous :
+        l'adresse du service (réécrite, port éphémère), le choix du Python
+        (essais successifs, comme le passage réparé) et les options du
+        harnais (rapport JUnit, ni cache ni fichiers AppleDouble). uvx fournit
+        le lanceur pytest : la checklist fait lancer `pytest -v` au correcteur.
+
+        Rend (résultat du dernier passage, constat) ; le constat dit si le
+        passage a réussi, et sinon à qui l'échec est imputable : la copie, ou
+        notre outillage (critère non mesuré)."""
+        commande = ["uvx", "--python", pythons[0]]
+        if os.path.isfile(requirements_path):
+            commande += ["--with-requirements", requirements_path]
+        commande += ["pytest", tests_path, "-v", "--tb=short", "-p", "no:cacheprovider",
+                     *IGNORER_PARASITES_MACOS, f"--junit-xml={junit_path}"]
+        self.logger.info("pytest tel que livré (requirements de la copie seul)...")
+        result = lancer(commande, env)
+        essais = [pythons[0]]
+        for suivant in pythons[1:]:
+            sortie = (result.stdout or "") + (result.stderr or "")
+            if (result.returncode in (0, 5) or os.path.exists(junit_path)
+                    or not environnement.installation_impossible(sortie)):
+                break
+            commande[2] = suivant
+            essais.append(suivant)
+            result = lancer(commande, env)
+        sortie = (result.stdout or "") + "\n" + (result.stderr or "")
+        rapport = os.path.exists(junit_path)
+        passed, failed, errors, total = self._compter_tests(sortie, junit_path)
+        passe = result.returncode == 0 and total > 0
+        imputable = cause = None
+        if not passe:
+            imputable, cause = self._imputer_tel_que_livre(
+                sortie, result.returncode, rapport, passed, failed, errors, total, essais)
+        constat = {
+            "passe": passe,
+            "passed": passed,
+            "failed": failed,
+            "errors": errors,
+            "total": total,
+            "code": result.returncode,
+            "cause": cause,
+            "imputable": imputable,
+            "commande": _commande_lisible(commande),
+            "python": commande[2],
+            "pythons_essayes": essais,
+            "sortie": sortie,
+        }
+        self.record_step(
+            "Lancer pytest tel que livré (requirements de la copie seul)",
+            command=constat["commande"],
+            output=_extrait(sortie, None, self._valeurs_a_masquer),
+            exit_code=result.returncode,
+            note=("pytest -v passe tel que livré." if passe else
+                  f"pytest -v ne passe pas tel que livré ({cause})."
+                  + (" Notre outillage en cause : critère non mesuré." if imputable == "outillage" else "")),
+        )
+        return result, constat
+
+    def _imputer_tel_que_livre(self, sortie, code, rapport, passed, failed, errors, total, essais):
+        """("copie" | "outillage", cause) d'un premier passage en échec.
+        Jamais un zéro pour notre absence de mesure : réseau, harnais et
+        installation impossible pour tous nos Python sont à nous."""
+        if not rapport and _RESEAU_UV.search(sortie):
+            ligne = _RESEAU_UV.search(sortie).group(0).strip()
+            return "outillage", f"index de paquets injoignable (réseau) : {ligne[:200]}"
+        if total and passed == 0 and failed + errors == total and _CONNEXION_REFUSEE.search(sortie):
+            return "outillage", (f"les {total} tests échouent tous en erreur de connexion : "
+                                 "harnais en cause (URL/port), pas la copie")
+        illisible = _REQUIREMENTS_ILLISIBLE.search(sortie)
+        if illisible:
+            return "copie", f"requirements.txt inutilisable : {illisible.group(0).strip()}"
+        if not rapport and environnement.installation_impossible(sortie):
+            return "outillage", ("dépendances de la copie non installables avec les Python essayés ("
+                                 + ", ".join(essais) + ") : imputation incertaine")
+        absent = _MODULE_ABSENT.search(sortie)
+        if absent:
+            return "copie", f"module absent de l'environnement livré : {absent.group(0)}"
+        if code == 5:
+            return "copie", "pytest ne collecte aucun test (code 5)"
+        if total == 0:
+            return "copie", f"collecte des tests en échec (code {code})"
+        return "copie", f"{failed + errors}/{total} tests en échec (code {code})"
+
+    def _pytest_repare(self, command, pythons, tests_path, projet, junit_path, env, lancer, results):
+        """Le passage d'avant la politique du 16/10 : outillage standard,
+        `asyncio_mode=auto`, relance sur fichiers explicites, puis les replis
+        (requirements illisible, code lu dans l'image)."""
+        self.logger.info("Running pytest against running API...")
+        result = lancer(command)
+        # uv n'a pas pu installer les dépendances de la copie pour ce Python
+        # (rien n'a tourné, pas de rapport) : le suivant, consigné.
+        essais = [pythons[0]]
+        position = command.index("--python") + 1
+        for suivant in pythons[1:]:
+            sortie = (result.stdout or "") + (result.stderr or "")
+            if (result.returncode in (0, 5) or os.path.exists(junit_path)
+                    or not environnement.installation_impossible(sortie)):
+                break
+            self.logger.info(
+                f"Dépendances des tests non installables en Python {command[position]} : essai en {suivant}")
+            command[position] = suivant
+            essais.append(suivant)
+            result = lancer(command)
+        results["python"] = command[position]
+        results["pythons_essayes"] = essais
+
+        if result.returncode == 5:
+            # Pytest exit code 5 means nothing collected; retry with explicit python files.
+            discovered_files = fichiers_de_tests(tests_path)
+            if discovered_files:
+                # Le lanceur pytest, pas l'argument de `--with pytest` : le
+                # premier « pytest » de la commande est un paquet à installer.
+                prefixe = command[: _position_pytest(command)]
+                retry_command = prefixe + [
+                    "pytest",
+                    *discovered_files,
+                    "-v",
+                    "--tb=short",
+                    "-p",
+                    "no:cacheprovider",
+                    "-o",
+                    "asyncio_mode=auto",
+                    *IGNORER_PARASITES_MACOS,
+                    f"--junit-xml={junit_path}",
+                ]
+                self.logger.info(
+                    "Pytest collected no tests by default pattern; retrying with explicit test files"
+                )
+                result = lancer(retry_command)
+                results["relance_fichiers_explicites"] = True
+
+        return self._replis_pytest(result, command, env, lancer, tests_path, projet,
+                                   junit_path, results)
+
+    def _reparations(self, tel_que_livre, command, requirements_path, tests_path, projet, results):
+        """Les réparations qui ont servi, chacune avec la preuve du premier
+        passage. Seulement celles dont on voit la raison : le feedback leur
+        attache des phrases imposées, une entrée de trop serait un reproche
+        faux."""
+        sortie = tel_que_livre.get("sortie", "")
+        masque = self._valeurs_a_masquer
+        reparations = []
+
+        def reparation(ident, applique, motif=None):
+            reparations.append({
+                "id": ident,
+                "critere_touche": "taux_pytest",
+                "tel_que_livre": {
+                    "commande": tel_que_livre["commande"],
+                    "code": tel_que_livre["code"],
+                    "extrait": _extrait(sortie, motif, masque),
+                },
+                "applique": applique,
+            })
+
+        if results.get("requirements_inutilisable"):
+            reparation("requirements_illisible", results.get("environnement_de_repli", ""),
+                       _REQUIREMENTS_ILLISIBLE)
+        if results.get("code_lu_dans_l_image"):
+            reparation("code_lu_dans_l_image", results["code_lu_dans_l_image"], _MODULE_ABSENT)
+        if not results.get("requirements_inutilisable"):
+            # Seulement les paquets dont l'absence a fait échouer le premier
+            # passage : un paquet non déclaré mais tiré par une dépendance
+            # (httpx par bentoml) n'a rien coûté à la copie.
+            absents = {PAQUET_DU_MODULE.get(m.split(".")[0], m.split(".")[0]).lower()
+                       for m in _MODULE_ABSENT.findall(sortie)}
+            injectes = {p.lower() for p in _paquets_avec(command)}
+            declares = _paquets_declares(requirements_path)
+            factice = [a for p in declares for a in ("--with", p)] + ["pytest"]
+            non_declares = [p for p in self._paquets_des_imports(tests_path, projet, factice)
+                            if p in injectes and p in absents and p != "pytest"]
+            if non_declares:
+                reparation("paquets_non_declares",
+                           "paquets importés par les tests, absents du requirements.txt, installés par le correcteur : "
+                           + ", ".join(non_declares), _MODULE_ABSENT)
+        if "asyncio_mode=auto" in command and _tests_async(tests_path) and _ASYNC.search(sortie):
+            reparation("asyncio_mode_auto",
+                       "tests `async def` exécutés par pytest-asyncio (fourni par le correcteur) en mode auto "
+                       "(-o asyncio_mode=auto)", _ASYNC)
+        noms = [n for n in getattr(self, "_noms_secrets_image", []) if _nomme_dans_les_tests(tests_path, n)]
+        if noms:
+            # Les tests lisent une variable que seul le conteneur définit
+            # (459884 : JWT_SECRET_KEY). Le nom, jamais la valeur.
+            reparation("secret_du_conteneur",
+                       "variable(s) d'environnement du conteneur fournies aux tests par le correcteur : "
+                       + ", ".join(noms))
+        if results.get("relance_fichiers_explicites"):
+            reparation("relance_fichiers_explicites",
+                       "aucun test collecté par la découverte par défaut : relance avec les fichiers de tests listés")
+        return reparations
 
     def _replis_pytest(self, result, command, env, lancer, tests_path, projet, junit_path, results):
         """Mesurer les tests de la copie quand leur environnement livré ne

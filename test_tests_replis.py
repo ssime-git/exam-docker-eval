@@ -95,7 +95,9 @@ def test_requirements_valide_aucun_repli(tmp_path, monkeypatch):
         return _Resultat(1, "1 failed")
     monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
     resultat = runner._run_pytest("http://localhost:32773")
-    assert len(appels) == 1 and resultat["failed"] == 1
+    # Tel que livré puis réparé (politique du 16/10), aucun repli de plus.
+    assert len(appels) == 2 and resultat["failed"] == 1
+    assert "--with" not in appels[0][:bentoml_runner._position_pytest(appels[0])]
     assert "requirements_inutilisable" not in resultat and "code_lu_dans_l_image" not in resultat
 
 
@@ -193,7 +195,8 @@ def test_module_absent_qui_n_est_pas_dans_l_image_aucun_repli(tmp_path, monkeypa
         return _Resultat(2, "E   ModuleNotFoundError: No module named 'jwt'\n")
     monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
     resultat = runner._run_pytest("http://localhost:32768")
-    assert len(uvx) == 1 and resultat["evaluable"] is False
+    # Tel que livré puis réparé : la lecture de l'image n'ajoute aucun passage.
+    assert len(uvx) == 2 and resultat["evaluable"] is False
     assert "code_lu_dans_l_image" not in resultat
 
 
@@ -209,13 +212,17 @@ def test_relance_sur_fichiers_explicites_garde_le_lanceur_pytest(tmp_path, monke
         if commande[0] == "docker":
             return _Resultat(0, "")
         commandes.append(commande)
-        if len(commandes) == 1:
+        # La découverte par défaut ne trouve rien (tel que livré comme
+        # réparé) ; la relance sur fichiers explicites, si.
+        if not commande[bentoml_runner._position_pytest(commande) + 1].endswith(".py"):
             return _Resultat(5, "no tests ran")
         junit(commande, 1)
         return _Resultat(0, "1 passed")
     monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
     resultat = runner._run_pytest("http://localhost:32773")
-    relance = commandes[-1]
-    assert relance[:5] == commandes[0][:5] and "--with" in relance[5:], relance
+    repare, relance = commandes[1], commandes[-1]
+    assert relance[:5] == repare[:5] and "--with" in relance[5:], relance
+    assert [r["id"] for r in resultat["reparations"]] == ["relance_fichiers_explicites"], resultat["reparations"]
+    assert resultat["pytest_tel_que_livre"]["code"] == 5
     assert relance[bentoml_runner._position_pytest(relance) + 1].endswith("verif_api.py"), relance
     assert resultat["passed"] == 1
