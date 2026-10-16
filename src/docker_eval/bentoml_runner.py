@@ -1114,7 +1114,10 @@ class BentoMLRunner(BaseRunner):
         # Sans lui, ni les identifiants ni la forme des payloads ne sont
         # connus, et le correcteur teste a cote : mauvais noms de champs,
         # mauvais nom de parametre. On lit donc le service dans l'image.
-        if not any(re.search(r"def\s+predict\s*\(", text) for _, text in texts):
+        # Un `def predict(` dans un test est un helper qui appelle l'API, pas
+        # le service : il ne dispense pas de lire l'image.
+        if not any(re.search(r"def\s+predict\s*\(", text) for chemin, text in texts
+                   if not looks_like_test_file(chemin)):
             in_image = self._read_service_from_image()
             if in_image:
                 self.logger.info(

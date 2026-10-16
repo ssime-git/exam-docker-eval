@@ -166,3 +166,31 @@ def test_corps_reconstruit_depuis_le_service_n_est_pas_documente(tmp_path):
     contrat = runner._discover_api_contract()
     assert source_du_corps(contrat, contrat["predict_bodies"][0]) == "source"
     assert json.dumps(contrat["predict_wrappers"][0]) == '"input_data"'
+
+
+def test_un_helper_predict_dans_les_tests_n_empeche_pas_de_lire_l_image(tmp_path):
+    """Le service se lit dans l'image quand le rendu n'en livre pas. Un
+    `def predict(` dans un fichier de test (helper qui appelle l'API) n'est
+    pas le service : il bloquait la lecture de l'image."""
+    racine = tmp_path / "rendu"
+    ecrire(racine / "README.md", "docker load -i admission_prediction_service.tar\n")
+    ecrire(racine / "tests" / "test_api.py",
+           "import requests\n\ndef predict(token, payload):\n"
+           "    return requests.post(URL + '/predict', json=payload, headers={'Authorization': token})\n")
+    runner = BentoMLRunner("x", str(tmp_path), 300, logging.getLogger("t"))
+    service = (
+        "import bentoml\nfrom pydantic import BaseModel\n\n"
+        "class AdmissionInput(BaseModel):\n    gre_score: float\n    cgpa: float\n\n"
+        "@bentoml.service\nclass S:\n    @bentoml.api\n"
+        "    def predict(self, input_data: AdmissionInput) -> dict:\n        return {}\n"
+    )
+    lus = []
+
+    def image():
+        lus.append(True)
+        return [("/home/bentoml/bento/src/service.py (dans l'image)", service)]
+    runner._read_service_from_image = image
+    contrat = runner._discover_api_contract()
+    assert lus, "le service n'a pas été lu dans l'image"
+    assert contrat["predict_wrappers"][0] == "input_data", contrat["predict_wrappers"]
+    assert source_du_corps(contrat, contrat["predict_bodies"][0]) == "image"
