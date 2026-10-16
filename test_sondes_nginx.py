@@ -383,11 +383,12 @@ def test_l_en_tete_de_l_enonce_est_toujours_envoye(tmp_path, monkeypatch):
     assert "X-Experiment-Group: debug" in etape["output"] and "X-Version: 2" in etape["output"]
 
 
-def test_admin_admin_d_abord_puis_les_identifiants_de_la_copie(tmp_path, monkeypatch):
+def test_les_identifiants_de_la_copie_d_abord_puis_admin_admin(tmp_path, monkeypatch):
+    # Politique du 16/10 : on note ce qui a été livré (voir test_lancement_tel_que_livre.py).
     runner, _ = runner_469145(tmp_path, monkeypatch)
     ecrire(tmp_path / "tests" / "run_tests.sh", RUN_TESTS.replace("admin:admin", "alice:secret"))
     candidats = runner._identifiants_candidats(runner._requete_predict())
-    assert candidats[:2] == ["admin:admin", "alice:secret"]
+    assert [c for c, _, _ in candidats[:2]] == ["alice:secret", "admin:admin"]
 
 
 def test_aucun_identifiant_accepte_se_dit(tmp_path, monkeypatch):
