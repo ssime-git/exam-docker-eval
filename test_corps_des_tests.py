@@ -203,3 +203,19 @@ def test_fichiers_de_l_image_sans_saut_de_ligne_final(tmp_path, monkeypatch):
         "/home/bentoml/bento/src/src/service.py (dans l'image)":
             "USERS = {}\ndef predict(self, input_data: InputModel): ...",
     }, lus
+
+
+def test_test_qui_exclut_200_ne_documente_rien():
+    """`!= 200` ou `not in (200, 201)` attend un refus : corps non lu."""
+    tests = '''import requests
+CORPS = {"gre_score": 320, "cgpa": 9.1}
+
+def test_refus():
+    r = requests.post("http://x/predict", json=CORPS)
+    assert r.status_code != 200
+
+def test_refus_bis():
+    r = requests.post("http://x/predict", json=CORPS)
+    assert r.status_code not in (200, 201)
+'''
+    assert bentoml_runner.corps_documentes_par_les_tests(tests) == []

@@ -466,7 +466,7 @@ def test_464154_code_de_l_image_puis_pkg_resources_absent(tmp_path, monkeypatch)
         chemins = env.get("PYTHONPATH", "").split(os.pathsep)
         if not any(c and os.path.isfile(os.path.join(c, "src", "service.py")) for c in chemins):
             return _Resultat(2, "E   ModuleNotFoundError: No module named 'src'\n")
-        if "setuptools<81" not in commande:
+        if "setuptools<82" not in commande:
             return _Resultat(2, ERREUR_PKG_RESOURCES)
         junit(commande, 7)
         return _Resultat(0, "=== 7 passed, 20 warnings in 4.39s ===\n"
@@ -480,8 +480,8 @@ def test_464154_code_de_l_image_puis_pkg_resources_absent(tmp_path, monkeypatch)
     etape = next(s for s in runner.steps if s["title"] == "Lancer les tests avec le code lu dans l'image")
     assert "No module named 'src'" not in etape["output"], etape
     assert etape["output"] == "=== 7 passed, 20 warnings in 4.39s ===", etape
-    assert "setuptools<81" in etape["note"], etape
-    assert any("setuptools<81" in p for p in passages)
+    assert "setuptools<82" in etape["note"], etape
+    assert any("setuptools<82" in p for p in passages)
 
 
 def test_setuptools_borne_seulement_sur_le_signal(tmp_path, monkeypatch):
@@ -501,4 +501,4 @@ def test_setuptools_borne_seulement_sur_le_signal(tmp_path, monkeypatch):
         return _Resultat(1, "1 failed")
     monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
     runner._run_pytest("http://localhost:32770")
-    assert not any("setuptools<81" in p for p in passages)
+    assert not any("setuptools<82" in p for p in passages)

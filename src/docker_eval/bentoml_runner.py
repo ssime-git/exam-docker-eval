@@ -193,12 +193,17 @@ def _attend_un_succes(fonction: ast.AST) -> bool:
         if not isinstance(noeud, ast.Compare):
             continue
         termes = [noeud.left, *noeud.comparators]
-        if not any(isinstance(t, ast.Attribute) and t.attr == "status_code" for t in termes):
-            continue
-        for terme in termes:
-            for feuille in ast.walk(terme):
-                if isinstance(feuille, ast.Constant) and feuille.value == 200:
-                    return True
+        # Paire par paire : `status_code == 200` ou `in (200, 201)` ; `!=`
+        # et `not in` attendent un refus.
+        for gauche, operateur, droite in zip(termes, noeud.ops, termes[1:]):
+            if not isinstance(operateur, (ast.Eq, ast.In)):
+                continue
+            paire = (gauche, droite)
+            if not any(isinstance(t, ast.Attribute) and t.attr == "status_code" for t in paire):
+                continue
+            if any(isinstance(f, ast.Constant) and f.value == 200 and not isinstance(f.value, bool)
+                   for t in paire for f in ast.walk(t)):
+                return True
     return False
 
 
@@ -272,8 +277,9 @@ PAQUET_DU_MODULE = {"jwt": "pyjwt", "yaml": "pyyaml", "sklearn": "scikit-learn",
                     "bs4": "beautifulsoup4", "cv2": "opencv-python-headless"}
 # Dossier du bento dans une image produite par `bentoml containerize`.
 CODE_DU_BENTO = "/home/bentoml/bento/src"
-# Dernière série de setuptools qui fournit encore `pkg_resources` (retiré en 82).
-SETUPTOOLS_AVEC_PKG_RESOURCES = "setuptools<81"
+# setuptools fournit encore `pkg_resources` en 81 (vérifié : 79, 80.9, 81.0
+# l'importent ; 82.0 et 84 non).
+SETUPTOOLS_AVEC_PKG_RESOURCES = "setuptools<82"
 
 
 def modules_importes(dossier: str) -> Dict[str, set]:
@@ -2680,7 +2686,7 @@ class BentoMLRunner(BaseRunner):
         """bentoml importe `pkg_resources` (via `fs`) ; setuptools ne le
         fournit plus depuis la version 82, et le `setuptools` que nous
         injectons sans borne résout à la dernière (464154 : 84). Notre
-        environnement, pas la copie : relance avec `setuptools<81`."""
+        environnement, pas la copie : relance avec `setuptools<82`."""
         sortie = (result.stdout or "") + "\n" + (result.stderr or "")
         if "No module named 'pkg_resources'" not in sortie or "setuptools" not in command:
             return result
