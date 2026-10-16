@@ -2266,6 +2266,9 @@ class BentoMLRunner(BaseRunner):
         result, tel_que_livre = self._pytest_tel_que_livre(
             pythons, requirements_path, patched_tests_path, junit_path, env_livre, lancer)
         results["pytest_tel_que_livre"] = {k: v for k, v in tel_que_livre.items() if k != "sortie"}
+        if tel_que_livre.get("derive_setuptools"):
+            # Adaptation à l'écosystème, hors `reparations[]`.
+            results["derive_setuptools"] = tel_que_livre["derive_setuptools"]
         if tel_que_livre["passe"]:
             # Rien à réparer : le second passage n'apprendrait rien et coûte
             # une installation de plus sur la VM.
@@ -2417,6 +2420,25 @@ class BentoMLRunner(BaseRunner):
             essais.append(suivant)
             result = lancer(commande, env)
         sortie = (result.stdout or "") + "\n" + (result.stderr or "")
+        # Dérive de l'écosystème, pas faute de la copie (décision du 16/10,
+        # même principe que la reconstruction datée) : bentoml importe
+        # `pkg_resources`, que setuptools >= 82, publié après le rendu, ne
+        # fournit plus. Une relance avec `setuptools<82`, dont le résultat
+        # reste celui du passage tel que livré : adaptation, ni réparation
+        # ni pénalité.
+        derive = None
+        if "No module named 'pkg_resources'" in sortie:
+            derive = {
+                "applique": SETUPTOOLS_AVEC_PKG_RESOURCES,
+                "motif": "pkg_resources absent : setuptools >= 82 publié après le rendu (dérive de l'écosystème)",
+                "extrait": _extrait(sortie, _MODULE_ABSENT, self._valeurs_a_masquer),
+            }
+            position = _position_pytest(commande)
+            commande[position:position] = ["--with", SETUPTOOLS_AVEC_PKG_RESOURCES]
+            self.logger.info("pkg_resources absent au passage tel que livré (dérive de setuptools) : relance avec "
+                             + SETUPTOOLS_AVEC_PKG_RESOURCES)
+            result = lancer(commande, env)
+            sortie = (result.stdout or "") + "\n" + (result.stderr or "")
         rapport = os.path.exists(junit_path)
         passed, failed, errors, total = self._compter_tests(sortie, junit_path)
         passe = result.returncode == 0 and total > 0
@@ -2440,6 +2462,8 @@ class BentoMLRunner(BaseRunner):
             "paquets_readme": list(paquets_readme),
             "sortie": sortie,
         }
+        if derive:
+            constat["derive_setuptools"] = derive
         self.record_step(
             "Lancer pytest tel que livré (requirements de la copie seul)",
             command=constat["commande"],
@@ -2453,7 +2477,9 @@ class BentoMLRunner(BaseRunner):
                     if constat["variables_documentees"] else "")
                  + (" Paquets installés comme le fait le README : "
                     + ", ".join(constat["paquets_readme"]) + "."
-                    if constat["paquets_readme"] else ""),
+                    if constat["paquets_readme"] else "")
+                 + (f" Dérive de l'écosystème (pkg_resources retiré de setuptools 82, publié après le rendu) : "
+                    f"rejoué avec {SETUPTOOLS_AVEC_PKG_RESOURCES}, sans pénalité." if derive else ""),
         )
         return result, constat
 

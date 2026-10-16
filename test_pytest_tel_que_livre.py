@@ -502,3 +502,42 @@ def test_setuptools_borne_seulement_sur_le_signal(tmp_path, monkeypatch):
     monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
     runner._run_pytest("http://localhost:32770")
     assert not any("setuptools<82" in p for p in passages)
+
+
+def test_tel_que_livre_derive_setuptools_sans_penalite(tmp_path, monkeypatch):
+    """Décision du coordinateur (16/10) : `pkg_resources` absent parce que
+    setuptools >= 82 est sorti après le rendu est une dérive de
+    l'écosystème. Le passage tel que livré est rejoué une fois avec
+    `setuptools<82` ; son résultat reste « tel que livré », exposé comme
+    adaptation (`derive_setuptools`), jamais dans `reparations[]`."""
+    ecrire(tmp_path / "requirements.txt", "bentoml==1.3.5\nrequests\npytest\n")
+    ecrire(tmp_path / "tests" / "test_api.py", "import bentoml\n\ndef test_a():\n    assert True\n")
+    runner = BentoMLRunner("x", str(tmp_path), 300, logging.getLogger("t"))
+    runner._env_required_by_image = lambda: {}
+    avec_uvx(monkeypatch)
+    passages = []
+
+    def faux_run(commande, **kwargs):
+        if commande[0] == "docker":
+            return _Resultat(0, "")
+        passages.append(list(commande))
+        if "setuptools<82" not in commande:
+            return _Resultat(2, ERREUR_PKG_RESOURCES)
+        junit(commande, 3)
+        return _Resultat(0, "=== 3 passed in 1.0s ===")
+    monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
+
+    resultat = runner._run_pytest("http://localhost:32770")
+
+    tql = resultat["pytest_tel_que_livre"]
+    assert tql["passe"] is True and tql["passed"] == 3, tql
+    assert tql["imputable"] is None, tql
+    assert tql["derive_setuptools"]["applique"] == "setuptools<82", tql
+    assert "pkg_resources" in tql["derive_setuptools"]["extrait"], tql
+    assert "setuptools<82" in tql["commande"], tql
+    assert resultat["derive_setuptools"] == tql["derive_setuptools"]
+    ids = {r["id"] for r in resultat["reparations"]}
+    assert not any("setuptools" in i or "derive" in i for i in ids), ids
+    # Premier passage sans rien de notre part, relance unique.
+    premiers = [p for p in passages if tel_que_livre(p)]
+    assert len(premiers) == 1, passages
