@@ -242,6 +242,10 @@ def fichiers_de_tests(dossier: str) -> list:
 
 # Que pytest ignore lui-même ces parasites : `._x_test.py` correspond au motif
 # `*_test.py` et serait collecté.
+# Les noms sous lesquels les tests des apprenants attendent l'adresse du
+# service ; EXAM_TEST_ENV (pi_test_env) s'y ajoute.
+NOMS_URL_PAR_DEFAUT = "BASE_URL,API_URL,SERVICE_URL,SERVICE_BASE_URL,API_BASE_URL,BENTO_URL"
+
 IGNORER_PARASITES_MACOS = ["--ignore-glob=*/._*", "--ignore-glob=*/__MACOSX/*"]
 
 
@@ -303,6 +307,132 @@ def _nomme_dans_les_tests(tests_path: str, nom: str) -> bool:
         except (OSError, UnicodeDecodeError):
             continue
     return False
+
+
+# `os.getenv("API_BASE_URL", "http://127.0.0.1:3001")` : le nom sous lequel
+# les tests attendent l'adresse du service, quel que soit le port documenté.
+_URL_LUE_PAR_LES_TESTS = re.compile(
+    r'(?:getenv|environ\.get)\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*,\s*'
+    r'f?["\']https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?')
+_URL_LOCALE = re.compile(r"^https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?(?:/|$)")
+# Les fichiers où une copie documente son environnement : le README et les
+# modèles de .env livrés pour être copiés.
+_FICHIER_DOCUMENTATION = re.compile(
+    r"^(?:readme(?:\.[a-z]+)?|\.?env\.(?:example|sample|template|dist)|example\.env)$", re.I)
+_AFFECTATION_DOCUMENTEE = re.compile(
+    r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s#]+)\s*(?:#.*)?$", re.M)
+
+
+def _noms_d_url_lus_par_les_tests(tests_path: str) -> list:
+    """Les variables d'environnement d'où les tests lisent l'adresse du
+    service. 462853 lisait API_BASE_URL, absente de la convention du skill
+    (`pi_test_env: BASE_URL,API_URL,SERVICE_URL`) : son défaut
+    127.0.0.1:3001 ne répondait pas, 20/20 « API indisponible »."""
+    noms = []
+    for chemin in fichiers_de_tests(tests_path):
+        try:
+            with open(chemin, encoding="utf-8") as f:
+                contenu = f.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for nom in _URL_LUE_PAR_LES_TESTS.findall(contenu):
+            if nom not in noms:
+                noms.append(nom)
+    return noms
+
+
+def _variables_documentees(racine: str) -> Dict[str, str]:
+    """`export NOM=valeur` du README ou d'un .env d'exemple livré.
+
+    Les exporter avant `pytest -v`, c'est suivre la copie : l'énoncé fait
+    jouer les commandes du README telles quelles (1.6). Les consignes
+    (`<VOTRE_CLE>`, `$AUTRE`) ne sont pas des valeurs."""
+    documentees: Dict[str, str] = {}
+    for dossier, sous_dossiers, fichiers in os.walk(racine):
+        sous_dossiers[:] = [d for d in sous_dossiers
+                            if d not in ("__MACOSX", ".git", "node_modules", ".venv", "venv")]
+        for nom_fichier in sorted(fichiers):
+            if nom_fichier.startswith("._") or not _FICHIER_DOCUMENTATION.match(nom_fichier):
+                continue
+            chemin = os.path.join(dossier, nom_fichier)
+            try:
+                if os.path.getsize(chemin) > 200_000:
+                    continue
+                with open(chemin, encoding="utf-8", errors="replace") as f:
+                    contenu = f.read()
+            except OSError:
+                continue
+            for nom, valeur in _AFFECTATION_DOCUMENTEE.findall(contenu):
+                valeur = valeur.strip("\"'")
+                if not valeur or any(c in valeur for c in "<>$"):
+                    continue
+                documentees.setdefault(nom, valeur)
+    return documentees
+
+
+_PIP_INSTALL = re.compile(
+    r"^\s*(?:\$\s*)?(?:sudo\s+)?(?:python3?\s+-m\s+|uv\s+)?pip3?\s+install\s+(.+)$", re.M)
+# Options de `pip install` suivies d'une valeur qui n'est pas un paquet.
+_OPTIONS_A_VALEUR = {"-i", "--index-url", "--extra-index-url", "-f", "--find-links",
+                     "--target", "-t", "--prefix", "--root", "--python", "--trusted-host"}
+
+
+def _installations_du_readme(racine: str):
+    """(paquets, fichiers de requirements) que le README fait installer avec
+    `pip install`, dans l'ordre. 466697 : `pip install pytest requests`
+    après `pip install -r requirements.txt`, requests absent du
+    requirements.txt. Seules les lignes de commande comptent, pas la prose ;
+    `pip` lui-même et les installations locales (`-e .`) sont écartés."""
+    import shlex
+
+    paquets, fichiers = [], []
+    for dossier, sous_dossiers, noms in os.walk(racine):
+        sous_dossiers[:] = [d for d in sous_dossiers
+                            if d not in ("__MACOSX", ".git", "node_modules", ".venv", "venv")]
+        for nom_fichier in sorted(noms):
+            if nom_fichier.startswith("._") or not re.match(r"^readme(?:\.[a-z]+)?$", nom_fichier, re.I):
+                continue
+            chemin = os.path.join(dossier, nom_fichier)
+            try:
+                if os.path.getsize(chemin) > 200_000:
+                    continue
+                with open(chemin, encoding="utf-8", errors="replace") as f:
+                    contenu = re.sub(r"\\\n\s*", " ", f.read())
+            except OSError:
+                continue
+            for arguments in _PIP_INSTALL.findall(contenu):
+                try:
+                    jetons = shlex.split(arguments.split("#", 1)[0])
+                except ValueError:
+                    continue
+                suivant_ignore = suivant_fichier = False
+                for jeton in jetons:
+                    if jeton in ("&&", ";", "||", "|"):
+                        break
+                    if suivant_fichier:
+                        candidat = os.path.normpath(os.path.join(dossier, jeton))
+                        if os.path.isfile(candidat) and candidat not in fichiers:
+                            fichiers.append(candidat)
+                        suivant_fichier = False
+                        continue
+                    if suivant_ignore:
+                        suivant_ignore = False
+                        continue
+                    if jeton in ("-r", "--requirement"):
+                        suivant_fichier = True
+                        continue
+                    if jeton in ("-e", "--editable", "-c", "--constraint") or jeton in _OPTIONS_A_VALEUR:
+                        suivant_ignore = True
+                        continue
+                    if jeton.startswith("-") or jeton in (".", "..") or "/" in jeton:
+                        continue
+                    # pip lui-même ; une consigne (`<paquet>`, `$PAQUETS`).
+                    if (re.match(r"^pip(?:[<>=!~\[]|$)", jeton, re.I)
+                            or jeton.startswith("<") or "$" in jeton):
+                        continue
+                    if jeton not in paquets:
+                        paquets.append(jeton)
+    return paquets, fichiers
 
 
 def _expurger(texte: str, valeurs=()) -> str:
@@ -1918,6 +2048,14 @@ class BentoMLRunner(BaseRunner):
              if paquet.strip() for arg in ("--with", paquet.strip())]
         if os.path.isfile(requirements_path):
             command.extend(["--with-requirements", requirements_path])
+        # Le passage réparé garde ce que le README fait installer.
+        paquets_readme, fichiers_readme = _installations_du_readme(self.eval_dir)
+        for fichier in fichiers_readme:
+            if fichier != os.path.normpath(requirements_path):
+                command.extend(["--with-requirements", fichier])
+        for paquet in paquets_readme:
+            if paquet not in _paquets_avec(command):
+                command.extend(["--with", paquet])
         patched_tests_path = self._prepare_tests_for_dynamic_base_url(
             tests_path, base_url
         )
@@ -1957,26 +2095,55 @@ class BentoMLRunner(BaseRunner):
         # BENTOML_BASE_URL : son repli localhost:3000 partait en connexion
         # refusée et ses 7 tests « échouaient ». Exporter les conventions
         # courantes ne coûte rien et note ce que les tests valent vraiment.
-        # Convention d'examen declarable (pi_test_env, #49).
-        noms_env = [n.strip() for n in (os.environ.get("EXAM_TEST_ENV")
-                                        or "BASE_URL,API_URL,SERVICE_URL,SERVICE_BASE_URL,API_BASE_URL,BENTO_URL").split(",")
-                    if n.strip()]
+        # Convention d'examen declarable (pi_test_env, #49) : elle s'ajoute à
+        # la liste par défaut, elle ne la remplace pas. 462853 : le skill
+        # déclarait BASE_URL,API_URL,SERVICE_URL, API_BASE_URL disparaissait
+        # et les 20 tests visaient 127.0.0.1:3001.
+        noms_env = []
+        for n in (NOMS_URL_PAR_DEFAUT + "," + (os.environ.get("EXAM_TEST_ENV") or "")).split(","):
+            if n.strip() and n.strip() not in noms_env:
+                noms_env.append(n.strip())
         for nom in noms_env:
             env.setdefault(nom, base_url)
+        # Le nom que les tests lisent vraiment, en plus de la convention : une
+        # convention déclarée remplace la liste par défaut et peut l'omettre
+        # (462853 : API_BASE_URL). Affecté, pas setdefault : une valeur
+        # laissée dans l'environnement de la machine viserait un autre service.
+        noms_url = _noms_d_url_lus_par_les_tests(patched_tests_path)
+        for nom in noms_url:
+            env[nom] = base_url
         # Les tests importent le code de l'apprenant, qui vit dans le projet.
         env["PYTHONPATH"] = os.pathsep.join(
             [p for p in (projet, env.get("PYTHONPATH")) if p]
         )
-        # L'environnement du premier passage, tel que livré : l'adresse du
-        # service (port éphémère) et rien d'autre de notre part.
-        env_livre = dict(env)
         # Le meme secret que le conteneur : des tests qui forgent leur propre
         # jeton (459884 : JWT_SECRET_KEY partage via .env) doivent signer avec
         # la cle que le service verifie.
         secrets_image = self._env_required_by_image()
+        # Ce que la copie documente (README, .env d'exemple) et que ses tests
+        # lisent : l'exporter, c'est suivre la copie, pas la réparer (462853 :
+        # le README exporte API_USERNAME, API_PASSWORD, JWT_SECRET avant
+        # `pytest -v`). La valeur du conteneur quand il en a une : il a été
+        # lancé avec la valeur documentée. L'adresse reste la nôtre.
+        documentees = {}
+        for nom, valeur in _variables_documentees(self.eval_dir).items():
+            if (nom in noms_url or nom in noms_env or nom.startswith("BENTOML_")
+                    or _URL_LOCALE.match(valeur)
+                    or not _nomme_dans_les_tests(patched_tests_path, nom)):
+                continue
+            documentees[nom] = secrets_image.get(nom, valeur)
+        self._noms_documentes = sorted(documentees)
+        results["variables_documentees"] = self._noms_documentes
+        # L'environnement du premier passage, tel que livré : l'adresse du
+        # service (port éphémère), ce que la copie documente, rien d'autre.
+        env_livre = dict(env)
+        env_livre.update(documentees)
         for nom, valeur in secrets_image.items():
             env.setdefault(nom, valeur)
-        self._valeurs_a_masquer = [str(v) for v in secrets_image.values() if v and len(str(v)) >= 4]
+        for nom, valeur in documentees.items():
+            env.setdefault(nom, valeur)
+        self._valeurs_a_masquer = [str(v) for v in list(secrets_image.values()) + list(documentees.values())
+                                   if v and len(str(v)) >= 4]
         self._noms_secrets_image = sorted(secrets_image)
 
         def lancer(commande, environnement_pytest=None):
@@ -2107,8 +2274,11 @@ class BentoMLRunner(BaseRunner):
         """`pytest -v` avec le seul requirements.txt de la copie.
 
         Aucun paquet injecté, pas d'`asyncio_mode=auto`, pas de code lu dans
-        l'image, pas de secret du conteneur, pas de relance. Restent à nous :
-        l'adresse du service (réécrite, port éphémère), le choix du Python
+        l'image, pas de secret du conteneur que la copie ne documente pas, pas
+        de relance. Les variables exportées par son README (ou un .env
+        d'exemple) et lues par ses tests sont fournies : c'est suivre la copie.
+        Restent à nous : l'adresse du service (réécrite, port éphémère, sous
+        chaque nom que les tests lisent), le choix du Python
         (essais successifs, comme le passage réparé) et les options du
         harnais (rapport JUnit, ni cache ni fichiers AppleDouble). uvx fournit
         le lanceur pytest : la checklist fait lancer `pytest -v` au correcteur.
@@ -2119,6 +2289,15 @@ class BentoMLRunner(BaseRunner):
         commande = ["uvx", "--python", pythons[0]]
         if os.path.isfile(requirements_path):
             commande += ["--with-requirements", requirements_path]
+        # Les `pip install` du README, joués comme il les écrit (466697 :
+        # `pip install pytest requests`) : les suivre n'est pas réparer.
+        paquets_readme, fichiers_readme = _installations_du_readme(self.eval_dir)
+        principal = os.path.normpath(requirements_path)
+        for fichier in fichiers_readme:
+            if fichier != principal:
+                commande += ["--with-requirements", fichier]
+        for paquet in paquets_readme:
+            commande += ["--with", paquet]
         commande += ["pytest", tests_path, "-v", "--tb=short", "-p", "no:cacheprovider",
                      *IGNORER_PARASITES_MACOS, f"--junit-xml={junit_path}"]
         self.logger.info("pytest tel que livré (requirements de la copie seul)...")
@@ -2152,6 +2331,8 @@ class BentoMLRunner(BaseRunner):
             "commande": _commande_lisible(commande),
             "python": commande[2],
             "pythons_essayes": essais,
+            "variables_documentees": list(getattr(self, "_noms_documentes", [])),
+            "paquets_readme": list(paquets_readme),
             "sortie": sortie,
         }
         self.record_step(
@@ -2161,7 +2342,13 @@ class BentoMLRunner(BaseRunner):
             exit_code=result.returncode,
             note=("pytest -v passe tel que livré." if passe else
                   f"pytest -v ne passe pas tel que livré ({cause})."
-                  + (" Notre outillage en cause : critère non mesuré." if imputable == "outillage" else "")),
+                  + (" Notre outillage en cause : critère non mesuré." if imputable == "outillage" else ""))
+                 + (" Variables exportées comme le documente la copie : "
+                    + ", ".join(constat["variables_documentees"]) + "."
+                    if constat["variables_documentees"] else "")
+                 + (" Paquets installés comme le fait le README : "
+                    + ", ".join(constat["paquets_readme"]) + "."
+                    if constat["paquets_readme"] else ""),
         )
         return result, constat
 
@@ -2286,7 +2473,11 @@ class BentoMLRunner(BaseRunner):
             reparation("asyncio_mode_auto",
                        "tests `async def` exécutés par pytest-asyncio (fourni par le correcteur) en mode auto "
                        "(-o asyncio_mode=auto)", _ASYNC)
-        noms = [n for n in getattr(self, "_noms_secrets_image", []) if _nomme_dans_les_tests(tests_path, n)]
+        # Une variable documentée par la copie a été fournie dès le premier
+        # passage : la suivre n'a rien coûté.
+        documentes = set(getattr(self, "_noms_documentes", []))
+        noms = [n for n in getattr(self, "_noms_secrets_image", [])
+                if n not in documentes and _nomme_dans_les_tests(tests_path, n)]
         if noms:
             # Les tests lisent une variable que seul le conteneur définit
             # (459884 : JWT_SECRET_KEY). Le nom, jamais la valeur.
