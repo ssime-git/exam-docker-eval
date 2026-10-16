@@ -19,6 +19,7 @@ from .sonde_http import contexte_tls_permissif, resume, sonder
 from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN, REESSAI_SANTE_MAX
 from . import diagnostic_demarrage
 from . import lancement
+from . import reconstruction_datee
 
 
 # Les quatre noms que docker compose accepte lui-meme, dans son ordre de
@@ -575,6 +576,12 @@ class ComposeRunner(BaseRunner):
         self._env_fabrique = None
         self._fichiers_rapatries = []
         self._originaux = {}
+        # Reconstruction datée (467094) : date de référence du rendu, relevée
+        # avant toute écriture du harnais dans la copie de travail, et
+        # résultat de l'unique reconstruction tentée.
+        self._date_reference = None
+        self._reconstruction = None
+        self._fichiers_harnais = []
 
     @staticmethod
     def _nom_fixe_en_alias(service: dict) -> bool:
@@ -815,6 +822,7 @@ class ComposeRunner(BaseRunner):
 
         run_started = self._debut_evaluation = time.time()
         self.record_submission_step()
+        self._relever_date_reference()
         try:
             compose_resolution_started = time.time()
             dossier, candidats = dossier_du_compose(self.eval_dir)
@@ -854,6 +862,7 @@ class ComposeRunner(BaseRunner):
                 exit_code=0,
                 duration=time.time() - compose_resolution_started,
             )
+            self._consigner_date_reference()
 
             # Passage « lancement tel que livré » (politique du 16/10) : la
             # commande de l'énoncé, jouée par make dans le conteneur jetable.
@@ -1018,7 +1027,20 @@ class ComposeRunner(BaseRunner):
             self.logger.info("Starting Docker Compose services...")
             compose_started = time.time()
             try:
-                with _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate, deja_demarre):
+                demarrage = _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate, deja_demarre)
+                if not deja_demarre:
+                    try:
+                        demarrage.__enter__()
+                    except Exception as echec_up:
+                        # Une seule reconstruction, aux versions de la date du
+                        # rendu, sur un conflit de versions (467094).
+                        nom_datee = self._tenter_reconstruction_datee(compose_name, echec_up)
+                        if nom_datee is None:
+                            raise
+                        compose_name = nom_datee
+                        commande_up = f"docker compose -f {nom_datee} up --build (reconstruction datée)"
+                    demarrage = _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate, True)
+                with demarrage:
                     self.record_step(
                         "Build et démarrage Compose",
                         command=commande_up,
@@ -2173,7 +2195,213 @@ class ComposeRunner(BaseRunner):
             result["lancement_tel_que_livre"] = {k: v for k, v in self._lancement.items() if k != "up"}
         if isinstance(result, dict):
             result["reparations"] = list(self._reparations)
+            if self._date_reference is not None:
+                result["date_reference"] = dict(self._date_reference)
+            if self._reconstruction is not None:
+                result["reconstruction_datee"] = dict(self._reconstruction)
         return result
+
+    # --- Reconstruction datée (467094) -------------------------------------
+
+    def _relever_date_reference(self) -> None:
+        """La date de référence du rendu, relevée avant que le harnais n'écrive
+        dans la copie de travail (.env, compose relâché, fichiers rapatriés) ;
+        consignée après la résolution du fichier Compose."""
+        debut = time.time()
+        try:
+            self._date_reference = reconstruction_datee.date_reference(self.eval_dir)
+        except Exception as erreur:
+            self._date_reference = {"date_reference": None, "fichier": None, "ignores": 0,
+                                    "source": f"date de référence illisible : {erreur}"}
+        self._duree_date_reference = time.time() - debut
+
+    def _consigner_date_reference(self) -> None:
+        ref = self._date_reference
+        self.record_step(
+            "Date de référence du rendu",
+            command="mtime le plus récent des fichiers extraits (lstat, sans __MACOSX ni ._*)",
+            output=f"{ref['date_reference'] or 'aucune'} — {ref['source']}",
+            exit_code=0,
+            duration=getattr(self, "_duree_date_reference", 0),
+            note=("Borne inférieure de la date de rendu : un paquet publié avant existait au rendu. "
+                  "Sert à la reconstruction datée si la stack tombe sur un conflit de versions."),
+        )
+
+    def _images_des_services_construits(self) -> dict:
+        """{service: ID d'image} des services construits pour cette copie."""
+        images = {}
+        prefixe = self.project_name.lower()
+        for conteneur in self._conteneurs_du_projet():
+            service = conteneur.labels.get("com.docker.compose.service", conteneur.name)
+            try:
+                image = conteneur.image
+                tags = image.tags or []
+            except Exception:
+                continue
+            if any(t.lower().startswith(prefixe) for t in tags):
+                images[service] = image.id
+        return images
+
+    def _freeze_image(self, image: str) -> str:
+        """`pip freeze` dans l'image construite : conteneur jetable, sans réseau."""
+        import docker
+        client = docker.from_env()
+        conteneur = client.containers.create(
+            image, entrypoint=["sh", "-c", "python -m pip freeze 2>/dev/null || python3 -m pip freeze"],
+            network_disabled=True, labels={"scriptorium.role": "freeze-reconstruction-datee"})
+        try:
+            conteneur.start()
+            conteneur.wait(timeout=120)
+            return conteneur.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
+        finally:
+            try:
+                conteneur.remove(force=True)
+            except Exception:
+                pass
+
+    def _pypi_json(self, nom: str):
+        import requests
+        try:
+            reponse = requests.get(f"https://pypi.org/pypi/{nom}/json", timeout=30)
+            return reponse.json() if reponse.status_code == 200 else None
+        except Exception:
+            return None
+
+    def _tenter_reconstruction_datee(self, compose_name: str, exc: Exception) -> str | None:
+        """Rebâtir une fois la stack aux versions de la date du rendu.
+
+        Seulement sur un conflit de versions entre dépendances (467094). Rend
+        le nom du compose dérivé si la stack devient saine, l'évaluation
+        continue alors dessus ; sinon None, et le classement initial reste.
+        """
+        cause = self._cause_demarrage
+        if self._reconstruction is not None or not reconstruction_datee.doit_reconstruire(cause):
+            return None
+        debut = time.time()
+        initiale = dict(cause)
+        service_cause = initiale.get("service")
+        preuve = ((initiale.get("services") or {}).get(service_cause) or {}).get("extrait") \
+            or initiale.get("preuve", "")
+        ref = self._date_reference or {}
+        date_iso = ref.get("date_reference")
+        self._reconstruction = {
+            "date_reference": date_iso, "source": ref.get("source"),
+            "methode": ("Dockerfile dérivé (dockerfile_inline d'un compose dérivé dans la copie de travail) : "
+                        "ARG PIP_CONSTRAINT vers des contraintes `paquet!=version` (versions publiées après "
+                        "la date, d'après l'API JSON de PyPI, pour les paquets installés non épinglés), "
+                        "ARG PIP_UPLOADED_PRIOR_TO (pip ≥ 26) et ARG UV_EXCLUDE_NEWER (uv)"),
+            "paquets_contraints": [], "resultat": "echec", "extrait": "", "preuve": preuve,
+        }
+
+        def terminer(extrait: str, code: int) -> None:
+            self._reconstruction["extrait"] = lancement.masquer_secrets(extrait)[-1500:]
+            self.record_step(
+                "Reconstruction datée",
+                command=f"docker compose -f {reconstruction_datee.COMPOSE_DATE} up --build "
+                        f"(paquets contraints au {date_iso or '?'})",
+                output=f"résultat : {self._reconstruction['resultat']}\n{self._reconstruction['extrait']}",
+                exit_code=code,
+                duration=time.time() - debut,
+                note=("Une copie qui marchait à la date du rendu est notée sur une reconstruction aux "
+                      "versions de l'époque ; ses dépendances non figées coûtent au plus un point."),
+            )
+
+        if not date_iso:
+            terminer(f"non tentée : pas de date de référence ({ref.get('source')})", 2)
+            return None
+        restant = self.timeout - (time.time() - self._debut_evaluation)
+        if restant < 180:
+            terminer(f"non tentée : {restant:.0f}s de budget restant, trop peu pour un build", 2)
+            return None
+        try:
+            import yaml
+            images = self._images_des_services_construits()
+            with open(os.path.join(self.eval_dir, compose_name), encoding="utf-8") as lecteur:
+                doc = yaml.safe_load(lecteur) or {}
+            if not images:
+                terminer("non tentée : aucun service construit par la copie, rien à reconstruire", 2)
+                return None
+            date = reconstruction_datee.lire_iso(date_iso)
+            cache = {}
+
+            def pypi(nom):
+                if nom not in cache:
+                    cache[nom] = self._pypi_json(nom)
+                return cache[nom]
+
+            par_service, notes = {}, []
+            services = (doc.get("services") or {})
+            for service, image in sorted(images.items()):
+                build = reconstruction_datee._build(services.get(service) or {}) or {}
+                noms = reconstruction_datee.epingles(
+                    reconstruction_datee.requirements_du_contexte(build, self.eval_dir))
+                try:
+                    freeze = self._freeze_image(image)
+                except Exception as erreur:
+                    notes.append(f"{service} : pip freeze impossible ({erreur})")
+                    continue
+                lignes, contraints, remarques = reconstruction_datee.contraintes(freeze, noms, pypi, date)
+                par_service[service] = lignes
+                notes += [f"{service} : {r}" for r in remarques]
+                for paquet in contraints:
+                    self._reconstruction["paquets_contraints"].append({"service": service, **paquet})
+            derive = reconstruction_datee.compose_date(doc, self.eval_dir, date_iso, par_service)
+            chemin = os.path.join(self.eval_dir, reconstruction_datee.COMPOSE_DATE)
+            with open(chemin, "w", encoding="utf-8") as sortie:
+                yaml.safe_dump(derive, sortie, sort_keys=False, allow_unicode=True)
+            self._fichiers_harnais.append(chemin)
+            # Même tag, nouvel ID après le rebuild : l'ancienne image deviendrait
+            # orpheline et échapperait au ménage par nom.
+            for image in images.values():
+                self.record_exam_image(image)
+            try:
+                if self.compose is not None:
+                    self.compose.stop()
+            except Exception as erreur:
+                notes.append(f"arrêt de la stack d'origine : {erreur}")
+            self._cause_demarrage = None
+            self.compose = DockerCompose(context=self.eval_dir, compose_file_name=reconstruction_datee.COMPOSE_DATE,
+                                         pull=False, build=True, env_file=None)
+            contraints = ", ".join(f"{p['service']} : {p['paquet']} {p['installe']} (exclues : {', '.join(p['exclues'])})"
+                                   for p in self._reconstruction["paquets_contraints"]) or "aucun"
+            resume_contraintes = f"paquets contraints : {contraints}" + (
+                "\n" + "\n".join(notes) if notes else "")
+            try:
+                _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate).__enter__()
+            except Exception as second:
+                nouvelle = self._cause_demarrage
+                self._cause_demarrage = initiale
+                terminer(f"{resume_contraintes}\nla stack reconstruite ne démarre pas non plus "
+                         f"(cause : {(nouvelle or {}).get('cause', 'non classée')}) : {second}", 1)
+                return None
+        except Exception as erreur:
+            self._cause_demarrage = initiale
+            terminer(f"reconstruction interrompue : {erreur}", 2)
+            return None
+        self._retenir_images_de_la_copie()
+        self._reconstruction["resultat"] = "saine"
+        reessai = (self._cause_demarrage or {}).get("reessai")
+        self._cause_demarrage = {
+            "imputation": "copie_datee", "cause": "derive_dependance", "service": service_cause,
+            "preuve": (f"la stack ne démarre plus avec les versions publiées après le rendu ({preuve}) ; "
+                       f"saine reconstruite aux versions du {reconstruction_datee.date_lisible(date_iso)}"),
+            "services": initiale.get("services"), "reessai": reessai, "cause_initiale": initiale,
+        }
+        etape = getattr(self, "_etape_diagnostic", None)
+        if etape is not None:
+            etape["exit_code"] = 0
+            etape["output"] += ("\nreconstruction datée : la stack démarre aux versions du "
+                                f"{reconstruction_datee.date_lisible(date_iso)} → imputation copie_datee.")
+        self._reparations.append({
+            "id": "reconstruction_datee",
+            "critere_touche": "reproductibilite",
+            "tel_que_livre": {"commande": f"docker compose -f {compose_name} up --build", "code": 1,
+                              "extrait": lancement.masquer_secrets(f"{service_cause} : {preuve}")[-600:]},
+            "applique": (f"stack reconstruite avec les paquets publiés au plus tard le {date_iso} "
+                         f"({contraints})"),
+        })
+        terminer(resume_contraintes, 0)
+        return reconstruction_datee.COMPOSE_DATE
 
     def _racine_monitoring(self, sondes_racine: list, mots: tuple, port: int, exclure: str | None = None):
         """L'URL hôte d'un service de monitoring : par son nom de conteneur,
@@ -2655,7 +2883,10 @@ class ComposeRunner(BaseRunner):
             result["cause_demarrage"] = self._cause_demarrage
             # Un `up` relancé avec succès laisse l'évaluation imputer seule.
             reessai = self._cause_demarrage.get("reessai") or {}
-            if reessai.get("resultat") != "sain":
+            # Reconstruction datée saine : la stack a été évaluée, la copie
+            # fonctionnait à la date du rendu, pas de faute à poser.
+            reconstruite = (self._reconstruction or {}).get("resultat") == "saine"
+            if reessai.get("resultat") != "sain" and not reconstruite:
                 result.setdefault("fault", diagnostic_demarrage.FAUTE_DU_CONTRAT.get(
                     self._cause_demarrage["imputation"], "indetermine"))
         return result
@@ -2859,6 +3090,14 @@ class ComposeRunner(BaseRunner):
         # interpoler le fichier pour démonter la stack (469217). Les fichiers
         # produits par la recette (rapatriés) suivent la même règle.
         errors.extend(self._retirer_rapatries())
+        for chemin in list(self._fichiers_harnais):
+            try:
+                os.remove(chemin)
+                self._fichiers_harnais.remove(chemin)
+            except FileNotFoundError:
+                self._fichiers_harnais.remove(chemin)
+            except OSError as e:
+                errors.append(f"{os.path.basename(chemin)} du harnais non retiré : {e}")
         if self._env_cree:
             try:
                 os.remove(self._env_cree)
