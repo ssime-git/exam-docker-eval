@@ -16,7 +16,8 @@ from testcontainers.compose import DockerCompose
 from .base_runner import BaseRunner
 from . import sondes_nginx, sondes_prometheus
 from .sonde_http import contexte_tls_permissif, resume, sonder
-from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN
+from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN, REESSAI_SANTE_MAX
+from . import diagnostic_demarrage
 
 
 # Les quatre noms que docker compose accepte lui-meme, dans son ordre de
@@ -462,13 +463,27 @@ class _DemarrageSansDemontage:
     """`with compose:` sans le démontage que testcontainers fait sur un `up`
     raté : son __enter__ appelle __exit__ en cas d'échec, et les conteneurs
     disparaissaient avant que le moteur ne relève leur état et leurs logs
-    (461416). Le démontage reste garanti par cleanup()."""
+    (461416). Le démontage reste garanti par cleanup().
 
-    def __init__(self, compose):
+    `sur_echec(exc, reessai_possible)` est appelé sur un `up` raté, stack
+    encore debout : il relève les services non sains et rend True pour
+    relancer le `up` une fois (healthcheck seulement trop lent, 467094)."""
+
+    def __init__(self, compose, sur_echec=None):
         self.compose = compose
+        self.sur_echec = sur_echec
 
     def __enter__(self):
-        self.compose.start()
+        try:
+            self.compose.start()
+        except Exception as exc:
+            if not (self.sur_echec and self.sur_echec(exc, True)):
+                raise
+            try:
+                self.compose.start()
+            except Exception as second:
+                self.sur_echec(second, False)
+                raise
         return self.compose
 
     def __exit__(self, *exc):
@@ -504,6 +519,11 @@ class ComposeRunner(BaseRunner):
         # Le .env écrit par le harnais (469217), retiré au nettoyage ; jamais
         # celui de la copie.
         self._env_cree = None
+        # Cause d'un `up --wait` raté, classée (467094) : rendue dans le
+        # résultat pour que le barème distingue la faute de la copie de ce
+        # que nous n'avons pas pu mesurer.
+        self._cause_demarrage = None
+        self._debut_evaluation = time.time()
 
     @staticmethod
     def _nom_fixe_en_alias(service: dict) -> bool:
@@ -710,7 +730,7 @@ class ComposeRunner(BaseRunner):
         """
         self._log_execution_start()
 
-        run_started = time.time()
+        run_started = self._debut_evaluation = time.time()
         self.record_submission_step()
         try:
             compose_resolution_started = time.time()
@@ -795,7 +815,7 @@ class ComposeRunner(BaseRunner):
             self.logger.info("Starting Docker Compose services...")
             compose_started = time.time()
             try:
-                with _DemarrageSansDemontage(self.compose):
+                with _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate):
                     self.record_step(
                         "Build et démarrage Compose",
                         command=f"docker compose -f {compose_name} up --build",
@@ -827,7 +847,7 @@ class ComposeRunner(BaseRunner):
                     servante = mode == "serving" or (mode != "pipeline" and "pipeline" not in services)
                     if servante:
                         self.logger.info(f"Stack servante ({'déclarée' if mode == 'serving' else services})")
-                        result = self._evaluer_services_persistants()
+                        result = self._avec_cause(self._evaluer_services_persistants())
                         self._log_execution_end(result)
                         return result
 
@@ -864,6 +884,7 @@ class ComposeRunner(BaseRunner):
                         "logs": logs,
                         "steps": self.steps,
                     }
+                    self._avec_cause(result)
 
                     self._log_execution_end(result)
                     return result
@@ -892,14 +913,14 @@ class ComposeRunner(BaseRunner):
                         exit_code=2,
                         duration=0,
                     )
-            result = {"success": False, "error": error_msg, "exit_code": 3, "steps": self.steps}
+            result = self._avec_cause({"success": False, "error": error_msg, "exit_code": 3, "steps": self.steps})
             self._log_execution_end(result)
             return result
 
         except Exception as e:
             error_msg = f"Execution error: {str(e)}"
             self.logger.error(error_msg, exc_info=True)
-            result = {"success": False, "error": error_msg, "exit_code": 2, "steps": self.steps}
+            result = self._avec_cause({"success": False, "error": error_msg, "exit_code": 2, "steps": self.steps})
             self._log_execution_end(result)
             return result
 
@@ -2195,6 +2216,7 @@ class ComposeRunner(BaseRunner):
                               + (f" ({code})" if conteneur.status != "running" else "")
                               + (f", {sante}" if sante else ""))
             parties.append("--- services ---\n" + "\n".join(lignes))
+            deja_diagnostiques = set((self._cause_demarrage or {}).get("services") or {})
             for conteneur in conteneurs:
                 sante, sonde = self._sante_du_conteneur(conteneur)
                 # 467094 : « bike-api is unhealthy » est un conteneur `running`.
@@ -2204,6 +2226,12 @@ class ComposeRunner(BaseRunner):
                 if conteneur.status == "running" and sante not in ("unhealthy", "starting"):
                     continue
                 service = conteneur.labels.get("com.docker.compose.service", conteneur.name)
+                if service in deja_diagnostiques:
+                    # Logs, sondes et healthcheck déjà relevés (200 lignes) et
+                    # classés : pas de seconde capture.
+                    parties.append(f"--- {service} : santé, sondes et logs dans l'étape "
+                                   "« Diagnostic des services non sains » ---")
+                    continue
                 if sonde is not None:
                     code_sonde, sortie_sonde = sonde
                     parties.append(f"--- dernière sonde de santé de {service} (code {code_sonde}) ---\n"
@@ -2230,6 +2258,152 @@ class ComposeRunner(BaseRunner):
             derniere = journal[-1] or {}
             sonde = (derniere.get("ExitCode"), str(derniere.get("Output") or ""))
         return statut, sonde
+
+    def _avec_cause(self, result: dict) -> dict:
+        if self._cause_demarrage is not None and isinstance(result, dict):
+            result["cause_demarrage"] = self._cause_demarrage
+            # Un `up` relancé avec succès laisse l'évaluation imputer seule.
+            reessai = self._cause_demarrage.get("reessai") or {}
+            if reessai.get("resultat") != "sain":
+                result.setdefault("fault", diagnostic_demarrage.FAUTE_DU_CONTRAT.get(
+                    self._cause_demarrage["imputation"], "indetermine"))
+        return result
+
+    def _releve_sante(self) -> dict:
+        """{service: (conteneur, attrs)} relus maintenant."""
+        releve = {}
+        for conteneur in self._conteneurs_du_projet():
+            try:
+                conteneur.reload()
+            except Exception:
+                pass
+            service = conteneur.labels.get("com.docker.compose.service", conteneur.name)
+            releve[service] = (conteneur, conteneur.attrs)
+        return releve
+
+    def _diagnostiquer_up_rate(self, exc: Exception, reessai_possible: bool) -> bool:
+        """Relever et classer les services non sains d'un `up --wait` raté.
+
+        467094 : bike-api était « running » (restart: always) mais unhealthy ;
+        seuls les conteneurs arrêtés étaient relevés, la cause restait
+        inconnue. Pour chaque service non sain ou sorti : ses logs, l'état et
+        l'historique de son healthcheck, sa définition. La cause classée va
+        dans le résultat (`cause_demarrage`).
+
+        Rend True quand tous les services non sains attendaient seulement
+        (healthcheck lent, pas de plantage) et sont devenus sains après une
+        attente bornée : le `up` est alors relancé une fois. Ne lève jamais :
+        l'exception d'origine doit rester celle qu'on voit.
+        """
+        debut = time.time()
+        try:
+            if not reessai_possible:
+                if self._cause_demarrage and self._cause_demarrage.get("reessai"):
+                    self._cause_demarrage["reessai"]["resultat"] = f"second up en échec : {exc}"[:300]
+                    self._etape_diagnostic["exit_code"] = 2
+                    self._etape_diagnostic["output"] += (
+                        f"\nréessai : le second `up --wait` échoue aussi ({str(exc)[:200]}).")
+                return False
+            # Recensées ici aussi : sans `up` réussi, les images construites
+            # restaient sur la machine après le ménage.
+            self._retenir_images_de_la_copie()
+            releve = self._releve_sante()
+            # Sans healthcheck, un service running qui a redémarré n'est en
+            # cause que si la boucle se voit : un redémarrage en attendant sa
+            # dépendance, puis stable, n'est pas un plantage.
+            a_observer = [s for s, (_, a) in releve.items()
+                          if (a.get("RestartCount") or 0) > 0
+                          and not (a.get("State") or {}).get("Health")]
+            boucles = set()
+            if a_observer:
+                en_boucle = self._boucles_de_redemarrage(delai=20)
+                boucles = {s for s, (c, _) in releve.items() if c.name in en_boucle}
+            noms = diagnostic_demarrage.services_non_sains(
+                {s: a for s, (_, a) in releve.items()}, boucles)
+            causes, blocs = {}, []
+            for service in noms:
+                conteneur, attrs = releve[service]
+                try:
+                    logs = conteneur.logs(tail=200).decode("utf-8", errors="replace")
+                except Exception as erreur:
+                    logs = f"logs illisibles : {erreur}"
+                logs = diagnostic_demarrage.masquer_secrets(logs, attrs)
+                causes[service] = diagnostic_demarrage.classer_service(attrs, logs)
+                blocs.append(diagnostic_demarrage.decrire_service(service, attrs, logs, causes[service]))
+            retenue = diagnostic_demarrage.classer_demarrage(causes)
+            retenue["services"] = causes
+            retenue["reessai"] = None
+            self._cause_demarrage = retenue
+            sortie = (f"cause retenue : {retenue['cause']} ({retenue['service']}) → imputation "
+                      f"{retenue['imputation']}\n{retenue['preuve']}\n\n" + "\n\n".join(blocs))
+            if not noms:
+                sortie = ("aucun service non sain relevé (le `up` a échoué avant ou sans "
+                          f"healthcheck) : {str(exc)[:300]}")
+            self.record_step(
+                "Diagnostic des services non sains",
+                command=("docker inspect (State, State.Health, Config.Healthcheck) et "
+                         "docker logs --tail 200 de chaque service non sain ou sorti "
+                         "(équivalent docker compose logs --no-color --tail 200 <service>)"),
+                output=sortie,
+                exit_code=2,
+                duration=time.time() - debut,
+                note=("Imputation : « copie » = faute établie de la copie ; « non_mesure » = cause "
+                      "de notre côté, la copie n'a pas été mesurée ; « indetermine » = ni l'un ni "
+                      "l'autre n'est établi."),
+            )
+            self._etape_diagnostic = self.steps[-1]
+            if not noms or not all(c["reessayable"] for c in causes.values()):
+                return False
+            return self._attendre_sante(noms, releve, retenue)
+        except Exception as erreur:
+            self.logger.warning(f"Diagnostic des services non sains impossible : {erreur}")
+            return False
+
+    def _attendre_sante(self, noms: list, releve: dict, retenue: dict) -> bool:
+        """Attendre que des services seulement lents deviennent sains.
+
+        Attente : start_period + retries × (interval + timeout) du plus lent,
+        plafonnée (EXAM_REESSAI_SANTE_MAX_S) et dans le budget de l'évaluation.
+        """
+        restant = self.timeout - (time.time() - self._debut_evaluation)
+        attente = min(max(diagnostic_demarrage.delai_de_reessai(releve[n][1], REESSAI_SANTE_MAX)
+                          for n in noms), max(0.0, restant))
+        debut = time.time()
+        statuts = {}
+        while True:
+            actuel = self._releve_sante()
+            statuts = {n: ((actuel.get(n, (None, {}))[1].get("State") or {}).get("Health") or {}).get("Status")
+                       for n in noms}
+            if all(s == "healthy" for s in statuts.values()) or time.time() - debut >= attente:
+                break
+            time.sleep(5)
+        sains = all(s == "healthy" for s in statuts.values())
+        retenue["reessai"] = {"attente_max_s": round(attente, 1),
+                              "attendu_s": round(time.time() - debut, 1),
+                              "resultat": "sain" if sains else "toujours non sain",
+                              "statuts": statuts}
+        if sains:
+            # Le healthcheck de la copie était trop court pour cette machine :
+            # pas une faute, et le `up` relancé reprend l'évaluation normale.
+            retenue.update(cause="delai_depasse", imputation=diagnostic_demarrage.NON_MESURE,
+                           preuve=("healthcheck devenu sain après une attente plus longue : "
+                                   "délai trop court pour la machine de correction"))
+        elif any(s == "starting" for s in statuts.values()):
+            retenue.update(cause="delai_depasse", imputation=diagnostic_demarrage.NON_MESURE,
+                           preuve=f"healthcheck toujours en démarrage après {attente:.0f}s (plafond)")
+        else:
+            retenue.update(cause="healthcheck_echoue", imputation=diagnostic_demarrage.INDETERMINE,
+                           preuve=f"healthcheck toujours en échec après {attente:.0f}s d'attente "
+                                  f"supplémentaire, sans plantage : {statuts}")
+        self._etape_diagnostic["output"] += (
+            f"\nréessai : attente de {retenue['reessai']['attendu_s']}s (plafond "
+            f"{attente:.0f}s) → {retenue['reessai']['resultat']} {statuts}"
+            + (" ; `up --wait` relancé une fois." if sains else "."))
+        if sains:
+            # Stack finalement saine : l'étape ne doit pas passer pour un échec
+            # dont il faudrait établir la cause.
+            self._etape_diagnostic["exit_code"] = 0
+        return sains
 
     def _capture_logs(self) -> str:
         """

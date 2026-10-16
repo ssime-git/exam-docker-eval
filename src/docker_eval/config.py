@@ -26,6 +26,10 @@ def _seconds(name: str, default: int) -> int:
 DEFAULT_TIMEOUT = _seconds("EXAM_DEFAULT_TIMEOUT", 600)  # compose evaluations
 BENTOML_TIMEOUT = _seconds("EXAM_BENTOML_TIMEOUT", 300)
 SERVICE_READY_TIMEOUT = _seconds("EXAM_SERVICE_READY_TIMEOUT", 60)
+# Plafond de l'attente supplémentaire quand un `up --wait` échoue sur un
+# healthcheck seulement lent (pas de plantage) : on attend, puis on relance
+# le `up` une fois (467094, VM à 2 vCPU).
+REESSAI_SANTE_MAX = _seconds("EXAM_REESSAI_SANTE_MAX_S", 300)
 # Attente de la sonde de disponibilite avant de conclure a une API muette.
 API_STARTUP_TIMEOUT = _seconds("EXAM_API_STARTUP_TIMEOUT", 60)
 # Sous QEMU, une image d'une autre architecture repond plusieurs fois plus
