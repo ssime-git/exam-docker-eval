@@ -262,6 +262,9 @@ _REQUIREMENTS_ILLISIBLE = re.compile(
     r"^.*(?:error:[^\n]*requirements[^\n]*\.txt:\d+:\d+|Couldn't parse requirement[^\n]*requirements[^\n]*)$",
     re.M)
 _MODULE_ABSENT = re.compile(r"No module named '([A-Za-z_][\w.]*)'")
+# Ce qu'un passage pytest a rendu : sa ligne de bilan, ou l'erreur qui l'a arrêté.
+_RESUME_OU_ERREUR = re.compile(
+    r"^(?:=+ [^\n]*\b(?:passed|failed|errors?|no tests ran)\b[^\n]* =+|E\s+\w*Error: [^\n]+)$", re.M)
 _IMPORTS = re.compile(r"^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import|import\s+([A-Za-z_][\w.]*(?:\s*,\s*[A-Za-z_][\w.]*)*))", re.M)
 # Module importé -> paquet à installer, quand les deux noms diffèrent.
 PAQUET_DU_MODULE = {"jwt": "pyjwt", "yaml": "pyyaml", "sklearn": "scikit-learn",
@@ -2660,7 +2663,7 @@ class BentoMLRunner(BaseRunner):
                     self.record_step(
                         "Lancer les tests avec le code lu dans l'image",
                         command=f"docker cp {self.container_name}:{CODE_DU_BENTO} <temporaire>",
-                        output=_extrait(sortie_de(result), None, self._valeurs_a_masquer),
+                        output=_extrait(sortie_de(result), _RESUME_OU_ERREUR, self._valeurs_a_masquer),
                         exit_code=result.returncode,
                         note=results["code_lu_dans_l_image"].capitalize()
                         + ". L'énoncé ne fait pas livrer src/ : les tests en dépendent quand même."

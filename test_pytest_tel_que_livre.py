@@ -469,7 +469,8 @@ def test_464154_code_de_l_image_puis_pkg_resources_absent(tmp_path, monkeypatch)
         if "setuptools<81" not in commande:
             return _Resultat(2, ERREUR_PKG_RESOURCES)
         junit(commande, 7)
-        return _Resultat(0, "7 passed")
+        return _Resultat(0, "=== 7 passed, 20 warnings in 4.39s ===\n"
+                            "The event loop scope for asynchronous fixtures will default to ...\n")
     monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
 
     resultat = runner._run_pytest("http://localhost:32770")
@@ -478,7 +479,7 @@ def test_464154_code_de_l_image_puis_pkg_resources_absent(tmp_path, monkeypatch)
     assert resultat["pytest_tel_que_livre"]["imputable"] == "copie"
     etape = next(s for s in runner.steps if s["title"] == "Lancer les tests avec le code lu dans l'image")
     assert "No module named 'src'" not in etape["output"], etape
-    assert etape["output"] == "7 passed", etape
+    assert etape["output"] == "=== 7 passed, 20 warnings in 4.39s ===", etape
     assert "setuptools<81" in etape["note"], etape
     assert any("setuptools<81" in p for p in passages)
 
