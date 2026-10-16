@@ -305,6 +305,67 @@ def _nomme_dans_les_tests(tests_path: str, nom: str) -> bool:
     return False
 
 
+# `os.getenv("API_BASE_URL", "http://127.0.0.1:3001")` : le nom sous lequel
+# les tests attendent l'adresse du service, quel que soit le port documenté.
+_URL_LUE_PAR_LES_TESTS = re.compile(
+    r'(?:getenv|environ\.get)\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*,\s*'
+    r'f?["\']https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?')
+_URL_LOCALE = re.compile(r"^https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?(?:/|$)")
+# Les fichiers où une copie documente son environnement : le README et les
+# modèles de .env livrés pour être copiés.
+_FICHIER_DOCUMENTATION = re.compile(
+    r"^(?:readme(?:\.[a-z]+)?|\.?env\.(?:example|sample|template|dist)|example\.env)$", re.I)
+_AFFECTATION_DOCUMENTEE = re.compile(
+    r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s#]+)\s*(?:#.*)?$", re.M)
+
+
+def _noms_d_url_lus_par_les_tests(tests_path: str) -> list:
+    """Les variables d'environnement d'où les tests lisent l'adresse du
+    service. 462853 lisait API_BASE_URL, absente de la convention du skill
+    (`pi_test_env: BASE_URL,API_URL,SERVICE_URL`) : son défaut
+    127.0.0.1:3001 ne répondait pas, 20/20 « API indisponible »."""
+    noms = []
+    for chemin in fichiers_de_tests(tests_path):
+        try:
+            with open(chemin, encoding="utf-8") as f:
+                contenu = f.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for nom in _URL_LUE_PAR_LES_TESTS.findall(contenu):
+            if nom not in noms:
+                noms.append(nom)
+    return noms
+
+
+def _variables_documentees(racine: str) -> Dict[str, str]:
+    """`export NOM=valeur` du README ou d'un .env d'exemple livré.
+
+    Les exporter avant `pytest -v`, c'est suivre la copie : l'énoncé fait
+    jouer les commandes du README telles quelles (1.6). Les consignes
+    (`<VOTRE_CLE>`, `$AUTRE`) ne sont pas des valeurs."""
+    documentees: Dict[str, str] = {}
+    for dossier, sous_dossiers, fichiers in os.walk(racine):
+        sous_dossiers[:] = [d for d in sous_dossiers
+                            if d not in ("__MACOSX", ".git", "node_modules", ".venv", "venv")]
+        for nom_fichier in sorted(fichiers):
+            if nom_fichier.startswith("._") or not _FICHIER_DOCUMENTATION.match(nom_fichier):
+                continue
+            chemin = os.path.join(dossier, nom_fichier)
+            try:
+                if os.path.getsize(chemin) > 200_000:
+                    continue
+                with open(chemin, encoding="utf-8", errors="replace") as f:
+                    contenu = f.read()
+            except OSError:
+                continue
+            for nom, valeur in _AFFECTATION_DOCUMENTEE.findall(contenu):
+                valeur = valeur.strip("\"'")
+                if not valeur or any(c in valeur for c in "<>$"):
+                    continue
+                documentees.setdefault(nom, valeur)
+    return documentees
+
+
 def _expurger(texte: str, valeurs=()) -> str:
     """Ni jeton, ni secret du conteneur dans ce qu'on expose."""
     texte = _JETON.sub("<jeton>", texte)
@@ -1963,20 +2024,45 @@ class BentoMLRunner(BaseRunner):
                     if n.strip()]
         for nom in noms_env:
             env.setdefault(nom, base_url)
+        # Le nom que les tests lisent vraiment, en plus de la convention : une
+        # convention déclarée remplace la liste par défaut et peut l'omettre
+        # (462853 : API_BASE_URL). Affecté, pas setdefault : une valeur
+        # laissée dans l'environnement de la machine viserait un autre service.
+        noms_url = _noms_d_url_lus_par_les_tests(patched_tests_path)
+        for nom in noms_url:
+            env[nom] = base_url
         # Les tests importent le code de l'apprenant, qui vit dans le projet.
         env["PYTHONPATH"] = os.pathsep.join(
             [p for p in (projet, env.get("PYTHONPATH")) if p]
         )
-        # L'environnement du premier passage, tel que livré : l'adresse du
-        # service (port éphémère) et rien d'autre de notre part.
-        env_livre = dict(env)
         # Le meme secret que le conteneur : des tests qui forgent leur propre
         # jeton (459884 : JWT_SECRET_KEY partage via .env) doivent signer avec
         # la cle que le service verifie.
         secrets_image = self._env_required_by_image()
+        # Ce que la copie documente (README, .env d'exemple) et que ses tests
+        # lisent : l'exporter, c'est suivre la copie, pas la réparer (462853 :
+        # le README exporte API_USERNAME, API_PASSWORD, JWT_SECRET avant
+        # `pytest -v`). La valeur du conteneur quand il en a une : il a été
+        # lancé avec la valeur documentée. L'adresse reste la nôtre.
+        documentees = {}
+        for nom, valeur in _variables_documentees(self.eval_dir).items():
+            if (nom in noms_url or nom in noms_env or nom.startswith("BENTOML_")
+                    or _URL_LOCALE.match(valeur)
+                    or not _nomme_dans_les_tests(patched_tests_path, nom)):
+                continue
+            documentees[nom] = secrets_image.get(nom, valeur)
+        self._noms_documentes = sorted(documentees)
+        results["variables_documentees"] = self._noms_documentes
+        # L'environnement du premier passage, tel que livré : l'adresse du
+        # service (port éphémère), ce que la copie documente, rien d'autre.
+        env_livre = dict(env)
+        env_livre.update(documentees)
         for nom, valeur in secrets_image.items():
             env.setdefault(nom, valeur)
-        self._valeurs_a_masquer = [str(v) for v in secrets_image.values() if v and len(str(v)) >= 4]
+        for nom, valeur in documentees.items():
+            env.setdefault(nom, valeur)
+        self._valeurs_a_masquer = [str(v) for v in list(secrets_image.values()) + list(documentees.values())
+                                   if v and len(str(v)) >= 4]
         self._noms_secrets_image = sorted(secrets_image)
 
         def lancer(commande, environnement_pytest=None):
@@ -2107,8 +2193,11 @@ class BentoMLRunner(BaseRunner):
         """`pytest -v` avec le seul requirements.txt de la copie.
 
         Aucun paquet injecté, pas d'`asyncio_mode=auto`, pas de code lu dans
-        l'image, pas de secret du conteneur, pas de relance. Restent à nous :
-        l'adresse du service (réécrite, port éphémère), le choix du Python
+        l'image, pas de secret du conteneur que la copie ne documente pas, pas
+        de relance. Les variables exportées par son README (ou un .env
+        d'exemple) et lues par ses tests sont fournies : c'est suivre la copie.
+        Restent à nous : l'adresse du service (réécrite, port éphémère, sous
+        chaque nom que les tests lisent), le choix du Python
         (essais successifs, comme le passage réparé) et les options du
         harnais (rapport JUnit, ni cache ni fichiers AppleDouble). uvx fournit
         le lanceur pytest : la checklist fait lancer `pytest -v` au correcteur.
@@ -2152,6 +2241,7 @@ class BentoMLRunner(BaseRunner):
             "commande": _commande_lisible(commande),
             "python": commande[2],
             "pythons_essayes": essais,
+            "variables_documentees": list(getattr(self, "_noms_documentes", [])),
             "sortie": sortie,
         }
         self.record_step(
@@ -2161,7 +2251,10 @@ class BentoMLRunner(BaseRunner):
             exit_code=result.returncode,
             note=("pytest -v passe tel que livré." if passe else
                   f"pytest -v ne passe pas tel que livré ({cause})."
-                  + (" Notre outillage en cause : critère non mesuré." if imputable == "outillage" else "")),
+                  + (" Notre outillage en cause : critère non mesuré." if imputable == "outillage" else ""))
+                 + (" Variables exportées comme le documente la copie : "
+                    + ", ".join(constat["variables_documentees"]) + "."
+                    if constat["variables_documentees"] else ""),
         )
         return result, constat
 
@@ -2286,7 +2379,11 @@ class BentoMLRunner(BaseRunner):
             reparation("asyncio_mode_auto",
                        "tests `async def` exécutés par pytest-asyncio (fourni par le correcteur) en mode auto "
                        "(-o asyncio_mode=auto)", _ASYNC)
-        noms = [n for n in getattr(self, "_noms_secrets_image", []) if _nomme_dans_les_tests(tests_path, n)]
+        # Une variable documentée par la copie a été fournie dès le premier
+        # passage : la suivre n'a rien coûté.
+        documentes = set(getattr(self, "_noms_documentes", []))
+        noms = [n for n in getattr(self, "_noms_secrets_image", [])
+                if n not in documentes and _nomme_dans_les_tests(tests_path, n)]
         if noms:
             # Les tests lisent une variable que seul le conteneur définit
             # (459884 : JWT_SECRET_KEY). Le nom, jamais la valeur.
