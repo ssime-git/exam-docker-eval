@@ -27,6 +27,7 @@ from testcontainers.core.container import DockerContainer
 
 from .base_runner import BaseRunner
 from .utils import find_credentials_in_texts
+from .bentoml_runner import fichiers_de_tests, IGNORER_PARASITES_MACOS
 from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT
 
 
@@ -787,7 +788,28 @@ class BentoCompiledRunner(BaseRunner):
         raise TimeoutError(f"API not ready after {timeout}s")
 
     def _run_pytest(self, base_url: str) -> Dict[str, Any]:
-        """Run pytest tests against running API."""
+        """Run pytest tests against running API.
+
+        Ne lève jamais : /login et /predict sont déjà obtenus, une panne ici
+        ne doit pas les effacer (469871). La catégorie Tests sort « pytest
+        non exécuté », avec la cause.
+        """
+        try:
+            return self._executer_pytest(base_url)
+        except Exception as exc:
+            cause = f"{type(exc).__name__}: {exc}"
+            self.logger.error(f"pytest non exécuté : {cause}", exc_info=True)
+            return {
+                "executed": False,
+                "total": 0,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "evaluable": False,
+                "reason": f"pytest non exécuté : {cause}",
+            }
+
+    def _executer_pytest(self, base_url: str) -> Dict[str, Any]:
         import subprocess
         import tempfile
         import shutil
@@ -812,19 +834,21 @@ class BentoCompiledRunner(BaseRunner):
             shutil.copytree(test_dir, os.path.join(temp_test_dir, "tests"))
 
             # Update BASE_URL in test files
-            for root, dirs, files in os.walk(temp_test_dir):
-                for file in files:
-                    if file.endswith(".py"):
-                        filepath = os.path.join(root, file)
-                        with open(filepath, "r") as f:
-                            content = f.read()
-                        # Replace hardcoded URLs
-                        content = content.replace(
-                            'BASE_URL = "http://localhost:3000"',
-                            f'BASE_URL = "{base_url}"',
-                        )
-                        with open(filepath, "w") as f:
-                            f.write(content)
+            for filepath in fichiers_de_tests(temp_test_dir):
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        content = f.read()
+                except (UnicodeDecodeError, OSError) as exc:
+                    # Illisible en UTF-8 : laissé tel quel, sans lever.
+                    self.logger.warning(f"Fichier de tests laissé tel quel : {filepath} ({exc})")
+                    continue
+                # Replace hardcoded URLs
+                content = content.replace(
+                    'BASE_URL = "http://localhost:3000"',
+                    f'BASE_URL = "{base_url}"',
+                )
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(content)
 
             # Run pytest
             self.logger.info("Running pytest...")
@@ -840,6 +864,7 @@ class BentoCompiledRunner(BaseRunner):
                     "pytest",
                     os.path.join(temp_test_dir, "tests"),
                     "-v",
+                    *IGNORER_PARASITES_MACOS,
                 ],
                 capture_output=True,
                 text=True,

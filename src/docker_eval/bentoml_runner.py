@@ -209,6 +209,28 @@ def modules_importes(dossier: str) -> Dict[str, set]:
     return trouves
 
 
+def fichier_parasite_macos(nom: str) -> bool:
+    """Vrai pour un fichier AppleDouble (`._x.py`) : métadonnées binaires que
+    macOS glisse dans une archive, jamais du code de l'apprenant (469871)."""
+    return os.path.basename(nom).startswith("._")
+
+
+def fichiers_de_tests(dossier: str) -> list:
+    """Les `.py` d'un dossier de tests, sans AppleDouble ni `__MACOSX`."""
+    trouves = []
+    for racine, dossiers, fichiers in os.walk(dossier):
+        dossiers[:] = [d for d in dossiers if d != "__MACOSX"]
+        for nom in fichiers:
+            if nom.endswith(".py") and not fichier_parasite_macos(nom):
+                trouves.append(os.path.join(racine, nom))
+    return trouves
+
+
+# Que pytest ignore lui-même ces parasites : `._x_test.py` correspond au motif
+# `*_test.py` et serait collecté.
+IGNORER_PARASITES_MACOS = ["--ignore-glob=*/._*", "--ignore-glob=*/__MACOSX/*"]
+
+
 def _position_pytest(commande) -> int:
     """Index du lanceur `pytest` dans une commande uvx (pas l'argument d'un
     `--with pytest`)."""
@@ -1621,41 +1643,44 @@ class BentoMLRunner(BaseRunner):
         adresse_du_service = re.compile(
             rf"http://(?:127\.0\.0\.1|localhost|0\.0\.0\.0):{BENTOML_PORT}(?![0-9])")
 
-        for root, _, files in os.walk(dst_tests_path):
-            for filename in files:
-                if not filename.endswith(".py"):
-                    continue
-                filepath = os.path.join(root, filename)
+        for filepath in fichiers_de_tests(dst_tests_path):
+            try:
                 with open(filepath, encoding="utf-8") as handle:
                     content = handle.read()
+            except (UnicodeDecodeError, OSError) as exc:
+                # Pas du texte UTF-8 : on ne sait pas le réécrire, on le
+                # laisse tel quel. La préparation ne doit jamais lever.
+                self.logger.warning(
+                    f"Fichier de tests illisible en UTF-8, laissé tel quel : {filepath} ({exc})")
+                continue
 
-                new_content = base_url_pattern.sub(
-                    r'\1os.getenv("BENTOML_BASE_URL", \2http://127.0.0.1:3000\3)',
-                    content,
+            new_content = base_url_pattern.sub(
+                r'\1os.getenv("BENTOML_BASE_URL", \2http://127.0.0.1:3000\3)',
+                content,
+            )
+            # Toute autre forme qui vise le port du service : un défaut
+            # d'os.environ.get sous un nom qu'on n'exporte pas (459845 :
+            # SERVICE_BASE_URL, repli localhost:3000, 8 tests en connexion
+            # refusée), une URL en dur dans une fixture. Le service tourne
+            # sur un port éphémère : l'adresse documentée ne répond pas.
+            new_content = adresse_du_service.sub(base_url, new_content)
+            if new_content != content:
+                if "import os" not in new_content:
+                    if re.search(r"^from __future__ import .+$", new_content, re.MULTILINE):
+                        new_content = re.sub(
+                            r"^(from __future__ import .+\n)",
+                            r"\1import os\n",
+                            new_content,
+                            count=1,
+                            flags=re.MULTILINE,
+                        )
+                    else:
+                        new_content = "import os\n" + new_content
+                with open(filepath, "w", encoding="utf-8") as handle:
+                    handle.write(new_content)
+                self.logger.info(
+                    f"Rewrote service URL in tests for dynamic port: {filepath}"
                 )
-                # Toute autre forme qui vise le port du service : un défaut
-                # d'os.environ.get sous un nom qu'on n'exporte pas (459845 :
-                # SERVICE_BASE_URL, repli localhost:3000, 8 tests en connexion
-                # refusée), une URL en dur dans une fixture. Le service tourne
-                # sur un port éphémère : l'adresse documentée ne répond pas.
-                new_content = adresse_du_service.sub(base_url, new_content)
-                if new_content != content:
-                    if "import os" not in new_content:
-                        if re.search(r"^from __future__ import .+$", new_content, re.MULTILINE):
-                            new_content = re.sub(
-                                r"^(from __future__ import .+\n)",
-                                r"\1import os\n",
-                                new_content,
-                                count=1,
-                                flags=re.MULTILINE,
-                            )
-                        else:
-                            new_content = "import os\n" + new_content
-                    with open(filepath, "w", encoding="utf-8") as handle:
-                        handle.write(new_content)
-                    self.logger.info(
-                        f"Rewrote service URL in tests for dynamic port: {filepath}"
-                    )
 
         self.logger.info(
             f"Tests patched in place at {dst_tests_path} (base_url={base_url})"
@@ -1687,7 +1712,34 @@ class BentoMLRunner(BaseRunner):
         return passed, failed, errors, total
 
     def _run_pytest(self, base_url: str) -> Dict[str, Any]:
-        """Run pytest suite against the running API."""
+        """Run pytest suite against the running API.
+
+        Ne lève jamais : les appelants rangent ce résultat à côté de
+        /login et /predict, déjà obtenus. Une exception ici (469871 :
+        UnicodeDecodeError sur un fichier AppleDouble) les faisait perdre, et
+        l'évaluation entière sortait en échec critique. La catégorie Tests
+        sort « pytest non exécuté », avec la cause, et rien d'autre ne bouge.
+        """
+        try:
+            return self._executer_pytest(base_url)
+        except Exception as exc:
+            cause = f"{type(exc).__name__}: {exc}"
+            self.logger.error(f"pytest non exécuté : {cause}", exc_info=True)
+            return {
+                "executed": False,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "total": 0,
+                "pass_rate": 0,
+                "tests_path": None,
+                "output_file": None,
+                "tests_present": True,
+                "evaluable": False,
+                "reason": f"pytest non exécuté : {cause}",
+            }
+
+    def _executer_pytest(self, base_url: str) -> Dict[str, Any]:
         results: Dict[str, Any] = {
             "executed": False,
             "passed": 0,
@@ -1779,6 +1831,7 @@ class BentoMLRunner(BaseRunner):
                 "no:cacheprovider",
                 "-o",
                 "asyncio_mode=auto",
+                *IGNORER_PARASITES_MACOS,
                 f"--junit-xml={junit_path}",
             ]
         )
@@ -1837,11 +1890,7 @@ class BentoMLRunner(BaseRunner):
 
         if result.returncode == 5:
             # Pytest exit code 5 means nothing collected; retry with explicit python files.
-            discovered_files = []
-            for root, _, files in os.walk(patched_tests_path):
-                for filename in files:
-                    if filename.endswith(".py"):
-                        discovered_files.append(os.path.join(root, filename))
+            discovered_files = fichiers_de_tests(patched_tests_path)
             if discovered_files:
                 # Le lanceur pytest, pas l'argument de `--with pytest` : le
                 # premier « pytest » de la commande est un paquet à installer.
@@ -1855,6 +1904,7 @@ class BentoMLRunner(BaseRunner):
                     "no:cacheprovider",
                     "-o",
                     "asyncio_mode=auto",
+                    *IGNORER_PARASITES_MACOS,
                     f"--junit-xml={junit_path}",
                 ]
                 self.logger.info(
