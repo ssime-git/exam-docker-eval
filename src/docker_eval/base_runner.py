@@ -312,15 +312,23 @@ class BaseRunner(ABC):
         pas ce qui a servi à les lancer.
         """
         import docker
+        import docker.errors
         images = getattr(self, "_exam_images", set())
         if not images:
             return []
         client = docker.from_env()
         errors = []
-        for image in sorted(images):
+        for image in sorted(images):  # copie triée : on retire de l'ensemble en route
             try:
                 client.images.remove(image, force=True)
                 self.logger.info(f"✓ Image d'examen supprimée : {image}")
+                images.discard(image)
+            except docker.errors.ImageNotFound:
+                # Déjà partie (ménage appelé deux fois, autre processus) : le
+                # but est atteint. Un warning ici finissait en dernière ligne
+                # de la sortie et le correcteur le citait comme cause d'échec.
+                self.logger.info(f"Image d'examen déjà absente : {image}")
+                images.discard(image)
             except Exception as erreur:
                 self.logger.warning(f"Image {image} non supprimée : {erreur}")
                 errors.append(f"image {image}: {erreur}")
