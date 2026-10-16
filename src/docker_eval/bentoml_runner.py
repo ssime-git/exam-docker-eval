@@ -14,6 +14,7 @@ import socket
 import tarfile
 from urllib.parse import urlparse
 import subprocess
+import sys
 import tempfile
 import xml.etree.ElementTree as ET
 import time
@@ -104,6 +105,117 @@ def profil_reconnu(corps) -> bool:
     if isinstance(corps, list):
         return any(profil_reconnu(v) for v in corps)
     return False
+
+
+# Provenance du corps /predict, exposée au barème (`corps_source`). Seuls
+# les corps que la copie documente elle-même engagent l'apprenant : un 4xx
+# sur un corps que nous avons deviné ou reconstruit depuis les types (avec
+# nos valeurs d'exemple) n'est pas une faute de la copie.
+CORPS_DOCUMENTES = ("readme", "tests", "openapi")
+
+# Noms courants du paramètre d'une API BentoML (`def predict(self,
+# input_data: T)`), essayés en enveloppe quand aucun nom n'a pu être lu.
+ENVELOPPES_COURANTES = ("input_data", "data", "input")
+
+
+def _cle_corps(corps) -> str:
+    return json.dumps(corps, sort_keys=True, default=str)
+
+
+def source_du_corps(contrat: Dict[str, Any], corps) -> str:
+    """D'où vient un corps /predict du contrat : readme, tests, image,
+    source ou devine."""
+    return (contrat.get("predict_body_sources") or {}).get(_cle_corps(corps), "devine")
+
+
+def _provenance_documentee(chemin: str) -> str:
+    """readme, tests, image ou source, d'après le fichier où un corps a été lu."""
+    if "(dans l'image)" in chemin:
+        return "image"
+    if looks_like_test_file(chemin):
+        return "tests"
+    nom = os.path.basename(chemin).lower()
+    if nom.startswith("readme") or nom.endswith((".md", ".txt", ".rst")):
+        return "readme"
+    return "source"
+
+
+_LIBELLE_CORPS = re.compile(
+    r"\b(?:request\s+body|body|payload|json|corps|requête|request|input)\s*[:=]\s*", re.I)
+_ROUTE_SUIVANTE = re.compile(r"\b(?:POST|GET|PUT|PATCH|DELETE)\s+/|/login\b", re.I)
+
+
+def corps_en_ligne_apres_predict(texte: str):
+    """Les objets JSON écrits en ligne après « /predict », derrière un
+    libellé (`body:`, `payload:`, `json:`...), jusqu'à la route suivante.
+
+    468775 : `POST /predict, header Authorization: Bearer <token>, body:
+    {"input_data": {...}} returns {"prediction": 0.xx}` — ni bloc de code ni
+    `curl -d`. Le corps du login, juste au-dessus, n'est pas dans la fenêtre ;
+    un exemple de réponse (`returns {...}`) n'a pas de libellé et ne porte
+    aucune variable d'admission."""
+    decodeur = json.JSONDecoder()
+    for route in re.finditer(r"/predict\b", texte):
+        debut = route.end()
+        fenetre = texte[debut:debut + 600]
+        suivante = _ROUTE_SUIVANTE.search(fenetre)
+        zone = fenetre[:suivante.start()] if suivante else fenetre
+        for libelle in _LIBELLE_CORPS.finditer(zone):
+            position = debut + libelle.end()
+            if position >= len(texte) or texte[position] != "{":
+                continue
+            try:
+                corps, _ = decodeur.raw_decode(texte, position)
+            except ValueError:
+                continue
+            if isinstance(corps, dict) and profil_reconnu(corps):
+                yield corps
+
+
+# uv refuse de lire le requirements.txt de la copie (468775 : « error:
+# Unexpected '·', expected '-c', '-e', '-r' or the start of a requirement:
+# requirements.txt:1:2 » ; « Couldn't parse requirement in `requirements.txt` »).
+_REQUIREMENTS_ILLISIBLE = re.compile(
+    r"^.*(?:error:[^\n]*requirements[^\n]*\.txt:\d+:\d+|Couldn't parse requirement[^\n]*requirements[^\n]*)$",
+    re.M)
+_MODULE_ABSENT = re.compile(r"No module named '([A-Za-z_][\w.]*)'")
+_IMPORTS = re.compile(r"^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import|import\s+([A-Za-z_][\w.]*(?:\s*,\s*[A-Za-z_][\w.]*)*))", re.M)
+# Module importé -> paquet à installer, quand les deux noms diffèrent.
+PAQUET_DU_MODULE = {"jwt": "pyjwt", "yaml": "pyyaml", "sklearn": "scikit-learn",
+                    "dotenv": "python-dotenv", "PIL": "pillow", "dateutil": "python-dateutil",
+                    "bs4": "beautifulsoup4", "cv2": "opencv-python-headless"}
+# Dossier du bento dans une image produite par `bentoml containerize`.
+CODE_DU_BENTO = "/home/bentoml/bento/src"
+
+
+def modules_importes(dossier: str) -> Dict[str, set]:
+    """{module de premier niveau: {sous-modules importés}} dans les .py d'un dossier."""
+    trouves: Dict[str, set] = {}
+    for racine, _, fichiers in os.walk(dossier):
+        for nom in fichiers:
+            if not nom.endswith(".py"):
+                continue
+            try:
+                with open(os.path.join(racine, nom), encoding="utf-8", errors="ignore") as lecteur:
+                    texte = lecteur.read(200_000)
+            except OSError:
+                continue
+            for depuis, imports in _IMPORTS.findall(texte):
+                for chemin in ([depuis] if depuis else [m.strip() for m in imports.split(",")]):
+                    morceaux = chemin.split(".")
+                    suite = trouves.setdefault(morceaux[0], set())
+                    if len(morceaux) > 1:
+                        suite.add(morceaux[1])
+    return trouves
+
+
+def _position_pytest(commande) -> int:
+    """Index du lanceur `pytest` dans une commande uvx (pas l'argument d'un
+    `--with pytest`)."""
+    for i, morceau in enumerate(commande):
+        if morceau == "pytest" and (i == 0 or commande[i - 1] != "--with"):
+            return i
+    return len(commande)
 
 
 def _jetons_du_corps(donnee, profondeur: int = 0):
@@ -986,7 +1098,12 @@ class BentoMLRunner(BaseRunner):
                 profil_median(('GRE', 'TOEFL', 'University_Rating', 'SOP', 'LOR', 'CGPA', 'Research')),
                 profil_median(('gre_score', 'toefl_score', 'university_rating', 'sop', 'lor', 'cgpa', 'research')),
             ],
+            'predict_body_sources': {},
         }
+        sources = contract['predict_body_sources']
+
+        def provenance(corps, source):
+            sources.setdefault(_cle_corps(corps), source)
 
         # Les identifiants sont cherches sur l'ensemble du rendu, le service
         # d'abord, les tests ensuite. Un apprenant qui les ecrit en dur dans son
@@ -997,7 +1114,10 @@ class BentoMLRunner(BaseRunner):
         # Sans lui, ni les identifiants ni la forme des payloads ne sont
         # connus, et le correcteur teste a cote : mauvais noms de champs,
         # mauvais nom de parametre. On lit donc le service dans l'image.
-        if not any(re.search(r"def\s+predict\s*\(", text) for _, text in texts):
+        # Un `def predict(` dans un test est un helper qui appelle l'API, pas
+        # le service : il ne dispense pas de lire l'image.
+        if not any(re.search(r"def\s+predict\s*\(", text) for chemin, text in texts
+                   if not looks_like_test_file(chemin)):
             in_image = self._read_service_from_image()
             if in_image:
                 self.logger.info(
@@ -1010,6 +1130,12 @@ class BentoMLRunner(BaseRunner):
         # noms de champs exacts. 459145 (FastAPI, pas de `def predict(self`)
         # documentait GRE_Score/TOEFL_Score... et recevait quand meme les
         # payloads generiques — 422 sur toute la ligne.
+        def documenter(corps, source_path):
+            contract['predict_bodies'].insert(0, corps)
+            contract['predict_documented_source'] = source_path
+            sources[_cle_corps(corps)] = _provenance_documentee(source_path)
+            self.logger.info(f"Payload /predict lu dans {source_path}")
+
         for source_path, text in texts:
             for bloc in re.findall(
                 r"/predict[\s\S]{0,300}?-d\s+'(\{[\s\S]*?\})'", text
@@ -1021,12 +1147,19 @@ class BentoMLRunner(BaseRunner):
                 # Un corps enveloppe (ex. {"request": {...}}) porte aussi le
                 # nom du wrapper.
                 if isinstance(corps, dict) and corps:
-                    contract['predict_bodies'].insert(0, corps)
-                    contract['predict_documented_source'] = source_path
-                    self.logger.info(f"Payload /predict lu dans {source_path}")
+                    documenter(corps, source_path)
                 break
             if contract.get('predict_documented_source'):
                 break
+            # Corps écrit en ligne dans la documentation (468775), pas dans
+            # un `curl -d`. Documentation seulement : dans un test, un
+            # `json={...}` après /predict peut être l'entrée invalide d'un
+            # test d'échec.
+            if _provenance_documentee(source_path) == "readme":
+                corps = next(corps_en_ligne_apres_predict(text), None)
+                if corps is not None:
+                    documenter(corps, source_path)
+                    break
 
         ordered = sorted(texts, key=lambda item: looks_like_test_file(item[0]))
         found = find_credentials_in_texts(ordered)
@@ -1042,6 +1175,7 @@ class BentoMLRunner(BaseRunner):
                 + (" -- ecrits en dur dans un test" if found['in_tests'] else "")
             )
 
+        signature_lue = False
         for source_path, text in texts:
             if contract['source'] == 'fallback':
                 contract['source'] = source_path
@@ -1057,6 +1191,7 @@ class BentoMLRunner(BaseRunner):
             # les champs d'un modèle unique à plat : pas d'enveloppe.
             predict_signature = re.search(r'def\s+predict\s*\(\s*(self\s*,\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([a-zA-Z_][a-zA-Z0-9_]*)', text)
             if predict_signature:
+                signature_lue = True
                 route_fastapi = predict_signature.group(1) is None
                 predict_wrapper = predict_signature.group(2)
                 # Un parametre positionnel (marque par `/`) n'est PAS enveloppe
@@ -1085,12 +1220,23 @@ class BentoMLRunner(BaseRunner):
                                 continue
                         request_payload[field_name] = self._sample_value_for_field(field_name)
                     if request_payload:
+                        # Reconstruit avec nos valeurs d'exemple : pas un
+                        # corps documenté par la copie.
+                        provenance(request_payload, "image" if "(dans l'image)" in source_path else "source")
                         if contract.get('predict_documented_source'):
                             # Le payload documente par l'apprenant prime sur
                             # celui reconstruit depuis les types.
                             contract['predict_bodies'].append(request_payload)
                         else:
                             contract['predict_bodies'] = [request_payload]
+
+        # Aucune signature lue (image illisible, 468775) : les variantes à
+        # plat et `request` échouent sur un service BentoML qui enveloppe au
+        # nom de son paramètre. Les noms courants viennent après, pour ne
+        # rien changer à l'ordre quand le nom a été lu.
+        if not signature_lue:
+            contract['predict_wrappers'] += [nom for nom in ENVELOPPES_COURANTES
+                                             if nom not in contract['predict_wrappers']]
 
         return contract
 
@@ -1179,6 +1325,11 @@ class BentoMLRunner(BaseRunner):
                     profil_median(("GRE", "TOEFL", "University_Rating", "SOP", "LOR", "CGPA", "Research")),
                     profil_median(("gre_score", "toefl_score", "university_rating", "sop", "lor", "cgpa", "research")),
                 ]
+            # Provenance du premier corps essayé : celle qui compte si tout
+            # échoue (le corps documenté passe en premier). Remplacée par
+            # celle du corps qui obtient un 200.
+            if predict_bodies:
+                results["corps_source"] = source_du_corps(contract, predict_bodies[0])
             for payload in predict_bodies:
                 normalized_payload = json.loads(json.dumps(payload).replace('{token}', token))
                 # L'accès obtenu au login doit accompagner la requete. Il ne
@@ -1222,6 +1373,7 @@ class BentoMLRunner(BaseRunner):
                         results["predict_response"] = str(data)[:400]
                         predict_ok = (body, headers, data, variante)
                         results["mecanisme_acces"] = variante["mecanisme"]
+                        results["corps_source"] = source_du_corps(contract, payload)
                         self.logger.info(f"✓ Prediction successful : {str(data)[:200]}")
                         break
                     except Exception as e:
@@ -1236,6 +1388,7 @@ class BentoMLRunner(BaseRunner):
                     "Predict failed for all supported payload variants (status codes: %s)",
                     results["predict_attempt_statuses"],
                 )
+            self.logger.info(f"Corps /predict : provenance {results.get('corps_source', 'devine')}")
 
         # Overall result
         results["all_passed"] = results["login_passed"] and results["predict_passed"]
@@ -1656,13 +1809,15 @@ class BentoMLRunner(BaseRunner):
             [p for p in (projet, env.get("PYTHONPATH")) if p]
         )
 
-        result = subprocess.run(
-            command,
-            cwd=projet,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        def lancer(commande, environnement_pytest=None):
+            # Un rapport laissé par un passage précédent ne doit jamais être
+            # relu comme celui de ce passage.
+            if os.path.exists(junit_path):
+                os.remove(junit_path)
+            return subprocess.run(commande, cwd=projet, capture_output=True, text=True,
+                                  env=environnement_pytest or env)
+
+        result = lancer(command)
         # uv n'a pas pu installer les dépendances de la copie pour ce Python
         # (rien n'a tourné, pas de rapport) : le suivant, consigné.
         essais = [pythons[0]]
@@ -1676,7 +1831,7 @@ class BentoMLRunner(BaseRunner):
                 f"Dépendances des tests non installables en Python {command[position]} : essai en {suivant}")
             command[position] = suivant
             essais.append(suivant)
-            result = subprocess.run(command, cwd=projet, capture_output=True, text=True, env=env)
+            result = lancer(command)
         results["python"] = command[position]
         results["pythons_essayes"] = essais
 
@@ -1688,7 +1843,9 @@ class BentoMLRunner(BaseRunner):
                     if filename.endswith(".py"):
                         discovered_files.append(os.path.join(root, filename))
             if discovered_files:
-                prefixe = command[: command.index("pytest")]
+                # Le lanceur pytest, pas l'argument de `--with pytest` : le
+                # premier « pytest » de la commande est un paquet à installer.
+                prefixe = command[: _position_pytest(command)]
                 retry_command = prefixe + [
                     "pytest",
                     *discovered_files,
@@ -1703,13 +1860,10 @@ class BentoMLRunner(BaseRunner):
                 self.logger.info(
                     "Pytest collected no tests by default pattern; retrying with explicit test files"
                 )
-                result = subprocess.run(
-                    retry_command,
-                    cwd=projet,
-                    capture_output=True,
-                    text=True,
-                    env=env,
-                )
+                result = lancer(retry_command)
+
+        result = self._replis_pytest(result, command, env, lancer, patched_tests_path, projet,
+                                     junit_path, results)
 
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         with open(output_file, "w", encoding="utf-8") as handle:
@@ -1794,6 +1948,137 @@ class BentoMLRunner(BaseRunner):
         results["problem_lines"] = problem_lines[:50]
 
         return results
+
+    def _replis_pytest(self, result, command, env, lancer, tests_path, projet, junit_path, results):
+        """Mesurer les tests de la copie quand leur environnement livré ne
+        le permet pas, et le consigner.
+
+        - requirements.txt illisible pour uv (468775) : rien ne s'installe,
+          rien n'est collecté. Le fichier cassé est une faute de la copie
+          (exposée pour le critère Reproductibilité) ; les tests se lancent
+          dans un environnement minimal : l'outillage de base plus les
+          imports des tests.
+        - les tests importent du code que l'énoncé interdit de livrer
+          (466786 : `from src.auth import ...`) : il est lu dans l'image du
+          bento et mis sur PYTHONPATH, hors de la copie, supprimé ensuite.
+
+        Les tests tournent comme les autres, avec le même lanceur."""
+        def sortie_de(resultat):
+            return (resultat.stdout or "") + "\n" + (resultat.stderr or "")
+
+        def rien_de_collecte():
+            return (self._read_junit_report(junit_path) or (0, 0, 0, 0))[3] == 0
+
+        erreur = _REQUIREMENTS_ILLISIBLE.search(sortie_de(result))
+        if erreur and rien_de_collecte() and "--with-requirements" in command:
+            i = command.index("--with-requirements")
+            base = command[:i] + command[i + 2:]
+            ajouts = self._paquets_des_imports(tests_path, projet, base)
+            position = _position_pytest(base)
+            repli = base[:position] + [a for p in ajouts for a in ("--with", p)] + base[position:]
+            self.logger.warning(
+                f"requirements.txt inutilisable ({erreur.group(0).strip()}) : "
+                "tests lancés dans un environnement minimal")
+            result = lancer(repli)
+            if ajouts and rien_de_collecte() and environnement.installation_impossible(sortie_de(result)):
+                # Un import des tests ne correspond à aucun paquet installable.
+                repli = base
+                result = lancer(repli)
+            command[:] = repli
+            paquets = [repli[j + 1] for j, a in enumerate(repli[:_position_pytest(repli)]) if a == "--with"]
+            results["requirements_inutilisable"] = True
+            results["requirements_erreur"] = erreur.group(0).strip()
+            results["environnement_de_repli"] = (
+                "requirements.txt inutilisable : tests lancés dans un environnement minimal ("
+                + ", ".join(paquets) + ")")
+            self.record_step(
+                "Lancer les tests sans le requirements.txt de la copie",
+                command=" ".join(repli[:2] + ["..."] + repli[_position_pytest(repli):][:2]),
+                output=erreur.group(0).strip(),
+                exit_code=result.returncode,
+                note=results["environnement_de_repli"]
+                + ". Le requirements.txt illisible reste une faute de la copie.",
+            )
+
+        absent = _MODULE_ABSENT.search(sortie_de(result))
+        if absent and self.image_name:
+            module = absent.group(1).split(".")[0]
+            dossier = tempfile.mkdtemp(prefix="scriptorium-code-image-")
+            try:
+                racine = self._code_de_l_image(module, modules_importes(tests_path).get(module, set()), dossier)
+                if racine:
+                    env_image = dict(env)
+                    env_image["PYTHONPATH"] = os.pathsep.join(
+                        [p for p in (projet, racine, env.get("PYTHONPATH")) if p])
+                    self.logger.info(
+                        f"Les tests importent {module}, absent du rendu : code lu dans l'image ({CODE_DU_BENTO})")
+                    result = lancer(command, env_image)
+                    results["code_lu_dans_l_image"] = (
+                        f"les tests importent du code non livré ({module}) ; lu dans l'image ({CODE_DU_BENTO})")
+                    self.record_step(
+                        "Lancer les tests avec le code lu dans l'image",
+                        command=f"docker cp {self.container_name}:{CODE_DU_BENTO} <temporaire>",
+                        output=absent.group(0),
+                        exit_code=result.returncode,
+                        note=results["code_lu_dans_l_image"].capitalize()
+                        + ". L'énoncé ne fait pas livrer src/ : les tests en dépendent quand même.",
+                    )
+            finally:
+                shutil.rmtree(dossier, ignore_errors=True)
+        return result
+
+    def _paquets_des_imports(self, tests_path: str, projet: str, commande) -> list:
+        """Paquets à installer pour les imports des tests : ni la
+        bibliothèque standard, ni les modules locaux, ni ce que la commande
+        installe déjà."""
+        deja = {commande[i + 1].lower() for i, a in enumerate(commande[:-1]) if a == "--with"}
+        locaux = {"src", "tests", "conftest", "__future__"}
+        for dossier in (tests_path, projet):
+            try:
+                locaux.update(os.path.splitext(nom)[0] for nom in os.listdir(dossier))
+            except OSError:
+                pass
+        paquets = []
+        for module in sorted(modules_importes(tests_path)):
+            if module in sys.stdlib_module_names or module in locaux:
+                continue
+            paquet = PAQUET_DU_MODULE.get(module, module).lower()
+            if paquet not in deja:
+                deja.add(paquet)
+                paquets.append(paquet)
+        return paquets
+
+    def _code_de_l_image(self, module: str, sous_modules: set, dossier: str) -> Optional[str]:
+        """Copier le bento de l'image (sans rien y exécuter) et rendre le
+        dossier à mettre sur PYTHONPATH pour que `module` s'importe, ou None.
+
+        `docker cp` lit le conteneur qui tourne déjà sous `container_name`
+        (les deux modes le nomment ainsi). Deux agencements de bento :
+        `bento/src/src/auth.py` (include de `src/`) et `bento/src/auth.py`."""
+        destination = os.path.join(dossier, os.path.basename(CODE_DU_BENTO))
+        try:
+            copie = subprocess.run(
+                ["docker", "cp", f"{self.container_name}:{CODE_DU_BENTO}", destination],
+                capture_output=True, text=True, timeout=120)
+        except Exception as exc:
+            self.logger.debug(f"Code de l'image illisible : {exc}")
+            return None
+        if copie.returncode != 0 or not os.path.isdir(destination):
+            return None
+        candidats = []
+        for racine, dossiers, _ in os.walk(dossier):
+            profondeur = os.path.relpath(racine, dossier).count(os.sep)
+            if profondeur > 4:
+                dossiers[:] = []
+                continue
+            paquet = os.path.join(racine, module)
+            if os.path.isdir(paquet):
+                if not sous_modules or any(os.path.isfile(os.path.join(paquet, f"{s}.py"))
+                                           or os.path.isdir(os.path.join(paquet, s)) for s in sous_modules):
+                    candidats.append((profondeur, racine))
+            elif not sous_modules and os.path.isfile(paquet + ".py"):
+                candidats.append((profondeur, racine))
+        return min(candidats)[1] if candidats else None
 
     def _collect_diagnostics(self) -> Dict[str, Any]:
         """Tout ce qu'il faut pour diagnostiquer, avant que la sandbox parte.
