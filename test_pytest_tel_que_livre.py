@@ -429,3 +429,75 @@ def test_468775_corps_deja_enveloppe_au_readme_reste_readme_apres_un_400(tmp_pat
     assert resultats["predict_attempt_statuses"][:2] == [400, 200], resultats
     assert resultats["corps_enveloppe"] is None, resultats
     assert resultats["corps_source"] == "readme", resultats
+
+
+# --- 464154 : code lu dans l'image, puis `pkg_resources` absent ---------------
+
+ERREUR_PKG_RESOURCES = (
+    "/tmp/scriptorium-code-image-x/src/src/service.py:6: in <module>\n    import bentoml\n"
+    ".../site-packages/fs/__init__.py:4: in <module>\n"
+    "    __import__(\"pkg_resources\").declare_namespace(__name__)\n"
+    "E   ModuleNotFoundError: No module named 'pkg_resources'\n")
+
+
+def test_464154_code_de_l_image_puis_pkg_resources_absent(tmp_path, monkeypatch):
+    """464154 : tel que livré, `No module named 'src'` (faute de la copie).
+    Avec le code lu dans l'image, `src` s'importe, mais bentoml (via `fs`)
+    importe `pkg_resources`, que le `setuptools` injecté sans borne (84) ne
+    fournit plus. L'étape affichait encore « No module named 'src' ».
+    Le correcteur relance avec un setuptools qui fournit `pkg_resources`."""
+    ecrire(tmp_path / "requirements.txt", "bentoml\npyjwt\nrequests\npytest\n")
+    ecrire(tmp_path / "tests" / "test_service.py",
+           "from src.service import app, create_token\n\ndef test_a():\n    assert True\n")
+    runner = BentoMLRunner("464154", str(tmp_path), 300, logging.getLogger("t"))
+    runner.image_name = "eval_464154/admission_prediction_service:latest"
+    runner._env_required_by_image = lambda: {}
+    avec_uvx(monkeypatch)
+    passages = []
+
+    def faux_run(commande, **kwargs):
+        if commande[:2] == ["docker", "cp"]:
+            ecrire(os.path.join(commande[3], "src", "service.py"), "app = 1\ncreate_token = 2\n")
+            return _Resultat(0, "")
+        if commande[0] == "docker":
+            return _Resultat(0, "")
+        env = kwargs.get("env") or {}
+        passages.append(list(commande))
+        chemins = env.get("PYTHONPATH", "").split(os.pathsep)
+        if not any(c and os.path.isfile(os.path.join(c, "src", "service.py")) for c in chemins):
+            return _Resultat(2, "E   ModuleNotFoundError: No module named 'src'\n")
+        if "setuptools<81" not in commande:
+            return _Resultat(2, ERREUR_PKG_RESOURCES)
+        junit(commande, 7)
+        return _Resultat(0, "7 passed")
+    monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
+
+    resultat = runner._run_pytest("http://localhost:32770")
+
+    assert resultat["passed"] == 7 and resultat["total"] == 7, resultat
+    assert resultat["pytest_tel_que_livre"]["imputable"] == "copie"
+    etape = next(s for s in runner.steps if s["title"] == "Lancer les tests avec le code lu dans l'image")
+    assert "No module named 'src'" not in etape["output"], etape
+    assert etape["output"] == "7 passed", etape
+    assert "setuptools<81" in etape["note"], etape
+    assert any("setuptools<81" in p for p in passages)
+
+
+def test_setuptools_borne_seulement_sur_le_signal(tmp_path, monkeypatch):
+    """Sans `pkg_resources` dans la sortie, aucune relance."""
+    ecrire(tmp_path / "requirements.txt", "requests\n")
+    ecrire(tmp_path / "tests" / "test_api.py", "def test_ko():\n    assert False\n")
+    runner = BentoMLRunner("x", str(tmp_path), 300, logging.getLogger("t"))
+    runner._env_required_by_image = lambda: {}
+    avec_uvx(monkeypatch)
+    passages = []
+
+    def faux_run(commande, **kwargs):
+        if commande[0] == "docker":
+            return _Resultat(0, "")
+        passages.append(list(commande))
+        junit(commande, 1, 1)
+        return _Resultat(1, "1 failed")
+    monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
+    runner._run_pytest("http://localhost:32770")
+    assert not any("setuptools<81" in p for p in passages)

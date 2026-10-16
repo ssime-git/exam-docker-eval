@@ -5,6 +5,7 @@ Handles BentoML evaluations that use docker load + docker run pattern
 with pre-built Docker images.
 """
 
+import ast
 import json
 import logging
 import os
@@ -186,6 +187,74 @@ def corps_en_ligne_apres_predict(texte: str):
                 yield corps
 
 
+def _attend_un_succes(fonction: ast.AST) -> bool:
+    """Le test vérifie-t-il un `status_code` à 200 (`== 200`, `in (200, 201)`) ?"""
+    for noeud in ast.walk(fonction):
+        if not isinstance(noeud, ast.Compare):
+            continue
+        termes = [noeud.left, *noeud.comparators]
+        if not any(isinstance(t, ast.Attribute) and t.attr == "status_code" for t in termes):
+            continue
+        for terme in termes:
+            for feuille in ast.walk(terme):
+                if isinstance(feuille, ast.Constant) and feuille.value == 200:
+                    return True
+    return False
+
+
+def _vise_predict(appel: ast.Call) -> bool:
+    """Le premier argument de l'appel désigne-t-il la route /predict ?"""
+    if not appel.args:
+        return False
+    for feuille in ast.walk(appel.args[0]):
+        if isinstance(feuille, ast.Constant) and isinstance(feuille.value, str) \
+                and re.search(r"/predict/?$", feuille.value):
+            return True
+    return False
+
+
+def corps_documentes_par_les_tests(texte: str) -> list:
+    """Les corps JSON que les tests envoient à /predict dans un test qui
+    attend un succès (462113 : `client.post("/predict", json=VALID_INPUT_DATA)`
+    dans `test_jwt_authentication_success`, `assert ... == 200`).
+
+    Lecture statique (`ast`), rien n'est importé ni exécuté. Le corps est
+    écrit en ligne ou dans une constante du module. Un test qui attend un
+    refus envoie souvent une entrée invalide : il ne documente rien."""
+    try:
+        arbre = ast.parse(texte)
+    except (SyntaxError, ValueError):
+        return []
+    constantes = {}
+    for noeud in arbre.body:
+        if isinstance(noeud, ast.Assign) and len(noeud.targets) == 1 and isinstance(noeud.targets[0], ast.Name):
+            try:
+                constantes[noeud.targets[0].id] = ast.literal_eval(noeud.value)
+            except (ValueError, TypeError, SyntaxError, RecursionError):
+                continue
+    corps_lus = []
+    for fonction in ast.walk(arbre):
+        if not isinstance(fonction, (ast.FunctionDef, ast.AsyncFunctionDef)) or not _attend_un_succes(fonction):
+            continue
+        for appel in ast.walk(fonction):
+            if not (isinstance(appel, ast.Call) and isinstance(appel.func, ast.Attribute)
+                    and appel.func.attr == "post" and _vise_predict(appel)):
+                continue
+            for mot in appel.keywords:
+                if mot.arg != "json":
+                    continue
+                if isinstance(mot.value, ast.Name):
+                    corps = constantes.get(mot.value.id)
+                else:
+                    try:
+                        corps = ast.literal_eval(mot.value)
+                    except (ValueError, TypeError, SyntaxError, RecursionError):
+                        corps = None
+                if isinstance(corps, dict) and profil_reconnu(corps) and corps not in corps_lus:
+                    corps_lus.append(corps)
+    return corps_lus
+
+
 # uv refuse de lire le requirements.txt de la copie (468775 : « error:
 # Unexpected '·', expected '-c', '-e', '-r' or the start of a requirement:
 # requirements.txt:1:2 » ; « Couldn't parse requirement in `requirements.txt` »).
@@ -200,6 +269,8 @@ PAQUET_DU_MODULE = {"jwt": "pyjwt", "yaml": "pyyaml", "sklearn": "scikit-learn",
                     "bs4": "beautifulsoup4", "cv2": "opencv-python-headless"}
 # Dossier du bento dans une image produite par `bentoml containerize`.
 CODE_DU_BENTO = "/home/bentoml/bento/src"
+# Dernière série de setuptools qui fournit encore `pkg_resources` (retiré en 82).
+SETUPTOOLS_AVEC_PKG_RESOURCES = "setuptools<81"
 
 
 def modules_importes(dossier: str) -> Dict[str, set]:
@@ -1313,7 +1384,15 @@ class BentoMLRunner(BaseRunner):
                 fields[field_name] = field_type
         return fields
 
-    def _sample_value_for_field(self, field_name: str) -> Any:
+    def _sample_value_for_field(self, field_name: str, field_type: Optional[str] = None) -> Any:
+        """Valeur d'exemple d'un champ, au type annoncé : un champ `int`
+        reçoit un entier (462113 : `CGPA: int` refusait 8.6 en 400)."""
+        valeur = self._valeur_d_exemple(field_name)
+        if (field_type or '').strip() == 'int' and isinstance(valeur, float):
+            return int(round(valeur))
+        return valeur
+
+    def _valeur_d_exemple(self, field_name: str) -> Any:
         # Profil médian du jeu admission.csv. L'énoncé impose une régression
         # linéaire (« Créer un modèle de régression linéaire »), non bornée :
         # sur un profil extrême (GRE 330, CGPA 9) une copie correcte peut
@@ -1332,6 +1411,10 @@ class BentoMLRunner(BaseRunner):
         normalized = field_name.lower()
         if normalized in samples:
             return samples[normalized]
+        # Noms libres (`LOR_`, `GRE Score`) : la variable d'admission qu'ils désignent.
+        variable = _variable_du_profil(field_name)
+        if variable:
+            return PROFIL_MEDIAN[variable]
         if normalized.endswith('score'):
             return 1
         if normalized.startswith('is_') or normalized in {'research', 'holiday', 'workingday'}:
@@ -1415,6 +1498,19 @@ class BentoMLRunner(BaseRunner):
                     documenter(corps, source_path)
                     break
 
+        # Sans corps au README, celui que les tests de la copie envoient dans
+        # un test qui attend un succès (462113 : `VALID_INPUT_DATA`). Les
+        # tests livrés seulement : ceux lus dans l'image ne documentent rien.
+        if not contract.get('predict_documented_source'):
+            for source_path, text in texts:
+                if ("(dans l'image)" in source_path or not source_path.endswith('.py')
+                        or not looks_like_test_file(source_path)):
+                    continue
+                corps = next(iter(corps_documentes_par_les_tests(text)), None)
+                if corps is not None:
+                    documenter(corps, source_path)
+                    break
+
         ordered = sorted(texts, key=lambda item: looks_like_test_file(item[0]))
         found = find_credentials_in_texts(ordered)
         if found:
@@ -1470,12 +1566,12 @@ class BentoMLRunner(BaseRunner):
                             nested_fields = self._extract_class_fields(text, normalized)
                             if nested_fields:
                                 nested_body = {
-                                    nested_name: self._sample_value_for_field(nested_name)
-                                    for nested_name in nested_fields
+                                    nested_name: self._sample_value_for_field(nested_name, nested_type)
+                                    for nested_name, nested_type in nested_fields.items()
                                 }
                                 request_payload[field_name] = nested_body
                                 continue
-                        request_payload[field_name] = self._sample_value_for_field(field_name)
+                        request_payload[field_name] = self._sample_value_for_field(field_name, field_type)
                     if request_payload:
                         # Reconstruit avec nos valeurs d'exemple : pas un
                         # corps documenté par la copie.
@@ -2540,6 +2636,7 @@ class BentoMLRunner(BaseRunner):
                 + ". Le requirements.txt illisible reste une faute de la copie.",
             )
 
+        env_du_passage = env
         absent = _MODULE_ABSENT.search(sortie_de(result))
         if absent and self.image_name:
             module = absent.group(1).split(".")[0]
@@ -2553,19 +2650,45 @@ class BentoMLRunner(BaseRunner):
                     self.logger.info(
                         f"Les tests importent {module}, absent du rendu : code lu dans l'image ({CODE_DU_BENTO})")
                     result = lancer(command, env_image)
+                    env_du_passage = env_image
+                    result = self._relancer_sans_pkg_resources(result, command, env_image, lancer, results)
                     results["code_lu_dans_l_image"] = (
                         f"les tests importent du code non livré ({module}) ; lu dans l'image ({CODE_DU_BENTO})")
+                    # Ce que ce passage a rendu, pas l'erreur du premier
+                    # (464154 : « No module named 'src' » affiché alors que src
+                    # s'importait et que pkg_resources manquait).
                     self.record_step(
                         "Lancer les tests avec le code lu dans l'image",
                         command=f"docker cp {self.container_name}:{CODE_DU_BENTO} <temporaire>",
-                        output=absent.group(0),
+                        output=_extrait(sortie_de(result), None, self._valeurs_a_masquer),
                         exit_code=result.returncode,
                         note=results["code_lu_dans_l_image"].capitalize()
-                        + ". L'énoncé ne fait pas livrer src/ : les tests en dépendent quand même.",
+                        + ". L'énoncé ne fait pas livrer src/ : les tests en dépendent quand même."
+                        + (f" pkg_resources absent du setuptools injecté : relancé avec {results['setuptools_borne']}."
+                           if results.get("setuptools_borne") else ""),
                     )
             finally:
                 shutil.rmtree(dossier, ignore_errors=True)
+        else:
+            result = self._relancer_sans_pkg_resources(result, command, env_du_passage, lancer, results)
         return result
+
+    def _relancer_sans_pkg_resources(self, result, command, env, lancer, results):
+        """bentoml importe `pkg_resources` (via `fs`) ; setuptools ne le
+        fournit plus depuis la version 82, et le `setuptools` que nous
+        injectons sans borne résout à la dernière (464154 : 84). Notre
+        environnement, pas la copie : relance avec `setuptools<81`."""
+        sortie = (result.stdout or "") + "\n" + (result.stderr or "")
+        if "No module named 'pkg_resources'" not in sortie or "setuptools" not in command:
+            return result
+        i = command.index("setuptools")
+        if i == 0 or command[i - 1] != "--with":
+            return result
+        command[i] = SETUPTOOLS_AVEC_PKG_RESOURCES
+        self.logger.info("pkg_resources absent du setuptools injecté : relance avec "
+                         + SETUPTOOLS_AVEC_PKG_RESOURCES)
+        results["setuptools_borne"] = SETUPTOOLS_AVEC_PKG_RESOURCES
+        return lancer(command, env)
 
     def _paquets_des_imports(self, tests_path: str, projet: str, commande) -> list:
         """Paquets à installer pour les imports des tests : ni la
@@ -2746,17 +2869,11 @@ class BentoMLRunner(BaseRunner):
             self.logger.debug(f"Lecture du service dans l'image impossible : {exc}")
             return []
 
-        texts = []
-        current_path, buffer = None, []
-        for line in (result.stdout or "").splitlines():
-            if line.startswith("===FILE:"):
-                if current_path:
-                    texts.append((f"{current_path} (dans l'image)", "\n".join(buffer)))
-                current_path, buffer = line[len("===FILE:"):], []
-            elif current_path:
-                buffer.append(line)
-        if current_path:
-            texts.append((f"{current_path} (dans l'image)", "\n".join(buffer)))
+        # Le marqueur peut coller à la dernière ligne d'un fichier sans saut
+        # de ligne final (462113) : découpage sur le marqueur, pas par ligne.
+        morceaux = re.split(r"===FILE:([^\n]*)\n?", result.stdout or "")
+        texts = [(f"{chemin} (dans l'image)", contenu.rstrip("\n"))
+                 for chemin, contenu in zip(morceaux[1::2], morceaux[2::2])]
         return texts
 
     def _env_required_by_image(self) -> Dict[str, str]:
