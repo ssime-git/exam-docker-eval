@@ -366,6 +366,71 @@ def _variables_documentees(racine: str) -> Dict[str, str]:
     return documentees
 
 
+_PIP_INSTALL = re.compile(
+    r"^\s*(?:\$\s*)?(?:sudo\s+)?(?:python3?\s+-m\s+|uv\s+)?pip3?\s+install\s+(.+)$", re.M)
+# Options de `pip install` suivies d'une valeur qui n'est pas un paquet.
+_OPTIONS_A_VALEUR = {"-i", "--index-url", "--extra-index-url", "-f", "--find-links",
+                     "--target", "-t", "--prefix", "--root", "--python", "--trusted-host"}
+
+
+def _installations_du_readme(racine: str):
+    """(paquets, fichiers de requirements) que le README fait installer avec
+    `pip install`, dans l'ordre. 466697 : `pip install pytest requests`
+    après `pip install -r requirements.txt`, requests absent du
+    requirements.txt. Seules les lignes de commande comptent, pas la prose ;
+    `pip` lui-même et les installations locales (`-e .`) sont écartés."""
+    import shlex
+
+    paquets, fichiers = [], []
+    for dossier, sous_dossiers, noms in os.walk(racine):
+        sous_dossiers[:] = [d for d in sous_dossiers
+                            if d not in ("__MACOSX", ".git", "node_modules", ".venv", "venv")]
+        for nom_fichier in sorted(noms):
+            if nom_fichier.startswith("._") or not re.match(r"^readme(?:\.[a-z]+)?$", nom_fichier, re.I):
+                continue
+            chemin = os.path.join(dossier, nom_fichier)
+            try:
+                if os.path.getsize(chemin) > 200_000:
+                    continue
+                with open(chemin, encoding="utf-8", errors="replace") as f:
+                    contenu = re.sub(r"\\\n\s*", " ", f.read())
+            except OSError:
+                continue
+            for arguments in _PIP_INSTALL.findall(contenu):
+                try:
+                    jetons = shlex.split(arguments.split("#", 1)[0])
+                except ValueError:
+                    continue
+                suivant_ignore = suivant_fichier = False
+                for jeton in jetons:
+                    if jeton in ("&&", ";", "||", "|"):
+                        break
+                    if suivant_fichier:
+                        candidat = os.path.normpath(os.path.join(dossier, jeton))
+                        if os.path.isfile(candidat) and candidat not in fichiers:
+                            fichiers.append(candidat)
+                        suivant_fichier = False
+                        continue
+                    if suivant_ignore:
+                        suivant_ignore = False
+                        continue
+                    if jeton in ("-r", "--requirement"):
+                        suivant_fichier = True
+                        continue
+                    if jeton in ("-e", "--editable", "-c", "--constraint") or jeton in _OPTIONS_A_VALEUR:
+                        suivant_ignore = True
+                        continue
+                    if jeton.startswith("-") or jeton in (".", "..") or "/" in jeton:
+                        continue
+                    # pip lui-même ; une consigne (`<paquet>`, `$PAQUETS`).
+                    if (re.match(r"^pip(?:[<>=!~\[]|$)", jeton, re.I)
+                            or jeton.startswith("<") or "$" in jeton):
+                        continue
+                    if jeton not in paquets:
+                        paquets.append(jeton)
+    return paquets, fichiers
+
+
 def _expurger(texte: str, valeurs=()) -> str:
     """Ni jeton, ni secret du conteneur dans ce qu'on expose."""
     texte = _JETON.sub("<jeton>", texte)
@@ -1979,6 +2044,14 @@ class BentoMLRunner(BaseRunner):
              if paquet.strip() for arg in ("--with", paquet.strip())]
         if os.path.isfile(requirements_path):
             command.extend(["--with-requirements", requirements_path])
+        # Le passage réparé garde ce que le README fait installer.
+        paquets_readme, fichiers_readme = _installations_du_readme(self.eval_dir)
+        for fichier in fichiers_readme:
+            if fichier != os.path.normpath(requirements_path):
+                command.extend(["--with-requirements", fichier])
+        for paquet in paquets_readme:
+            if paquet not in _paquets_avec(command):
+                command.extend(["--with", paquet])
         patched_tests_path = self._prepare_tests_for_dynamic_base_url(
             tests_path, base_url
         )
@@ -2208,6 +2281,15 @@ class BentoMLRunner(BaseRunner):
         commande = ["uvx", "--python", pythons[0]]
         if os.path.isfile(requirements_path):
             commande += ["--with-requirements", requirements_path]
+        # Les `pip install` du README, joués comme il les écrit (466697 :
+        # `pip install pytest requests`) : les suivre n'est pas réparer.
+        paquets_readme, fichiers_readme = _installations_du_readme(self.eval_dir)
+        principal = os.path.normpath(requirements_path)
+        for fichier in fichiers_readme:
+            if fichier != principal:
+                commande += ["--with-requirements", fichier]
+        for paquet in paquets_readme:
+            commande += ["--with", paquet]
         commande += ["pytest", tests_path, "-v", "--tb=short", "-p", "no:cacheprovider",
                      *IGNORER_PARASITES_MACOS, f"--junit-xml={junit_path}"]
         self.logger.info("pytest tel que livré (requirements de la copie seul)...")
@@ -2242,6 +2324,7 @@ class BentoMLRunner(BaseRunner):
             "python": commande[2],
             "pythons_essayes": essais,
             "variables_documentees": list(getattr(self, "_noms_documentes", [])),
+            "paquets_readme": list(paquets_readme),
             "sortie": sortie,
         }
         self.record_step(
@@ -2254,7 +2337,10 @@ class BentoMLRunner(BaseRunner):
                   + (" Notre outillage en cause : critère non mesuré." if imputable == "outillage" else ""))
                  + (" Variables exportées comme le documente la copie : "
                     + ", ".join(constat["variables_documentees"]) + "."
-                    if constat["variables_documentees"] else ""),
+                    if constat["variables_documentees"] else "")
+                 + (" Paquets installés comme le fait le README : "
+                    + ", ".join(constat["paquets_readme"]) + "."
+                    if constat["paquets_readme"] else ""),
         )
         return result, constat
 
