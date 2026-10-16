@@ -189,3 +189,34 @@ def test_documentation_partielle_seuls_les_non_documentes_sont_reproches(tmp_pat
     reparations = {r["id"]: r for r in resultat["reparations"]}
     applique = reparations["secret_du_conteneur"]["applique"]
     assert "JWT_SECRET" in applique and "API_USERNAME" not in applique, applique
+
+
+def test_convention_du_skill_s_ajoute_aux_noms_par_defaut(tmp_path, monkeypatch):
+    """Cause racine de 462853 : `pi_test_env: BASE_URL,API_URL,SERVICE_URL`
+    remplaçait la liste par défaut et en retirait API_BASE_URL. La
+    convention s'ajoute : chaque nom par défaut reste exporté, même quand
+    les tests ne le lisent pas sous une forme reconnaissable."""
+    ecrire(tmp_path / "requirements.txt", "requests==2.32.5\n")
+    # Lecture sans défaut : seule la liste exportée peut la satisfaire.
+    ecrire(tmp_path / "tests" / "test_api.py",
+           "import os\nBASE_URL = os.environ['API_BASE_URL']\n\ndef test_a():\n    assert True\n")
+    runner = BentoMLRunner("x", str(tmp_path), 300, logging.getLogger("t"))
+    runner._env_required_by_image = lambda: {}
+    monkeypatch.setattr(bentoml_runner.shutil, "which", lambda nom: "/usr/bin/uvx")
+    monkeypatch.setenv("EXAM_TEST_ENV", "BASE_URL,API_URL,SERVICE_URL,EXAM_URL")
+    for nom in ("API_BASE_URL", "SERVICE_BASE_URL", "BENTO_URL"):
+        monkeypatch.delenv(nom, raising=False)
+    envs = []
+
+    def faux_run(commande, **kwargs):
+        if commande[0] == "docker":
+            return _Resultat(0, "")
+        envs.append(dict(kwargs.get("env") or {}))
+        junit(commande, 1)
+        return _Resultat(0, "1 passed")
+    monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
+
+    runner._run_pytest(BASE)
+    for nom in ("BASE_URL", "API_URL", "SERVICE_URL", "SERVICE_BASE_URL", "API_BASE_URL", "BENTO_URL",
+                "EXAM_URL"):
+        assert envs[0].get(nom) == BASE, nom

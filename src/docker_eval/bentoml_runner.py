@@ -242,6 +242,10 @@ def fichiers_de_tests(dossier: str) -> list:
 
 # Que pytest ignore lui-même ces parasites : `._x_test.py` correspond au motif
 # `*_test.py` et serait collecté.
+# Les noms sous lesquels les tests des apprenants attendent l'adresse du
+# service ; EXAM_TEST_ENV (pi_test_env) s'y ajoute.
+NOMS_URL_PAR_DEFAUT = "BASE_URL,API_URL,SERVICE_URL,SERVICE_BASE_URL,API_BASE_URL,BENTO_URL"
+
 IGNORER_PARASITES_MACOS = ["--ignore-glob=*/._*", "--ignore-glob=*/__MACOSX/*"]
 
 
@@ -2091,10 +2095,14 @@ class BentoMLRunner(BaseRunner):
         # BENTOML_BASE_URL : son repli localhost:3000 partait en connexion
         # refusée et ses 7 tests « échouaient ». Exporter les conventions
         # courantes ne coûte rien et note ce que les tests valent vraiment.
-        # Convention d'examen declarable (pi_test_env, #49).
-        noms_env = [n.strip() for n in (os.environ.get("EXAM_TEST_ENV")
-                                        or "BASE_URL,API_URL,SERVICE_URL,SERVICE_BASE_URL,API_BASE_URL,BENTO_URL").split(",")
-                    if n.strip()]
+        # Convention d'examen declarable (pi_test_env, #49) : elle s'ajoute à
+        # la liste par défaut, elle ne la remplace pas. 462853 : le skill
+        # déclarait BASE_URL,API_URL,SERVICE_URL, API_BASE_URL disparaissait
+        # et les 20 tests visaient 127.0.0.1:3001.
+        noms_env = []
+        for n in (NOMS_URL_PAR_DEFAUT + "," + (os.environ.get("EXAM_TEST_ENV") or "")).split(","):
+            if n.strip() and n.strip() not in noms_env:
+                noms_env.append(n.strip())
         for nom in noms_env:
             env.setdefault(nom, base_url)
         # Le nom que les tests lisent vraiment, en plus de la convention : une

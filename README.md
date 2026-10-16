@@ -76,7 +76,8 @@ La variable est consultée avant les dépôts frères, mais **après** un paquet
    SKILL.md**, jamais le moteur. Clés servies en environnement :
    `pi_default_service_port` → `EXAM_DEFAULT_SERVICE_PORT`,
    `pi_test_packages` → `EXAM_TEST_PACKAGES`,
-   `pi_test_env` → `EXAM_TEST_ENV`,
+   `pi_test_env` → `EXAM_TEST_ENV` (s'ajoute aux noms d'URL par défaut, ne
+   les remplace pas),
    `pi_stack_mode` (serving|pipeline|auto) → `EXAM_STACK_MODE`.
    Clé absente = défaut historique du moteur.
 3. **Cas unique d'une copie** — aucun code. C'est le travail de
