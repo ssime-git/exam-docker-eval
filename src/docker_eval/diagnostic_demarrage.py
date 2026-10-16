@@ -207,10 +207,13 @@ def classer_service(attrs: dict, logs: str) -> dict:
                      f"conteneur tué faute de mémoire (OOMKilled, code {code})")
     preuve = _ligne(logs, _MOTIFS_VERSIONS)
     if preuve:
-        return cause("conflit_versions_dependances", INDETERMINE,
-                     f"dépendances installées incompatibles : {preuve}. Un paquet non épinglé "
-                     "publié après le rendu peut en être la cause : à trancher en reconstruisant "
-                     "avec les versions disponibles à la date du rendu")
+        conflit = cause("conflit_versions_dependances", INDETERMINE,
+                        f"dépendances installées incompatibles : {preuve}. Un paquet non épinglé "
+                        "publié après le rendu peut en être la cause : à trancher en reconstruisant "
+                        "avec les versions disponibles à la date du rendu")
+        # La ligne seule, citée par la reconstruction datée et le feedback.
+        conflit["extrait"] = preuve
+        return conflit
     if 127 in codes_sante or _MOTIFS_COMMANDE_ABSENTE.search(sorties_sante):
         return cause("healthcheck_commande_absente", COPIE,
                      "la commande du healthcheck n'existe pas dans l'image : "
