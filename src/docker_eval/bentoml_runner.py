@@ -452,6 +452,9 @@ NOMS_URL_PAR_DEFAUT = "BASE_URL,API_URL,SERVICE_URL,SERVICE_BASE_URL,API_BASE_UR
 
 IGNORER_PARASITES_MACOS = ["--ignore-glob=*/._*", "--ignore-glob=*/__MACOSX/*"]
 
+# Les noms d'une partie facultative ou bonus d'un rendu (457338 : `optional_part`).
+_PARTIE_FACULTATIVE = re.compile(r"optional|optionnel|facultati|bonus")
+
 
 # uv n'a pas pu joindre l'index de paquets : notre réseau, pas la copie.
 _RESEAU_UV = re.compile(
@@ -1685,18 +1688,30 @@ class BentoMLRunner(BaseRunner):
         """Yield readable text files from the submission or embedded OCI layers."""
         interesting_suffixes = ('.py', '.md', '.txt', '.yaml', '.yml')
 
-        for root, _, files in os.walk(self.eval_dir):
-            for file_name in files:
-                if not file_name.endswith(interesting_suffixes):
+        # Le premier README qui documente un corps ou des identifiants fait
+        # foi : l'ordre ne peut pas dépendre du système de fichiers (457338 :
+        # le README de `optional_part` lu avant celui de la partie notée).
+        chemins = []
+        for root, dossiers, files in os.walk(self.eval_dir):
+            dossiers[:] = sorted(d for d in dossiers if d != "__MACOSX")
+            for file_name in sorted(files):
+                if file_name.endswith(interesting_suffixes):
+                    chemins.append(os.path.join(root, file_name))
+
+        def rang(chemin):
+            readme_racine = (
+                os.path.dirname(os.path.abspath(chemin)) == os.path.abspath(self.eval_dir)
+                and os.path.basename(chemin).lower().startswith("readme"))
+            return (not readme_racine,) + self._rang_dans_le_rendu(os.path.dirname(chemin))
+
+        for full_path in sorted(chemins, key=rang):
+            try:
+                if os.path.getsize(full_path) > 200_000:
                     continue
-                full_path = os.path.join(root, file_name)
-                try:
-                    if os.path.getsize(full_path) > 200_000:
-                        continue
-                    with open(full_path, encoding='utf-8', errors='replace') as handle:
-                        yield full_path, handle.read()
-                except Exception:
-                    continue
+                with open(full_path, encoding='utf-8', errors='replace') as handle:
+                    yield full_path, handle.read()
+            except Exception:
+                continue
 
         manifest_path = os.path.join(self.eval_dir, 'manifest.json')
         blobs_root = os.path.join(self.eval_dir, 'blobs', 'sha256')
@@ -2384,14 +2399,40 @@ class BentoMLRunner(BaseRunner):
         if os.path.isdir(tests_dir):
             return tests_dir
 
-        for root, _, files in os.walk(self.eval_dir):
-            for filename in files:
-                if filename.startswith("test_") and filename.endswith(".py"):
-                    return root
-                if filename.endswith("_test.py"):
-                    return root
+        candidats = []
+        for root, dossiers, files in os.walk(self.eval_dir):
+            dossiers[:] = sorted(d for d in dossiers if d != "__MACOSX")
+            if any(
+                (f.startswith("test_") and f.endswith(".py")) or f.endswith("_test.py")
+                for f in files
+                if not fichier_parasite_macos(f)
+            ):
+                candidats.append(root)
+        if not candidats:
+            return None
 
-        return None
+        # Un rendu en deux parties (457338 : `mandatory_part/`, `optional_part/`)
+        # porte deux suites de tests. Le premier dossier rendu par `os.walk`
+        # dépend du système de fichiers ; on lançait parfois les tests de la
+        # passerelle facultative contre l'image notée.
+        return min(candidats, key=self._rang_dans_le_rendu)
+
+    def _rang_dans_le_rendu(self, dossier: str) -> tuple:
+        """Clé de tri d'un dossier du rendu, le plus pertinent d'abord : le
+        plus proche de l'image évaluée, puis hors partie facultative, puis le
+        moins profond, puis l'ordre alphabétique."""
+        image = os.path.dirname(os.path.abspath(self.image_tar)) if self.image_tar else None
+        absolu = os.path.abspath(dossier)
+        proximite = 0
+        if image:
+            try:
+                proximite = len(os.path.commonpath([absolu, image]))
+            except ValueError:
+                proximite = 0
+        relatif = os.path.relpath(absolu, os.path.abspath(self.eval_dir))
+        profondeur = 0 if relatif == os.curdir else relatif.count(os.sep) + 1
+        facultatif = bool(_PARTIE_FACULTATIVE.search(relatif.lower()))
+        return (-proximite, facultatif, profondeur, relatif)
 
     def _project_root_for_tests(self, tests_path: str) -> str:
         """Le dossier depuis lequel les tests de l'apprenant peuvent s'importer."""
