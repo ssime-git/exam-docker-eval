@@ -632,6 +632,32 @@ def acces_delivre(reponse) -> list:
     return variantes
 
 
+_LECTURE_ENV = re.compile(
+    r'os\.(?:environ\.get|getenv)\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*'
+    r'(?:,\s*([^)]*?))?\s*\)(\s*or\b)?')
+
+
+def _lectures_env_sans_defaut(texte: str) -> set:
+    """Variables lues par `os.environ.get`/`os.getenv` sans défaut utile :
+    ni second argument (ou une chaîne vide, None), ni repli `or ...`."""
+    noms = set()
+    for nom, defaut, repli in _LECTURE_ENV.findall(texte or ""):
+        if repli:
+            continue
+        if defaut.strip() not in ("", "''", '""', "None"):
+            continue
+        noms.add(nom)
+    return noms
+
+
+def _est_utilisateur(nom: str) -> bool:
+    return "USER" in nom.upper() or nom.upper().endswith("_LOGIN")
+
+
+def _est_mot_de_passe(nom: str) -> bool:
+    return "PASS" in nom.upper() or "PWD" in nom.upper()
+
+
 def _alterer(valeur: str) -> str:
     """Une valeur d'accès modifiée : même forme, derniers caractères changés."""
     if len(valeur) <= 8:
@@ -670,6 +696,8 @@ class BentoMLRunner(BaseRunner):
         self.container = None
         self.image_name = None
         self.cli_container_id: Optional[str] = None
+        self.credentials_source: Optional[str] = None
+        self.credentials_in_tests = False
         self.container_name = f"bentoml_eval_{student_name}".replace(" ", "_").lower()
 
     def run_evaluation(self) -> Dict[str, Any]:
@@ -1063,6 +1091,7 @@ class BentoMLRunner(BaseRunner):
         """
         self._log_execution_start()
 
+        debut = time.time()
         image_loaded = False
         container_started = False
         api_ready = False
@@ -1101,10 +1130,12 @@ class BentoMLRunner(BaseRunner):
             # nous-memes supposait de savoir ce qui est libre sur l'hote, ce
             # qu'un processus conteneurise ne peut pas savoir.
             port_mode = "ephemere"
+            # Sans `--rm` : un conteneur mort au démarrage doit rester
+            # lisible (logs, code de sortie) pour imputer l'échec. Le
+            # nettoyage le supprime par son nom (_force_cleanup_container).
             run_cmd = [
                 "docker",
                 "run",
-                "--rm",
                 "-d",
                 "--name",
                 self.container_name,
@@ -1188,6 +1219,7 @@ class BentoMLRunner(BaseRunner):
             return result
 
         except Exception as e:
+            elapsed = time.time() - debut
             error_msg = f"Execution error: {str(e)}"
             self.logger.error(error_msg, exc_info=True)
             result = {
@@ -1199,7 +1231,35 @@ class BentoMLRunner(BaseRunner):
                 "container_started": container_started,
                 "api_ready": api_ready,
                 "execution_mode": "image_only_cli",
+                "credentials_source": self.credentials_source,
+                "credentials_in_tests": self.credentials_in_tests,
             }
+            if container_started:
+                # Même relevé que le chemin testcontainers : sans lui, un
+                # conteneur mort au démarrage finissait en « cause non
+                # établie » (469475).
+                diagnostics = self._collect_diagnostics()
+                died, code_sortie = self._container_exit_state()
+                logs = self._capture_container_logs()
+                if isinstance(e, TimeoutError) and died:
+                    result["error"] = self._describe_container_death(code_sortie, elapsed)
+                result.update({
+                    "elapsed_seconds": round(elapsed, 1),
+                    "container_exited": died,
+                    "container_exit_code": code_sortie,
+                    "diagnostics": diagnostics,
+                    "container_logs": logs,
+                })
+                result["fault"] = self._attribute_fault(diagnostics, logs)
+                result["cause"] = self._cause_de_la_faute(result["fault"], diagnostics, logs)
+                self.record_step(
+                    "L'evaluation s'interrompt",
+                    output=_expurger(logs or result["error"], self._valeurs_a_masquer_conteneur()),
+                    exit_code=code_sortie,
+                    note=result["error"],
+                    duration=elapsed,
+                )
+                self.logger.info(f"Attribution de la faute : {result['fault']}")
             self._log_execution_end(result)
             return result
         finally:
@@ -1298,6 +1358,14 @@ class BentoMLRunner(BaseRunner):
 
             if elapsed > startup_timeout:
                 raise TimeoutError(f"API not ready after {startup_timeout}s")
+
+            # Un conteneur déjà sorti ne répondra plus : inutile d'attendre la
+            # fin du délai (469475 : mort en ~10 s, attente de 60 s).
+            if getattr(self, "cli_container_id", None):
+                mort, code_sortie = self._container_exit_state()
+                if mort:
+                    raise TimeoutError(
+                        f"conteneur arrêté (code {code_sortie}) avant de répondre, après {elapsed:.0f}s")
 
             container_logs = ""
             if getattr(self, "container", None) is not None:
@@ -1570,6 +1638,24 @@ class BentoMLRunner(BaseRunner):
                 f"Identifiants lus dans {found['source']}"
                 + (" -- ecrits en dur dans un test" if found['in_tests'] else "")
             )
+
+        # Identifiants que nous avons fournis au conteneur (469475 : le
+        # README fait générer API_USERNAME/API_PASSWORD) : le service ne
+        # connaît qu'eux. Calculés avant le démarrage, donc déjà en cache.
+        fournis = getattr(self, "_container_env", None) or {}
+        utilisateur = next((v for n, v in sorted(fournis.items()) if _est_utilisateur(n)), None)
+        mot_de_passe = next((v for n, v in sorted(fournis.items()) if _est_mot_de_passe(n)), None)
+        if mot_de_passe:
+            if utilisateur:
+                contract['usernames'] = [utilisateur] + [u for u in contract['usernames'] if u != utilisateur]
+            contract['passwords'] = [mot_de_passe] + [p for p in contract['passwords'] if p != mot_de_passe]
+            if mot_de_passe in self._valeurs_generees():
+                contract['credentials_source'] = (
+                    "environnement fourni au conteneur (variables citées par le README, "
+                    "valeurs générées par le correcteur)")
+                contract['credentials_in_tests'] = False
+                self.credentials_source = contract['credentials_source']
+                self.credentials_in_tests = False
 
         signature_lue = False
         for source_path, text in texts:
@@ -1914,6 +2000,11 @@ class BentoMLRunner(BaseRunner):
         utilisateur, mot_de_passe = str(cible.get("username", "")), str(cible.get("password", ""))
         if not utilisateur or not mot_de_passe:
             return False
+        if mot_de_passe in self._valeurs_generees():
+            # Mot de passe tiré par nous pour le conteneur (469475 : le
+            # README le fait générer) : sa présence dans la copie ne se
+            # mesure pas.
+            return None
         for racine, dossiers, fichiers in os.walk(self.eval_dir):
             dossiers[:] = [d for d in dossiers if d not in (".git", ".venv", "venv", "node_modules",
                                                             "__pycache__", ".pytest_cache")]
@@ -2887,6 +2978,10 @@ class BentoMLRunner(BaseRunner):
             return "systeme"
         if diag.get("docker_error") or diag.get("image_error"):
             return "systeme"
+        # Une variable que le README fait fournir et que nous n'avons pas
+        # fournie : le service a raison de refuser de démarrer.
+        if self._variables_documentees_absentes(logs):
+            return "systeme"
 
         # Le programme de l'apprenant a demarre puis a rendu la main en erreur.
         exit_code = diag.get("container_exit_code")
@@ -2898,6 +2993,47 @@ class BentoMLRunner(BaseRunner):
             return "apprenant"
 
         return "indetermine"
+
+    def _variables_documentees_absentes(self, logs: str) -> list:
+        """Noms de variables (avec `_`) cités à la fois par les logs du
+        conteneur et par le README, que nous n'avons pas fournis."""
+        # Seules les lignes d'erreur comptent : une variable citée dans un log
+        # ordinaire ne dit pas qu'elle manque.
+        erreurs = "\n".join(l for l in (logs or "").splitlines()
+                            if re.search(r"error|exception|missing|required|not set|must be|\bset\b",
+                                         l, re.IGNORECASE))
+        noms = set(re.findall(r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9]*_[A-Z0-9_]+)(?![A-Za-z0-9_])", erreurs))
+        if not noms:
+            return []
+        fournis = set(getattr(self, "_container_env", None) or {})
+        try:
+            documentation = "\n".join(
+                texte for chemin, texte in self._iter_submission_texts()
+                if os.path.basename(chemin).lower().startswith("readme"))
+        except Exception:
+            return []
+        return sorted(nom for nom in noms - fournis
+                      if not nom.startswith("BENTOML_")
+                      and re.search(rf"(?<![A-Za-z0-9_]){re.escape(nom)}(?![A-Za-z0-9_])", documentation))
+
+    def _cause_de_la_faute(self, faute: str, diag: Dict[str, Any], logs: str) -> str:
+        """La cause, en clair, qui accompagne `fault`."""
+        absentes = self._variables_documentees_absentes(logs)
+        if faute == "systeme" and absentes:
+            return ("variables d'environnement exigées par le README non fournies au conteneur : "
+                    + ", ".join(absentes))
+        code = diag.get("container_exit_code")
+        derniere = next((l.strip() for l in reversed((logs or "").splitlines()) if l.strip()), "")
+        derniere = _expurger(derniere, self._valeurs_a_masquer_conteneur())[:300]
+        if faute == "apprenant":
+            return f"le service de l'image s'arrête au démarrage (code {code}) : {derniere}"
+        if faute == "systeme":
+            return "l'environnement de correction n'a pas pu exécuter l'image"
+        return "cause non établie"
+
+    def _valeurs_a_masquer_conteneur(self) -> list:
+        return [str(v) for v in (getattr(self, "_container_env", None) or {}).values()
+                if v and len(str(v)) >= 4]
 
     def _http_timeout(self, base: int) -> int:
         """Delai d'une requete HTTP, allonge quand on emule.
@@ -2963,9 +3099,22 @@ class BentoMLRunner(BaseRunner):
             return self._container_env
 
         requis = set()
+        lues_sans_defaut = set()
         for _, texte in self._read_service_from_image():
             requis.update(re.findall(
                 r'os\.environ\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*\]', texte))
+            lues_sans_defaut.update(_lectures_env_sans_defaut(texte))
+        # 469475 : `os.environ.get('API_USERNAME', '')` puis RuntimeError au
+        # démarrage, et un README qui fait générer ces valeurs (`--env-file`).
+        # Lecture sans défaut (ou défaut vide) ET nom cité par la
+        # documentation de la copie : la fournir, c'est suivre le README.
+        if lues_sans_defaut - requis:
+            documentation = "\n".join(
+                texte for chemin, texte in self._iter_submission_texts()
+                if os.path.basename(chemin).lower().startswith("readme"))
+            requis.update(nom for nom in lues_sans_defaut
+                          if re.search(rf"(?<![A-Za-z0-9_]){re.escape(nom)}(?![A-Za-z0-9_])",
+                                       documentation))
 
         env: Dict[str, str] = {}
         if requis:
@@ -2981,13 +3130,23 @@ class BentoMLRunner(BaseRunner):
                         continue
                     declares.setdefault(nom, valeur)
             import secrets
+            generees = set()
             for nom in sorted(requis):
                 env[nom] = declares.get(nom) or secrets.token_hex(32)
+                if not declares.get(nom):
+                    generees.add(nom)
+            self._env_genere = generees
             self.logger.info(
                 "Variables exigees par le service : " + ", ".join(sorted(requis)))
 
         self._container_env = env
         return env
+
+    def _valeurs_generees(self) -> set:
+        """Valeurs que nous avons tirées au hasard pour le conteneur (aucune
+        valeur documentée) : elles ne figurent pas dans la copie."""
+        env = getattr(self, "_container_env", None) or {}
+        return {env[nom] for nom in getattr(self, "_env_genere", set()) if nom in env}
 
     def _completer_environnement_image(self, platform: Optional[str], attrs: dict) -> None:
         """L'image réellement exécutée, son architecture, et les limites du
