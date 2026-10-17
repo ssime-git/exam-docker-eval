@@ -31,13 +31,20 @@ from .config import BENTOML_PORT, BENTOML_READY_PATTERN, API_STARTUP_TIMEOUT, EM
 
 
 def premier_nombre(donnee):
-    """La première valeur numérique d'une réponse JSON (la prédiction), ou None."""
+    """La première valeur numérique hors erreur et métadonnées HTTP.
+
+    Le nom du champ de prédiction reste libre. Un code de statut n'est pas
+    une prédiction et une réponse explicitement en erreur ne la prouve pas.
+    """
     if isinstance(donnee, bool):
         return None
     if isinstance(donnee, (int, float)):
         return donnee
     if isinstance(donnee, dict):
-        donnee = list(donnee.values())
+        if any(donnee.get(cle) for cle in ("error", "errors")):
+            return None
+        donnee = [valeur for cle, valeur in donnee.items()
+                  if cle not in {"status", "status_code", "code", "detail", "message"}]
     if isinstance(donnee, list):
         for element in donnee:
             trouve = premier_nombre(element)
@@ -1730,12 +1737,13 @@ class BentoMLRunner(BaseRunner):
                         if predict_response.status_code != 200:
                             continue
                         data = predict_response.json()
-                        # Un 200 sur /predict est une reponse valide. Exiger une
-                        # cle precise revient a deviner comment l'apprenant a
-                        # nomme son champ : un service qui repond correctement
-                        # avec un autre nom etait recale pour rien.
-                        results["predict_passed"] = True
+                        # Le statut HTTP seul ne prouve pas une prédiction :
+                        # certains services renvoient leurs erreurs en JSON 200.
                         results["predict_response"] = str(data)[:400]
+                        if premier_nombre(data) is None:
+                            self.logger.warning("HTTP 200 sans prédiction numérique : %s", str(data)[:200])
+                            continue
+                        results["predict_passed"] = True
                         predict_ok = (body, headers, data, variante)
                         results["mecanisme_acces"] = variante["mecanisme"]
                         # L'enveloppe gagnante compte autant que le corps :
