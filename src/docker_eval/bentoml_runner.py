@@ -784,6 +784,41 @@ def identifiants_du_login(corps, profondeur: int = 0) -> Optional[dict]:
     return None
 
 
+def tags_du_tar(chemin: str) -> list:
+    """RepoTags d'une archive `docker save` (manifest.json), sinon noms
+    d'image de l'index OCI. Lecture des seuls fichiers d'index : les tars
+    font plusieurs centaines de Mo et rien n'est extrait sur le disque."""
+    tags: list = []
+    try:
+        with tarfile.open(chemin) as archive:
+            def lire(nom):
+                try:
+                    membre = archive.extractfile(nom)
+                except KeyError:
+                    return None
+                if membre is None:
+                    return None
+                try:
+                    return json.loads(membre.read(5_000_000).decode("utf-8"))
+                except ValueError:
+                    return None
+
+            manifest = lire("manifest.json")
+            for entree in manifest if isinstance(manifest, list) else []:
+                for tag in (entree or {}).get("RepoTags") or []:
+                    if isinstance(tag, str) and tag not in tags:
+                        tags.append(tag)
+            if not tags:
+                index = lire("index.json")
+                for entree in (index or {}).get("manifests") or [] if isinstance(index, dict) else []:
+                    nom = ((entree or {}).get("annotations") or {}).get("io.containerd.image.name")
+                    if isinstance(nom, str) and nom not in tags:
+                        tags.append(nom)
+    except (OSError, tarfile.TarError):
+        return []
+    return tags
+
+
 def _est_utilisateur(nom: str) -> bool:
     return "USER" in nom.upper() or nom.upper().endswith("_LOGIN")
 
@@ -889,6 +924,7 @@ class BentoMLRunner(BaseRunner):
                         "exit_code": 2,
                         "image_loaded": False,
                         **self._champs_identifiants(),
+                        **self._infos_image(),
                     }
                 image_loaded = True
             else:
@@ -1067,6 +1103,7 @@ class BentoMLRunner(BaseRunner):
                 "host_arch": self._host_arch(),
                 "credentials_source": self.credentials_source,
                 "credentials_in_tests": self.credentials_in_tests,
+                **self._infos_image(),
                 "steps": self.steps,
             }
 
@@ -1103,6 +1140,7 @@ class BentoMLRunner(BaseRunner):
                 "api_ready": api_ready,
                 "container_logs": self._capture_container_logs(),
                 **self._champs_identifiants(),
+                **self._infos_image(),
             }
             # L'echec est une etape comme une autre : il doit se lire dans la
             # trace, au bon endroit, avec ce que le conteneur a dit.
@@ -1136,6 +1174,7 @@ class BentoMLRunner(BaseRunner):
                 "api_ready": api_ready,
                 "container_logs": self._capture_container_logs(),
                 **self._champs_identifiants(),
+                **self._infos_image(),
             }
             # L'echec est une etape comme une autre : il doit se lire dans la
             # trace, au bon endroit, avec ce que le conteneur a dit.
@@ -1209,17 +1248,32 @@ class BentoMLRunner(BaseRunner):
                     self.logger.error(f"docker load failed: {output.strip()}")
                     return None
 
-                match = re.search(r"Loaded image:\s*(.+)", output) or re.search(r"Loaded image ID:\s*(.+)", output)
-                if match:
-                    chargee = match.group(1).strip()
-                    self.logger.info(f"✓ Image loaded via docker CLI: {chargee}")
-                    return self.adopter_image(chargee)
+                # Tous les « Loaded image », pas le premier seulement : un
+                # tar à plusieurs tags (ou plusieurs images) laissait les
+                # autres derrière lui et le barème ne les voyait pas.
+                chargees = [m.strip() for m in re.findall(r"Loaded image:\s*(.+)", output)]
+                if not chargees:
+                    chargees = [m.strip() for m in re.findall(r"Loaded image ID:\s*(.+)", output)]
+                self._images_chargees = chargees
+                if chargees:
+                    self.logger.info(f"✓ Image(s) loaded via docker CLI: {', '.join(chargees)}")
+                    adoptees = [self.adopter_image(chargee) for chargee in chargees]
+                    return adoptees[0]
 
             self.logger.error("docker load succeeded but no image tag/id found in output")
             return None
         except Exception as e:
             self.logger.error(f"docker load CLI error: {e}")
             return None
+
+    def _infos_image(self) -> Dict[str, Any]:
+        """Tags réellement présents dans le tar (manifest.json, sinon
+        index.json) et images annoncées par `docker load`. 462113 : le README
+        lance `:latest`, le seul tag du tar est `:qdo3i3fmj6dwm7my`."""
+        if getattr(self, "_image_tags", None) is None:
+            self._image_tags = tags_du_tar(self.image_tar) if self.image_tar else []
+        return {"image_tags": list(self._image_tags),
+                "images_chargees": list(getattr(self, "_images_chargees", []) or [])}
 
     def _run_image_only_evaluation(self) -> Dict[str, Any]:
         """
@@ -1253,6 +1307,7 @@ class BentoMLRunner(BaseRunner):
                             "exit_code": 2,
                             "image_loaded": False,
                             **self._champs_identifiants(),
+                            **self._infos_image(),
                         }
                     self.image_name = bento_result["image_name"]
                 else:
@@ -1262,6 +1317,7 @@ class BentoMLRunner(BaseRunner):
                         "exit_code": 2,
                         "image_loaded": False,
                         **self._champs_identifiants(),
+                        **self._infos_image(),
                     }
             image_loaded = True
 
@@ -1311,6 +1367,7 @@ class BentoMLRunner(BaseRunner):
                     "image_loaded": image_loaded,
                     "container_started": False,
                     **self._champs_identifiants(),
+                    **self._infos_image(),
                 }
 
             self.cli_container_id = (run_result.stdout or "").strip() or self.container_name
@@ -1356,6 +1413,7 @@ class BentoMLRunner(BaseRunner):
                 "execution_mode": "image_only_cli",
                 "credentials_source": self.credentials_source,
                 "credentials_in_tests": self.credentials_in_tests,
+                **self._infos_image(),
             }
             self._log_execution_end(result)
             return result
@@ -1374,6 +1432,7 @@ class BentoMLRunner(BaseRunner):
                 "api_ready": api_ready,
                 "execution_mode": "image_only_cli",
                 **self._champs_identifiants(),
+                **self._infos_image(),
             }
             if container_started:
                 # Même relevé que le chemin testcontainers : sans lui, un
@@ -1424,10 +1483,13 @@ class BentoMLRunner(BaseRunner):
                 images = client.images.load(f.read())
 
                 if images:
-                    image = images[0]
-                    chargee = image.tags[0] if image.tags else image.id
-                    self.logger.info(f"✓ Image loaded: {chargee}")
-                    return self.adopter_image(chargee)
+                    # Tous les tags de toutes les images chargées : chacun
+                    # est adopté (donc supprimé au ménage) et exposé.
+                    chargees = [tag for image in images for tag in (image.tags or [image.id])]
+                    self._images_chargees = chargees
+                    self.logger.info(f"✓ Image(s) loaded: {', '.join(chargees)}")
+                    adoptees = [self.adopter_image(chargee) for chargee in chargees]
+                    return adoptees[0]
                 else:
                     self.logger.error("No image found in tar file")
                     return None
