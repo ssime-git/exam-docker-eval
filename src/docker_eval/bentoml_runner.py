@@ -53,6 +53,117 @@ def premier_nombre(donnee):
     return None
 
 
+# Noms de champ qui portent la prédiction, par priorité (sous-chaîne du nom,
+# en minuscules) : `chance_of_admit` (469475) relève de « chance ». « score »
+# vient en dernier, `gre_score` étant un nom d'entrée parfois renvoyé.
+CHAMPS_PREDICTION = ("prediction", "predicted", "chance", "admit", "probab", "result",
+                     "estimat", "output", "score")
+
+
+def _nombre_de(valeur):
+    if isinstance(valeur, bool):
+        return None
+    if isinstance(valeur, (int, float)):
+        return valeur
+    if isinstance(valeur, list):
+        return next((n for n in (_nombre_de(v) for v in valeur) if n is not None), None)
+    if isinstance(valeur, dict):
+        return lire_prediction(valeur)
+    return None
+
+
+def reponse_en_erreur(donnee) -> bool:
+    """Un JSON qui dit l'erreur : `error`/`errors`, ou `detail` ou un
+    `status` ≥ 400 sans champ de prédiction (451711 : `200 {"error": ...,
+    "status": 401}`)."""
+    if not isinstance(donnee, dict):
+        return False
+    if any(donnee.get(cle) for cle in ("error", "errors")):
+        return True
+    porte_prediction = any(any(nom in str(cle).lower() for nom in CHAMPS_PREDICTION[:-1])
+                           for cle in donnee)
+    if porte_prediction:
+        return False
+    if donnee.get("detail"):
+        return True
+    for cle in ("status", "status_code", "code"):
+        valeur = donnee.get(cle)
+        if isinstance(valeur, int) and not isinstance(valeur, bool) and valeur >= 400:
+            return True
+    return False
+
+
+def lire_prediction(donnee):
+    """La prédiction d'une réponse /predict, ou None : champ dédié d'abord,
+    puis repli sur le premier nombre hors métadonnées HTTP."""
+    if reponse_en_erreur(donnee):
+        return None
+    if isinstance(donnee, dict):
+        for nom in CHAMPS_PREDICTION:
+            for cle, valeur in donnee.items():
+                if nom in str(cle).lower():
+                    trouve = _nombre_de(valeur)
+                    if trouve is not None:
+                        return trouve
+    return premier_nombre(donnee)
+
+
+# Champs du corps /predict qui transportent le jeton (451711 : `token`).
+CHAMPS_JETON = ("token", "access_token", "jwt", "auth_token", "bearer", "authorization")
+
+
+def substituer_jeton(corps, jeton: str):
+    """Le corps avec le jeton du login à la place des placeholders : tout
+    champ `token`/`access_token`/`jwt`... (« <TOKEN_FROM_LOGIN> »,
+    « VOTRE_TOKEN », « {token} », un jeton d'exemple périmé), et toute
+    occurrence de `{token}`. Un préfixe « Bearer » est conservé."""
+    if isinstance(corps, dict):
+        sortie = {}
+        for cle, valeur in corps.items():
+            if str(cle).lower() in CHAMPS_JETON and isinstance(valeur, str):
+                prefixe = "Bearer " if valeur.lower().startswith("bearer ") else ""
+                sortie[cle] = prefixe + jeton
+            else:
+                sortie[cle] = substituer_jeton(valeur, jeton)
+        return sortie
+    if isinstance(corps, list):
+        return [substituer_jeton(v, jeton) for v in corps]
+    if isinstance(corps, str):
+        return corps.replace("{token}", jeton)
+    return corps
+
+
+def contient_jeton(corps, jeton: str) -> bool:
+    if not jeton:
+        return False
+    if isinstance(corps, dict):
+        return any(contient_jeton(v, jeton) for v in corps.values())
+    if isinstance(corps, list):
+        return any(contient_jeton(v, jeton) for v in corps)
+    return isinstance(corps, str) and jeton in corps
+
+
+def retirer_jeton(corps, jeton: str):
+    """Le corps sans les champs qui portent le jeton."""
+    if isinstance(corps, dict):
+        return {k: retirer_jeton(v, jeton) for k, v in corps.items()
+                if not (isinstance(v, str) and jeton in v)}
+    if isinstance(corps, list):
+        return [retirer_jeton(v, jeton) for v in corps]
+    return corps
+
+
+def alterer_jeton(corps, jeton: str):
+    """Le corps avec un jeton falsifié à la place du vrai."""
+    if isinstance(corps, dict):
+        return {k: alterer_jeton(v, jeton) for k, v in corps.items()}
+    if isinstance(corps, list):
+        return [alterer_jeton(v, jeton) for v in corps]
+    if isinstance(corps, str) and jeton in corps:
+        return corps.replace(jeton, _alterer(jeton))
+    return corps
+
+
 # Profil médian d'admission.csv, pour les sondes /predict. L'énoncé impose
 # « un modèle de régression linéaire », non borné : la chance d'admission
 # (« notée sur 1 ») d'un profil extrême peut dépasser 1 sur une copie juste.
@@ -1841,13 +1952,21 @@ class BentoMLRunner(BaseRunner):
             if predict_bodies:
                 results["corps_source"] = source_du_corps(contract, predict_bodies[0])
             for payload in predict_bodies:
-                normalized_payload = json.loads(json.dumps(payload).replace('{token}', token))
+                normalized_payload = substituer_jeton(payload, token)
                 # L'accès obtenu au login doit accompagner la requete. Il ne
                 # l'etait pas : les en-tetes partaient vides et /predict rendait
                 # 401, ce qui etait compte contre l'apprenant alors que son
                 # endpoint verifie correctement l'autorisation. Une variante
                 # par façon de présenter l'accès (Bearer, cookie, clé).
                 request_variants = []
+                # Jeton porté par le corps (451711 : `input_data.token`) :
+                # d'abord sans en-tête, pour savoir si le corps suffit.
+                if contient_jeton(normalized_payload, token):
+                    dans_le_corps = {"mecanisme": "jeton_corps", "entete": None,
+                                     "valeur": token, "entetes": {}}
+                    for wrapper in contract.get("predict_wrappers", [None, "request"]):
+                        request_variants.append(({wrapper: normalized_payload} if wrapper else normalized_payload,
+                                                 {}, dans_le_corps, wrapper))
                 for variante in acces:
                     for wrapper in contract.get("predict_wrappers", [None, "request"]):
                         if wrapper:
@@ -1879,7 +1998,7 @@ class BentoMLRunner(BaseRunner):
                         # Le statut HTTP seul ne prouve pas une prédiction :
                         # certains services renvoient leurs erreurs en JSON 200.
                         results["predict_response"] = str(data)[:400]
-                        if premier_nombre(data) is None:
+                        if lire_prediction(data) is None:
                             self.logger.warning("HTTP 200 sans prédiction numérique : %s", str(data)[:200])
                             continue
                         results["predict_passed"] = True
@@ -1949,6 +2068,8 @@ class BentoMLRunner(BaseRunner):
         mecanisme = acces.get("mecanisme", "jeton")
         if not valeur:
             entetes_falsifies = None  # rien à modifier : critère non mesuré
+        elif mecanisme == "jeton_corps":
+            entetes_falsifies = dict(sans_auth)  # le jeton voyage dans le corps
         elif mecanisme == "cookie" and acces.get("cookies"):
             entetes_falsifies = {**sans_auth, "Cookie": "; ".join(
                 f"{k}={_alterer(v)}" for k, v in acces["cookies"].items())}
@@ -1972,27 +2093,54 @@ class BentoMLRunner(BaseRunner):
         for cle, val in list(cible_inv.items()) if isinstance(cible_inv, dict) else []:
             if isinstance(val, (int, float)) and not isinstance(val, bool):
                 cible_inv[cle] = "pas-un-nombre"
+        # Jeton aussi (ou seulement) dans le corps (451711) : « sans accès »
+        # le retire, « accès falsifié » l'altère, là où il voyage. Introuvable
+        # alors qu'il doit y être : non mesuré.
+        corps_sans, corps_falsifie = corps, corps
+        if valeur and contient_jeton(corps, valeur):
+            corps_sans, corps_falsifie = retirer_jeton(corps, valeur), alterer_jeton(corps, valeur)
+        elif mecanisme == "jeton_corps":
+            corps_sans = corps_falsifie = None
+        refus_dans_un_200 = []
+
+        def sonde(nom, chemin, corps_envoye, entetes_envoyes):
+            if corps_envoye is None or entetes_envoyes is None:
+                return None
+            r = requete("POST", chemin, json=corps_envoye, headers=entetes_envoyes)
+            if isinstance(r, str):
+                return r
+            if r.status_code == 200:
+                # Code relevé tel quel ; le refus porté par le JSON est noté à
+                # part, le barème décide.
+                try:
+                    if reponse_en_erreur(r.json()):
+                        refus_dans_un_200.append(nom)
+                except Exception:
+                    pass
+            return r.status_code
+
         securite = {
-            "predict_sans_token": code("POST", "/predict", json=corps, headers=sans_auth),
-            "predict_token_falsifie": (code("POST", "/predict", json=corps, headers=entetes_falsifies)
-                                       if entetes_falsifies is not None else None),
-            "login_mauvais_identifiants": (code("POST", "/login", json=mauvais_login)
-                                           if mauvais_login is not None else None),
+            "predict_sans_token": sonde("predict_sans_token", "/predict", corps_sans, sans_auth),
+            "predict_token_falsifie": sonde("predict_token_falsifie", "/predict", corps_falsifie,
+                                            entetes_falsifies),
+            "login_mauvais_identifiants": sonde("login_mauvais_identifiants", "/login", mauvais_login, {}),
             "mecanisme": mecanisme,
         }
+        if refus_dans_un_200:
+            securite["refus_dans_un_200"] = refus_dans_un_200
 
         # La prédiction jugée vient du profil médian : la régression linéaire
         # imposée n'est pas bornée, un profil extrême sort de [0, 1] sur une
         # copie juste. Si le service refuse le corps médian, repli sur la
         # réponse du premier appel.
-        prediction = premier_nombre(reponse)
+        prediction = lire_prediction(reponse)
         profil = "nominal"
         median = appliquer_profil_median(corps)
         if median != corps:
             r = requete("POST", "/predict", json=median, headers=entetes)
             if not isinstance(r, str) and r.status_code == 200:
                 try:
-                    valeur_mediane = premier_nombre(r.json())
+                    valeur_mediane = lire_prediction(r.json())
                 except Exception:
                     valeur_mediane = None
                 if valeur_mediane is not None:
