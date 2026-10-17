@@ -714,3 +714,37 @@ def test_diagnostic_attrs_without_state_or_health_does_not_crash(tmp_path, logge
     sortie = runner._diagnostic_up_rate(RuntimeError("x"))
 
     assert "nu (nu-1) : running" in sortie and "jamais lu" not in sortie
+
+
+def test_reglages_dns_de_la_copie_retires(tmp_path, logger):
+    """469634 : bike-api imposait `dns: [8.8.8.8, 1.1.1.1]`. Sur la machine de
+    correction, ces résolveurs publics ne répondaient pas (« Temporary failure
+    in name resolution »), alors que son résolveur par défaut atteint UCI.
+    Comme les ports hôte et `container_name`, ces clés lient la copie au
+    réseau où elle tourne : elles sont retirées, le reste est inchangé."""
+    import yaml
+
+    texte = (
+        "services:\n"
+        "  bike-api:\n    build: ./src/api\n    restart: unless-stopped\n"
+        "    healthcheck:\n      test: [CMD, python, -c, 'print(1)']\n      retries: 30\n"
+        "    dns:\n      - 8.8.8.8\n      - 1.1.1.1\n"
+        "    dns_search: example.org\n    dns_opt: [use-vc]\n"
+        "  prometheus:\n    image: prom/prometheus:v2.53.0\n    depends_on: [bike-api]\n"
+    )
+    runner = make_runner(tmp_path, logger, texte)
+
+    nom = runner._relax_host_ports(str(tmp_path / "docker-compose.yml"))
+
+    assert nom == "docker-compose.eval.yml"
+    reecrit = yaml.safe_load((tmp_path / nom).read_text())
+    attendu = yaml.safe_load(texte)
+    for cle in ("dns", "dns_search", "dns_opt"):
+        assert cle not in reecrit["services"]["bike-api"]
+        del attendu["services"]["bike-api"][cle]
+    assert reecrit == attendu
+    assert "Réglages DNS de la copie retirés : bike-api" in runner._port_relaxation_outcome
+    assert "8.8.8.8" in runner._port_relaxation_outcome
+    assert runner._dns_retires == {"bike-api": {"dns": ["8.8.8.8", "1.1.1.1"],
+                                                "dns_search": "example.org",
+                                                "dns_opt": ["use-vc"]}}
