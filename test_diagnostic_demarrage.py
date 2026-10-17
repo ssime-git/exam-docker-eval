@@ -432,3 +432,19 @@ def test_une_seule_capture_des_logs_entre_les_deux_etapes(tmp_path, monkeypatch)
     assert "bike-api (eval-bike-api-1) : running, unhealthy" in build["output"]
     assert "Diagnostic des services non sains" in build["output"]
     assert "pyarrow requires NumPy" not in build["output"]
+
+
+def test_reseau_sortant_cite_le_dns_retire_de_la_copie(tmp_path, monkeypatch):
+    """469634 : si l'erreur réseau survient malgré le retrait de `dns:`, la
+    preuve cite la clé d'origine, pour la repérer sans ouvrir le compose."""
+    conteneurs = [Conteneur("eval-bike-api-1", etat(restarts=1, exit_code=1), LOGS_RESEAU.encode())]
+    runner = runner_sans_docker(tmp_path, monkeypatch, conteneurs)
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  bike-api:\n    image: x\n    dns: [8.8.8.8, 1.1.1.1]\n")
+
+    result = runner.run_evaluation()
+
+    cause = result["cause_demarrage"]
+    assert cause["cause"] == "reseau_sortant"
+    assert "dns: [8.8.8.8, 1.1.1.1]" in cause["preuve"]
+    assert "dns: [8.8.8.8, 1.1.1.1]" in cause["services"]["bike-api"]["preuve"]

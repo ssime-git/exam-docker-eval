@@ -22,6 +22,7 @@ Il prend un rendu d'apprenant déjà extrait, l'exécute dans des conteneurs jet
 
 - **Le nettoyage est garanti**, y compris sur plantage et signaux. Les diagnostics sont capturés *avant* le démontage, jamais en le différant.
 - **Les ports hôte sont éphémères** et relus après coup. Tester la disponibilité d'un port ne fonctionne pas depuis un conteneur : le bind se fait sur l'hôte, pas sur le loopback du processus.
+- **Les réglages DNS de la copie sont retirés** (`dns`, `dns_search`, `dns_opt`) du compose réécrit et consignés : comme un port hôte, ils lient la copie au réseau où elle tourne. Les conteneurs résolvent par le résolveur de la machine de correction.
 - **Une image d'une autre architecture est exécutée sous émulation** si `binfmt_misc` expose des gestionnaires QEMU. Un apprenant qui construit sur un Mac Apple Silicon n'est pas pénalisé.
 - **Un échec est attribué** : `apprenant`, `systeme`, ou `indetermine`. Dans le doute on ne tranche pas — un REPASS envoyé sur une supposition est irréversible.
 - **Le temps rapporté est le temps écoulé**, jamais le délai configuré.

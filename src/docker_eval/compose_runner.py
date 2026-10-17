@@ -29,6 +29,16 @@ from . import reconstruction_datee
 NOMS_COMPOSE = ("docker-compose.yml", "docker-compose.yaml", "compose.yaml", "compose.yml")
 _DOSSIERS_IGNORES = {".git", ".venv", "venv", "node_modules", "__pycache__", "__MACOSX"}
 
+# Réglages DNS d'un service, retirés du compose réécrit (469634).
+_CLES_DNS = ("dns", "dns_search", "dns_opt")
+
+
+def _decrire_dns(reglages: dict) -> str:
+    """`dns: [8.8.8.8, 1.1.1.1], dns_search: x` : les clés retirées, lisibles."""
+    def valeur(v):
+        return f"[{', '.join(map(str, v))}]" if isinstance(v, list) else str(v)
+    return ", ".join(f"{cle}: {valeur(v)}" for cle, v in reglages.items())
+
 
 def fichier_compose(dossier: str) -> str | None:
     """Le fichier Compose d'un dossier, s'il en porte un."""
@@ -582,6 +592,8 @@ class ComposeRunner(BaseRunner):
         self._date_reference = None
         self._reconstruction = None
         self._fichiers_harnais = []
+        # {service: {clé DNS: valeur d'origine}} retirés du compose réécrit.
+        self._dns_retires = {}
 
     @staticmethod
     def _nom_fixe_en_alias(service: dict) -> bool:
@@ -642,9 +654,19 @@ class ComposeRunner(BaseRunner):
 
         changed = False
         alias = []
+        dns_retires = {}
         for nom_service, service in doc["services"].items():
             if isinstance(service, dict) and self._nom_fixe_en_alias(service):
                 alias.append(nom_service)
+                changed = True
+            # 469634 : `dns: [8.8.8.8, 1.1.1.1]` contournait le résolveur de
+            # la machine de correction, qui atteint pourtant l'hôte visé. Comme
+            # un port hôte, un réglage DNS lie la copie au réseau où elle
+            # tourne : retiré, et consigné.
+            reglages = {cle: service.pop(cle) for cle in _CLES_DNS
+                        if isinstance(service, dict) and cle in service}
+            if reglages:
+                dns_retires[nom_service] = reglages
                 changed = True
             if not isinstance(service, dict) or "ports" not in service:
                 continue
@@ -672,8 +694,12 @@ class ComposeRunner(BaseRunner):
             return os.path.relpath(compose_file, self.eval_dir)
 
         self.logger.info("Ports hote relaches : Docker en attribuera de libres")
+        self._dns_retires.update(dns_retires)
         self._port_relaxation_outcome = f"Ports hôte relâchés dans {relaxed_name}." + (
-            f" Noms de conteneur fixes devenus alias réseau : {', '.join(alias)}." if alias else "")
+            f" Noms de conteneur fixes devenus alias réseau : {', '.join(alias)}." if alias else "") + (
+            " Réglages DNS de la copie retirés : "
+            + "; ".join(f"{s} ({_decrire_dns(r)})" for s, r in dns_retires.items())
+            + "." if dns_retires else "")
         self._port_relaxation_exit_code = 0
         return relaxed_name
 
@@ -2951,6 +2977,10 @@ class ComposeRunner(BaseRunner):
                     logs = f"logs illisibles : {erreur}"
                 logs = diagnostic_demarrage.masquer_secrets(logs, attrs)
                 causes[service] = diagnostic_demarrage.classer_service(attrs, logs)
+                if causes[service]["cause"] == "reseau_sortant" and service in self._dns_retires:
+                    causes[service]["preuve"] += (
+                        f" (la copie déclarait {_decrire_dns(self._dns_retires[service])} "
+                        "pour ce service ; retiré par le moteur)")
                 blocs.append(diagnostic_demarrage.decrire_service(service, attrs, logs, causes[service]))
             retenue = diagnostic_demarrage.classer_demarrage(causes)
             retenue["services"] = causes
