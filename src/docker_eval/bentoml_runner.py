@@ -236,6 +236,9 @@ CORPS_DOCUMENTES = ("readme", "tests", "openapi")
 # input_data: T)`), essayés en enveloppe quand aucun nom n'a pu être lu.
 ENVELOPPES_COURANTES = ("input_data", "data", "input")
 
+# Erreurs de `docker load` qui tiennent à l'archive livrée elle-même.
+IMAGE_LIVREE_INCOHERENTE = ("too many non-empty layers in History section",)
+
 # Copie de travail de la construction depuis la source, dans le rendu.
 DOSSIER_CONSTRUCTION = ".scriptorium_construction"
 
@@ -822,6 +825,26 @@ def tags_du_tar(chemin: str) -> list:
     return tags
 
 
+def paire_dans_le_texte(texte: str, utilisateur: str, mot_de_passe: str, ecart: int = 3) -> bool:
+    """L'utilisateur et le mot de passe figurent-ils ensemble : mots entiers,
+    à `ecart` lignes au plus l'un de l'autre (même objet JSON, liste
+    « utilisateur / mot de passe »). Deux sous-chaînes n'importe où dans le
+    fichier ne suffisaient pas à prouver une paire (« admin » dans la prose)."""
+    def lignes_de(valeur):
+        motif = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(valeur)}(?![A-Za-z0-9_])")
+        return [(n, m.start()) for n, ligne in enumerate(texte.splitlines())
+                for m in motif.finditer(ligne)]
+
+    occurrences_u = lignes_de(utilisateur)
+    occurrences_p = occurrences_u if utilisateur == mot_de_passe else lignes_de(mot_de_passe)
+    for u in occurrences_u:
+        for p in occurrences_p:
+            # Même valeur pour les deux : deux occurrences distinctes.
+            if u != p and abs(u[0] - p[0]) <= ecart:
+                return True
+    return False
+
+
 def _est_utilisateur(nom: str) -> bool:
     return "USER" in nom.upper() or nom.upper().endswith("_LOGIN")
 
@@ -928,6 +951,7 @@ class BentoMLRunner(BaseRunner):
                         "image_loaded": False,
                         **self._champs_identifiants(),
                         **self._infos_image(),
+                        **self._faute_du_chargement(),
                     }
                 image_loaded = True
             else:
@@ -1253,6 +1277,7 @@ class BentoMLRunner(BaseRunner):
                 output = (result.stdout or "") + "\n" + (result.stderr or "")
                 if result.returncode != 0:
                     self.logger.error(f"docker load failed: {output.strip()}")
+                    self._erreur_chargement = output.strip()
                     return None
 
                 # Tous les « Loaded image », pas le premier seulement : un
@@ -1272,6 +1297,19 @@ class BentoMLRunner(BaseRunner):
         except Exception as e:
             self.logger.error(f"docker load CLI error: {e}")
             return None
+
+    def _faute_du_chargement(self) -> Dict[str, Any]:
+        """fault/cause d'un `docker load` en échec, quand l'erreur dit que
+        l'archive livrée est incohérente (460660 : « too many non-empty
+        layers in History section », config de l'image qui ne correspond pas
+        à ses couches). Les autres échecs (disque, démon) ne sont pas imputés."""
+        erreur = getattr(self, "_erreur_chargement", "") or ""
+        motif = next((m for m in IMAGE_LIVREE_INCOHERENTE if m in erreur), None)
+        if not motif:
+            return {}
+        ligne = next((l.strip() for l in erreur.splitlines() if motif in l), motif)
+        return {"fault": "apprenant",
+                "cause": f"image livrée incohérente, refusée par docker load : {ligne[:300]}"}
 
     def _infos_image(self) -> Dict[str, Any]:
         """Tags réellement présents dans le tar (manifest.json, sinon
@@ -1318,6 +1356,7 @@ class BentoMLRunner(BaseRunner):
                             "image_loaded": False,
                             **self._champs_identifiants(),
                             **self._infos_image(),
+                            **self._faute_du_chargement(),
                         }
                     self.image_name = bento_result["image_name"]
                 else:
@@ -1328,6 +1367,7 @@ class BentoMLRunner(BaseRunner):
                         "image_loaded": False,
                         **self._champs_identifiants(),
                         **self._infos_image(),
+                        **self._faute_du_chargement(),
                     }
             image_loaded = True
 
@@ -1506,6 +1546,7 @@ class BentoMLRunner(BaseRunner):
 
         except Exception as e:
             self.logger.error(f"Error loading image: {e}")
+            self._erreur_chargement = str(e)
             return None
 
     def _find_bentoml_image(self) -> Optional[str]:
@@ -2289,7 +2330,7 @@ class BentoMLRunner(BaseRunner):
                         texte = lecteur.read(200_000)
                 except OSError:
                     continue
-                if utilisateur in texte and mot_de_passe in texte:
+                if paire_dans_le_texte(texte, utilisateur, mot_de_passe):
                     return True
         return False
 
