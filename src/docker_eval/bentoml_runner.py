@@ -53,6 +53,117 @@ def premier_nombre(donnee):
     return None
 
 
+# Noms de champ qui portent la prédiction, par priorité (sous-chaîne du nom,
+# en minuscules) : `chance_of_admit` (469475) relève de « chance ». « score »
+# vient en dernier, `gre_score` étant un nom d'entrée parfois renvoyé.
+CHAMPS_PREDICTION = ("prediction", "predicted", "chance", "admit", "probab", "result",
+                     "estimat", "output", "score")
+
+
+def _nombre_de(valeur):
+    if isinstance(valeur, bool):
+        return None
+    if isinstance(valeur, (int, float)):
+        return valeur
+    if isinstance(valeur, list):
+        return next((n for n in (_nombre_de(v) for v in valeur) if n is not None), None)
+    if isinstance(valeur, dict):
+        return lire_prediction(valeur)
+    return None
+
+
+def reponse_en_erreur(donnee) -> bool:
+    """Un JSON qui dit l'erreur : `error`/`errors`, ou `detail` ou un
+    `status` ≥ 400 sans champ de prédiction (451711 : `200 {"error": ...,
+    "status": 401}`)."""
+    if not isinstance(donnee, dict):
+        return False
+    if any(donnee.get(cle) for cle in ("error", "errors")):
+        return True
+    porte_prediction = any(any(nom in str(cle).lower() for nom in CHAMPS_PREDICTION[:-1])
+                           for cle in donnee)
+    if porte_prediction:
+        return False
+    if donnee.get("detail"):
+        return True
+    for cle in ("status", "status_code", "code"):
+        valeur = donnee.get(cle)
+        if isinstance(valeur, int) and not isinstance(valeur, bool) and valeur >= 400:
+            return True
+    return False
+
+
+def lire_prediction(donnee):
+    """La prédiction d'une réponse /predict, ou None : champ dédié d'abord,
+    puis repli sur le premier nombre hors métadonnées HTTP."""
+    if reponse_en_erreur(donnee):
+        return None
+    if isinstance(donnee, dict):
+        for nom in CHAMPS_PREDICTION:
+            for cle, valeur in donnee.items():
+                if nom in str(cle).lower():
+                    trouve = _nombre_de(valeur)
+                    if trouve is not None:
+                        return trouve
+    return premier_nombre(donnee)
+
+
+# Champs du corps /predict qui transportent le jeton (451711 : `token`).
+CHAMPS_JETON = ("token", "access_token", "jwt", "auth_token", "bearer", "authorization")
+
+
+def substituer_jeton(corps, jeton: str):
+    """Le corps avec le jeton du login à la place des placeholders : tout
+    champ `token`/`access_token`/`jwt`... (« <TOKEN_FROM_LOGIN> »,
+    « VOTRE_TOKEN », « {token} », un jeton d'exemple périmé), et toute
+    occurrence de `{token}`. Un préfixe « Bearer » est conservé."""
+    if isinstance(corps, dict):
+        sortie = {}
+        for cle, valeur in corps.items():
+            if str(cle).lower() in CHAMPS_JETON and isinstance(valeur, str):
+                prefixe = "Bearer " if valeur.lower().startswith("bearer ") else ""
+                sortie[cle] = prefixe + jeton
+            else:
+                sortie[cle] = substituer_jeton(valeur, jeton)
+        return sortie
+    if isinstance(corps, list):
+        return [substituer_jeton(v, jeton) for v in corps]
+    if isinstance(corps, str):
+        return corps.replace("{token}", jeton)
+    return corps
+
+
+def contient_jeton(corps, jeton: str) -> bool:
+    if not jeton:
+        return False
+    if isinstance(corps, dict):
+        return any(contient_jeton(v, jeton) for v in corps.values())
+    if isinstance(corps, list):
+        return any(contient_jeton(v, jeton) for v in corps)
+    return isinstance(corps, str) and jeton in corps
+
+
+def retirer_jeton(corps, jeton: str):
+    """Le corps sans les champs qui portent le jeton."""
+    if isinstance(corps, dict):
+        return {k: retirer_jeton(v, jeton) for k, v in corps.items()
+                if not (isinstance(v, str) and jeton in v)}
+    if isinstance(corps, list):
+        return [retirer_jeton(v, jeton) for v in corps]
+    return corps
+
+
+def alterer_jeton(corps, jeton: str):
+    """Le corps avec un jeton falsifié à la place du vrai."""
+    if isinstance(corps, dict):
+        return {k: alterer_jeton(v, jeton) for k, v in corps.items()}
+    if isinstance(corps, list):
+        return [alterer_jeton(v, jeton) for v in corps]
+    if isinstance(corps, str) and jeton in corps:
+        return corps.replace(jeton, _alterer(jeton))
+    return corps
+
+
 # Profil médian d'admission.csv, pour les sondes /predict. L'énoncé impose
 # « un modèle de régression linéaire », non borné : la chance d'admission
 # (« notée sur 1 ») d'un profil extrême peut dépasser 1 sur une copie juste.
@@ -124,6 +235,12 @@ CORPS_DOCUMENTES = ("readme", "tests", "openapi")
 # Noms courants du paramètre d'une API BentoML (`def predict(self,
 # input_data: T)`), essayés en enveloppe quand aucun nom n'a pu être lu.
 ENVELOPPES_COURANTES = ("input_data", "data", "input")
+
+# Erreurs de `docker load` qui tiennent à l'archive livrée elle-même.
+IMAGE_LIVREE_INCOHERENTE = ("too many non-empty layers in History section",)
+
+# Copie de travail de la construction depuis la source, dans le rendu.
+DOSSIER_CONSTRUCTION = ".scriptorium_construction"
 
 
 def _cle_corps(corps) -> str:
@@ -632,6 +749,110 @@ def acces_delivre(reponse) -> list:
     return variantes
 
 
+_LECTURE_ENV = re.compile(
+    r'os\.(?:environ\.get|getenv)\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*'
+    r'(?:,\s*([^)]*?))?\s*\)(\s*or\b)?')
+
+
+def _lectures_env_sans_defaut(texte: str) -> set:
+    """Variables lues par `os.environ.get`/`os.getenv` sans défaut utile :
+    ni second argument (ou une chaîne vide, None), ni repli `or ...`."""
+    noms = set()
+    for nom, defaut, repli in _LECTURE_ENV.findall(texte or ""):
+        if repli:
+            continue
+        if defaut.strip() not in ("", "''", '""', "None"):
+            continue
+        noms.add(nom)
+    return noms
+
+
+_CHAMPS_MOT_DE_PASSE = ("password", "passwd", "pwd", "mot_de_passe", "pass")
+_CHAMPS_UTILISATEUR = ("username", "user", "login", "email", "user_name", "name")
+
+
+def _champ(dico: dict, noms) -> Optional[str]:
+    return next((cle for cle in dico if str(cle).lower() in noms), None)
+
+
+def identifiants_du_login(corps, profondeur: int = 0) -> Optional[dict]:
+    """Le dict du corps /login qui porte le mot de passe, quel que soit le
+    nom de l'enveloppe (`credentials`, `data`, `input_data`...), ou None.
+    461573 : seul `credentials` était reconnu."""
+    if not isinstance(corps, dict) or profondeur > 3:
+        return None
+    if _champ(corps, _CHAMPS_MOT_DE_PASSE):
+        return corps
+    for valeur in corps.values():
+        trouve = identifiants_du_login(valeur, profondeur + 1)
+        if trouve is not None:
+            return trouve
+    return None
+
+
+def tags_du_tar(chemin: str) -> list:
+    """RepoTags d'une archive `docker save` (manifest.json), sinon noms
+    d'image de l'index OCI. Lecture des seuls fichiers d'index : les tars
+    font plusieurs centaines de Mo et rien n'est extrait sur le disque."""
+    tags: list = []
+    try:
+        with tarfile.open(chemin) as archive:
+            def lire(nom):
+                try:
+                    membre = archive.extractfile(nom)
+                except KeyError:
+                    return None
+                if membre is None:
+                    return None
+                try:
+                    return json.loads(membre.read(5_000_000).decode("utf-8"))
+                except ValueError:
+                    return None
+
+            manifest = lire("manifest.json")
+            for entree in manifest if isinstance(manifest, list) else []:
+                for tag in (entree or {}).get("RepoTags") or []:
+                    if isinstance(tag, str) and tag not in tags:
+                        tags.append(tag)
+            if not tags:
+                index = lire("index.json")
+                for entree in (index or {}).get("manifests") or [] if isinstance(index, dict) else []:
+                    nom = ((entree or {}).get("annotations") or {}).get("io.containerd.image.name")
+                    if isinstance(nom, str) and nom not in tags:
+                        tags.append(nom)
+    except (OSError, tarfile.TarError):
+        return []
+    return tags
+
+
+def paire_dans_le_texte(texte: str, utilisateur: str, mot_de_passe: str, ecart: int = 3) -> bool:
+    """L'utilisateur et le mot de passe figurent-ils ensemble : mots entiers,
+    à `ecart` lignes au plus l'un de l'autre (même objet JSON, liste
+    « utilisateur / mot de passe »). Deux sous-chaînes n'importe où dans le
+    fichier ne suffisaient pas à prouver une paire (« admin » dans la prose)."""
+    def lignes_de(valeur):
+        motif = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(valeur)}(?![A-Za-z0-9_])")
+        return [(n, m.start()) for n, ligne in enumerate(texte.splitlines())
+                for m in motif.finditer(ligne)]
+
+    occurrences_u = lignes_de(utilisateur)
+    occurrences_p = occurrences_u if utilisateur == mot_de_passe else lignes_de(mot_de_passe)
+    for u in occurrences_u:
+        for p in occurrences_p:
+            # Même valeur pour les deux : deux occurrences distinctes.
+            if u != p and abs(u[0] - p[0]) <= ecart:
+                return True
+    return False
+
+
+def _est_utilisateur(nom: str) -> bool:
+    return "USER" in nom.upper() or nom.upper().endswith("_LOGIN")
+
+
+def _est_mot_de_passe(nom: str) -> bool:
+    return "PASS" in nom.upper() or "PWD" in nom.upper()
+
+
 def _alterer(valeur: str) -> str:
     """Une valeur d'accès modifiée : même forme, derniers caractères changés."""
     if len(valeur) <= 8:
@@ -670,6 +891,8 @@ class BentoMLRunner(BaseRunner):
         self.container = None
         self.image_name = None
         self.cli_container_id: Optional[str] = None
+        self.credentials_source: Optional[str] = None
+        self.credentials_in_tests = False
         self.container_name = f"bentoml_eval_{student_name}".replace(" ", "_").lower()
 
     def run_evaluation(self) -> Dict[str, Any]:
@@ -726,6 +949,9 @@ class BentoMLRunner(BaseRunner):
                         "error": "Failed to load Docker image",
                         "exit_code": 2,
                         "image_loaded": False,
+                        **self._champs_identifiants(),
+                        **self._infos_image(),
+                        **self._faute_du_chargement(),
                     }
                 image_loaded = True
             else:
@@ -754,15 +980,19 @@ class BentoMLRunner(BaseRunner):
                     if not self.image_name:
                         source_root = self._find_bento_source()
                         if source_root:
-                            construit = self._build_bento_from_source(source_root)
+                            try:
+                                construit = self._build_bento_from_source(source_root)
+                                bento_result = (self._auto_containerize_bento(
+                                    bento_file_path=construit.get("bento"))
+                                    if construit.get("success") else {})
+                            finally:
+                                self._ranger_construction()
                             if construit.get("success"):
-                                bento_result = self._auto_containerize_bento(
-                                    bento_file_path=construit.get("bento")
-                                )
                                 if bento_result.get("success"):
                                     self.image_name = bento_result["image_name"]
                                     auto_containerized = True
                                     image_loaded = True
+                                    self._image_construite = True
                                     self.logger.info(f"✓ Image construite depuis la source : {self.image_name}")
                             else:
                                 self.logger.warning(construit.get("error", "construction en échec"))
@@ -904,6 +1134,7 @@ class BentoMLRunner(BaseRunner):
                 "host_arch": self._host_arch(),
                 "credentials_source": self.credentials_source,
                 "credentials_in_tests": self.credentials_in_tests,
+                **self._infos_image(),
                 "steps": self.steps,
             }
 
@@ -939,6 +1170,8 @@ class BentoMLRunner(BaseRunner):
                 "container_started": container_started,
                 "api_ready": api_ready,
                 "container_logs": self._capture_container_logs(),
+                **self._champs_identifiants(),
+                **self._infos_image(),
             }
             # L'echec est une etape comme une autre : il doit se lire dans la
             # trace, au bon endroit, avec ce que le conteneur a dit.
@@ -971,6 +1204,8 @@ class BentoMLRunner(BaseRunner):
                 "container_started": container_started,
                 "api_ready": api_ready,
                 "container_logs": self._capture_container_logs(),
+                **self._champs_identifiants(),
+                **self._infos_image(),
             }
             # L'echec est une etape comme une autre : il doit se lire dans la
             # trace, au bon endroit, avec ce que le conteneur a dit.
@@ -1042,19 +1277,51 @@ class BentoMLRunner(BaseRunner):
                 output = (result.stdout or "") + "\n" + (result.stderr or "")
                 if result.returncode != 0:
                     self.logger.error(f"docker load failed: {output.strip()}")
+                    self._erreur_chargement = output.strip()
                     return None
 
-                match = re.search(r"Loaded image:\s*(.+)", output) or re.search(r"Loaded image ID:\s*(.+)", output)
-                if match:
-                    chargee = match.group(1).strip()
-                    self.logger.info(f"✓ Image loaded via docker CLI: {chargee}")
-                    return self.adopter_image(chargee)
+                # Tous les « Loaded image », pas le premier seulement : un
+                # tar à plusieurs tags (ou plusieurs images) laissait les
+                # autres derrière lui et le barème ne les voyait pas.
+                chargees = [m.strip() for m in re.findall(r"Loaded image:\s*(.+)", output)]
+                if not chargees:
+                    chargees = [m.strip() for m in re.findall(r"Loaded image ID:\s*(.+)", output)]
+                self._images_chargees = chargees
+                if chargees:
+                    self.logger.info(f"✓ Image(s) loaded via docker CLI: {', '.join(chargees)}")
+                    adoptees = [self.adopter_image(chargee) for chargee in chargees]
+                    return adoptees[0]
 
             self.logger.error("docker load succeeded but no image tag/id found in output")
             return None
         except Exception as e:
             self.logger.error(f"docker load CLI error: {e}")
             return None
+
+    def _faute_du_chargement(self) -> Dict[str, Any]:
+        """fault/cause d'un `docker load` en échec, quand l'erreur dit que
+        l'archive livrée est incohérente (460660 : « too many non-empty
+        layers in History section », config de l'image qui ne correspond pas
+        à ses couches). Les autres échecs (disque, démon) ne sont pas imputés."""
+        erreur = getattr(self, "_erreur_chargement", "") or ""
+        motif = next((m for m in IMAGE_LIVREE_INCOHERENTE if m in erreur), None)
+        if not motif:
+            return {}
+        ligne = next((l.strip() for l in erreur.splitlines() if motif in l), motif)
+        return {"fault": "apprenant",
+                "cause": f"image livrée incohérente, refusée par docker load : {ligne[:300]}"}
+
+    def _infos_image(self) -> Dict[str, Any]:
+        """Tags réellement présents dans le tar (manifest.json, sinon
+        index.json) et images annoncées par `docker load`. 462113 : le README
+        lance `:latest`, le seul tag du tar est `:qdo3i3fmj6dwm7my`."""
+        if getattr(self, "_image_tags", None) is None:
+            self._image_tags = tags_du_tar(self.image_tar) if self.image_tar else []
+        return {"image_tags": list(self._image_tags),
+                "images_chargees": list(getattr(self, "_images_chargees", []) or []),
+                # Distinct d'image_loaded : l'image n'a pas été livrée, nous
+                # l'avons construite depuis la source du rendu.
+                "image_construite_par_le_correcteur": bool(getattr(self, "_image_construite", False))}
 
     def _run_image_only_evaluation(self) -> Dict[str, Any]:
         """
@@ -1063,6 +1330,7 @@ class BentoMLRunner(BaseRunner):
         """
         self._log_execution_start()
 
+        debut = time.time()
         image_loaded = False
         container_started = False
         api_ready = False
@@ -1086,6 +1354,9 @@ class BentoMLRunner(BaseRunner):
                             ),
                             "exit_code": 2,
                             "image_loaded": False,
+                            **self._champs_identifiants(),
+                            **self._infos_image(),
+                            **self._faute_du_chargement(),
                         }
                     self.image_name = bento_result["image_name"]
                 else:
@@ -1094,6 +1365,9 @@ class BentoMLRunner(BaseRunner):
                         "error": "Failed to load Docker image with docker load -i",
                         "exit_code": 2,
                         "image_loaded": False,
+                        **self._champs_identifiants(),
+                        **self._infos_image(),
+                        **self._faute_du_chargement(),
                     }
             image_loaded = True
 
@@ -1101,10 +1375,12 @@ class BentoMLRunner(BaseRunner):
             # nous-memes supposait de savoir ce qui est libre sur l'hote, ce
             # qu'un processus conteneurise ne peut pas savoir.
             port_mode = "ephemere"
+            # Sans `--rm` : un conteneur mort au démarrage doit rester
+            # lisible (logs, code de sortie) pour imputer l'échec. Le
+            # nettoyage le supprime par son nom (_force_cleanup_container).
             run_cmd = [
                 "docker",
                 "run",
-                "--rm",
                 "-d",
                 "--name",
                 self.container_name,
@@ -1140,6 +1416,8 @@ class BentoMLRunner(BaseRunner):
                     "image_name": self.image_name,
                     "image_loaded": image_loaded,
                     "container_started": False,
+                    **self._champs_identifiants(),
+                    **self._infos_image(),
                 }
 
             self.cli_container_id = (run_result.stdout or "").strip() or self.container_name
@@ -1183,11 +1461,15 @@ class BentoMLRunner(BaseRunner):
                 "port_mode": port_mode,
                 "host_port": str(host_port),
                 "execution_mode": "image_only_cli",
+                "credentials_source": self.credentials_source,
+                "credentials_in_tests": self.credentials_in_tests,
+                **self._infos_image(),
             }
             self._log_execution_end(result)
             return result
 
         except Exception as e:
+            elapsed = time.time() - debut
             error_msg = f"Execution error: {str(e)}"
             self.logger.error(error_msg, exc_info=True)
             result = {
@@ -1199,7 +1481,35 @@ class BentoMLRunner(BaseRunner):
                 "container_started": container_started,
                 "api_ready": api_ready,
                 "execution_mode": "image_only_cli",
+                **self._champs_identifiants(),
+                **self._infos_image(),
             }
+            if container_started:
+                # Même relevé que le chemin testcontainers : sans lui, un
+                # conteneur mort au démarrage finissait en « cause non
+                # établie » (469475).
+                diagnostics = self._collect_diagnostics()
+                died, code_sortie = self._container_exit_state()
+                logs = self._capture_container_logs()
+                if isinstance(e, TimeoutError) and died:
+                    result["error"] = self._describe_container_death(code_sortie, elapsed)
+                result.update({
+                    "elapsed_seconds": round(elapsed, 1),
+                    "container_exited": died,
+                    "container_exit_code": code_sortie,
+                    "diagnostics": diagnostics,
+                    "container_logs": logs,
+                })
+                result["fault"] = self._attribute_fault(diagnostics, logs)
+                result["cause"] = self._cause_de_la_faute(result["fault"], diagnostics, logs)
+                self.record_step(
+                    "L'evaluation s'interrompt",
+                    output=_expurger(logs or result["error"], self._valeurs_a_masquer_conteneur()),
+                    exit_code=code_sortie,
+                    note=result["error"],
+                    duration=elapsed,
+                )
+                self.logger.info(f"Attribution de la faute : {result['fault']}")
             self._log_execution_end(result)
             return result
         finally:
@@ -1223,16 +1533,20 @@ class BentoMLRunner(BaseRunner):
                 images = client.images.load(f.read())
 
                 if images:
-                    image = images[0]
-                    chargee = image.tags[0] if image.tags else image.id
-                    self.logger.info(f"✓ Image loaded: {chargee}")
-                    return self.adopter_image(chargee)
+                    # Tous les tags de toutes les images chargées : chacun
+                    # est adopté (donc supprimé au ménage) et exposé.
+                    chargees = [tag for image in images for tag in (image.tags or [image.id])]
+                    self._images_chargees = chargees
+                    self.logger.info(f"✓ Image(s) loaded: {', '.join(chargees)}")
+                    adoptees = [self.adopter_image(chargee) for chargee in chargees]
+                    return adoptees[0]
                 else:
                     self.logger.error("No image found in tar file")
                     return None
 
         except Exception as e:
             self.logger.error(f"Error loading image: {e}")
+            self._erreur_chargement = str(e)
             return None
 
     def _find_bentoml_image(self) -> Optional[str]:
@@ -1298,6 +1612,14 @@ class BentoMLRunner(BaseRunner):
 
             if elapsed > startup_timeout:
                 raise TimeoutError(f"API not ready after {startup_timeout}s")
+
+            # Un conteneur déjà sorti ne répondra plus : inutile d'attendre la
+            # fin du délai (469475 : mort en ~10 s, attente de 60 s).
+            if getattr(self, "cli_container_id", None):
+                mort, code_sortie = self._container_exit_state()
+                if mort:
+                    raise TimeoutError(
+                        f"conteneur arrêté (code {code_sortie}) avant de répondre, après {elapsed:.0f}s")
 
             container_logs = ""
             if getattr(self, "container", None) is not None:
@@ -1571,6 +1893,24 @@ class BentoMLRunner(BaseRunner):
                 + (" -- ecrits en dur dans un test" if found['in_tests'] else "")
             )
 
+        # Identifiants que nous avons fournis au conteneur (469475 : le
+        # README fait générer API_USERNAME/API_PASSWORD) : le service ne
+        # connaît qu'eux. Calculés avant le démarrage, donc déjà en cache.
+        fournis = getattr(self, "_container_env", None) or {}
+        utilisateur = next((v for n, v in sorted(fournis.items()) if _est_utilisateur(n)), None)
+        mot_de_passe = next((v for n, v in sorted(fournis.items()) if _est_mot_de_passe(n)), None)
+        if mot_de_passe:
+            if utilisateur:
+                contract['usernames'] = [utilisateur] + [u for u in contract['usernames'] if u != utilisateur]
+            contract['passwords'] = [mot_de_passe] + [p for p in contract['passwords'] if p != mot_de_passe]
+            if mot_de_passe in self._valeurs_generees():
+                contract['credentials_source'] = (
+                    "environnement fourni au conteneur (variables citées par le README, "
+                    "valeurs générées par le correcteur)")
+                contract['credentials_in_tests'] = False
+                self.credentials_source = contract['credentials_source']
+                self.credentials_in_tests = False
+
         signature_lue = False
         for source_path, text in texts:
             if contract['source'] == 'fallback':
@@ -1732,13 +2072,21 @@ class BentoMLRunner(BaseRunner):
             if predict_bodies:
                 results["corps_source"] = source_du_corps(contract, predict_bodies[0])
             for payload in predict_bodies:
-                normalized_payload = json.loads(json.dumps(payload).replace('{token}', token))
+                normalized_payload = substituer_jeton(payload, token)
                 # L'accès obtenu au login doit accompagner la requete. Il ne
                 # l'etait pas : les en-tetes partaient vides et /predict rendait
                 # 401, ce qui etait compte contre l'apprenant alors que son
                 # endpoint verifie correctement l'autorisation. Une variante
                 # par façon de présenter l'accès (Bearer, cookie, clé).
                 request_variants = []
+                # Jeton porté par le corps (451711 : `input_data.token`) :
+                # d'abord sans en-tête, pour savoir si le corps suffit.
+                if contient_jeton(normalized_payload, token):
+                    dans_le_corps = {"mecanisme": "jeton_corps", "entete": None,
+                                     "valeur": token, "entetes": {}}
+                    for wrapper in contract.get("predict_wrappers", [None, "request"]):
+                        request_variants.append(({wrapper: normalized_payload} if wrapper else normalized_payload,
+                                                 {}, dans_le_corps, wrapper))
                 for variante in acces:
                     for wrapper in contract.get("predict_wrappers", [None, "request"]):
                         if wrapper:
@@ -1770,7 +2118,7 @@ class BentoMLRunner(BaseRunner):
                         # Le statut HTTP seul ne prouve pas une prédiction :
                         # certains services renvoient leurs erreurs en JSON 200.
                         results["predict_response"] = str(data)[:400]
-                        if premier_nombre(data) is None:
+                        if lire_prediction(data) is None:
                             self.logger.warning("HTTP 200 sans prédiction numérique : %s", str(data)[:200])
                             continue
                         results["predict_passed"] = True
@@ -1801,6 +2149,16 @@ class BentoMLRunner(BaseRunner):
         results["all_passed"] = results["login_passed"] and results["predict_passed"]
         if login_ok is not None and predict_ok is not None:
             results.update(self._sonder_securite_et_contrat(base_url, login_ok, *predict_ok))
+        if "identifiants_dans_la_copie" not in results:
+            # /login ou /predict en échec (464154) : la présence de la paire
+            # dans le README ou les tests reste une mesure statique. Paire
+            # du login réussi, sinon celle lue dans la copie ; aucune paire
+            # connue : non mesuré.
+            paire = login_ok
+            if paire is None and contract.get("credentials_source"):
+                paire = {"username": contract["usernames"][0], "password": contract["passwords"][0]}
+            results["identifiants_dans_la_copie"] = (
+                self._identifiants_dans_la_copie(paire) if paire is not None else None)
 
         return results
 
@@ -1840,6 +2198,8 @@ class BentoMLRunner(BaseRunner):
         mecanisme = acces.get("mecanisme", "jeton")
         if not valeur:
             entetes_falsifies = None  # rien à modifier : critère non mesuré
+        elif mecanisme == "jeton_corps":
+            entetes_falsifies = dict(sans_auth)  # le jeton voyage dans le corps
         elif mecanisme == "cookie" and acces.get("cookies"):
             entetes_falsifies = {**sans_auth, "Cookie": "; ".join(
                 f"{k}={_alterer(v)}" for k, v in acces["cookies"].items())}
@@ -1851,34 +2211,66 @@ class BentoMLRunner(BaseRunner):
             entetes_falsifies = {**sans_auth, acces["entete"]: _alterer(valeur)}
 
         mauvais_login = json.loads(json.dumps(login_ok))
-        cible = mauvais_login.get("credentials", mauvais_login) if isinstance(mauvais_login, dict) else {}
-        if isinstance(cible, dict) and "password" in cible:
-            cible["password"] = "mauvais-mot-de-passe-scriptorium"
+        cible = identifiants_du_login(mauvais_login)
+        if cible is not None:
+            cible[_champ(cible, _CHAMPS_MOT_DE_PASSE)] = "mauvais-mot-de-passe-scriptorium"
+        if mauvais_login == login_ok:
+            # Aucun mot de passe à changer : renvoyer le bon corps mesurerait
+            # un accès accepté qui n'en est pas un.
+            mauvais_login = None
         invalide = json.loads(json.dumps(corps))
         cible_inv = next((v for v in invalide.values() if isinstance(v, dict)), invalide) if isinstance(invalide, dict) else {}
         for cle, val in list(cible_inv.items()) if isinstance(cible_inv, dict) else []:
             if isinstance(val, (int, float)) and not isinstance(val, bool):
                 cible_inv[cle] = "pas-un-nombre"
+        # Jeton aussi (ou seulement) dans le corps (451711) : « sans accès »
+        # le retire, « accès falsifié » l'altère, là où il voyage. Introuvable
+        # alors qu'il doit y être : non mesuré.
+        corps_sans, corps_falsifie = corps, corps
+        if valeur and contient_jeton(corps, valeur):
+            corps_sans, corps_falsifie = retirer_jeton(corps, valeur), alterer_jeton(corps, valeur)
+        elif mecanisme == "jeton_corps":
+            corps_sans = corps_falsifie = None
+        refus_dans_un_200 = []
+
+        def sonde(nom, chemin, corps_envoye, entetes_envoyes):
+            if corps_envoye is None or entetes_envoyes is None:
+                return None
+            r = requete("POST", chemin, json=corps_envoye, headers=entetes_envoyes)
+            if isinstance(r, str):
+                return r
+            if r.status_code == 200:
+                # Code relevé tel quel ; le refus porté par le JSON est noté à
+                # part, le barème décide.
+                try:
+                    if reponse_en_erreur(r.json()):
+                        refus_dans_un_200.append(nom)
+                except Exception:
+                    pass
+            return r.status_code
+
         securite = {
-            "predict_sans_token": code("POST", "/predict", json=corps, headers=sans_auth),
-            "predict_token_falsifie": (code("POST", "/predict", json=corps, headers=entetes_falsifies)
-                                       if entetes_falsifies is not None else None),
-            "login_mauvais_identifiants": code("POST", "/login", json=mauvais_login),
+            "predict_sans_token": sonde("predict_sans_token", "/predict", corps_sans, sans_auth),
+            "predict_token_falsifie": sonde("predict_token_falsifie", "/predict", corps_falsifie,
+                                            entetes_falsifies),
+            "login_mauvais_identifiants": sonde("login_mauvais_identifiants", "/login", mauvais_login, {}),
             "mecanisme": mecanisme,
         }
+        if refus_dans_un_200:
+            securite["refus_dans_un_200"] = refus_dans_un_200
 
         # La prédiction jugée vient du profil médian : la régression linéaire
         # imposée n'est pas bornée, un profil extrême sort de [0, 1] sur une
         # copie juste. Si le service refuse le corps médian, repli sur la
         # réponse du premier appel.
-        prediction = premier_nombre(reponse)
+        prediction = lire_prediction(reponse)
         profil = "nominal"
         median = appliquer_profil_median(corps)
         if median != corps:
             r = requete("POST", "/predict", json=median, headers=entetes)
             if not isinstance(r, str) and r.status_code == 200:
                 try:
-                    valeur_mediane = premier_nombre(r.json())
+                    valeur_mediane = lire_prediction(r.json())
                 except Exception:
                     valeur_mediane = None
                 if valeur_mediane is not None:
@@ -1910,10 +2302,18 @@ class BentoMLRunner(BaseRunner):
         (« README.md avec les commandes strictes et ordonnées pour [...]
         lancer les tests », « Le dossier tests/ ») ; des identifiants écrits
         dans src/service.py ne documentent rien pour qui relance pytest."""
-        cible = login_ok.get("credentials", login_ok) if isinstance(login_ok, dict) else {}
-        utilisateur, mot_de_passe = str(cible.get("username", "")), str(cible.get("password", ""))
+        cible = identifiants_du_login(login_ok) or {}
+        champ_utilisateur = _champ(cible, _CHAMPS_UTILISATEUR)
+        champ_mot_de_passe = _champ(cible, _CHAMPS_MOT_DE_PASSE)
+        utilisateur = str(cible.get(champ_utilisateur, "")) if champ_utilisateur else ""
+        mot_de_passe = str(cible.get(champ_mot_de_passe, "")) if champ_mot_de_passe else ""
         if not utilisateur or not mot_de_passe:
             return False
+        if mot_de_passe in self._valeurs_generees():
+            # Mot de passe tiré par nous pour le conteneur (469475 : le
+            # README le fait générer) : sa présence dans la copie ne se
+            # mesure pas.
+            return None
         for racine, dossiers, fichiers in os.walk(self.eval_dir):
             dossiers[:] = [d for d in dossiers if d not in (".git", ".venv", "venv", "node_modules",
                                                             "__pycache__", ".pytest_cache")]
@@ -1930,7 +2330,7 @@ class BentoMLRunner(BaseRunner):
                         texte = lecteur.read(200_000)
                 except OSError:
                     continue
-                if utilisateur in texte and mot_de_passe in texte:
+                if paire_dans_le_texte(texte, utilisateur, mot_de_passe):
                     return True
         return False
 
@@ -2275,6 +2675,12 @@ class BentoMLRunner(BaseRunner):
                     or not _nomme_dans_les_tests(patched_tests_path, nom)):
                 continue
             documentees[nom] = secrets_image.get(nom, valeur)
+        # Variables que le README fait générer (469475 : `.env.runtime`) et
+        # que les tests lisent : le premier passage les reçoit, avec la
+        # valeur donnée au conteneur. Suivre le README n'est pas réparer.
+        for nom in sorted(getattr(self, "_env_cite_readme", set())):
+            if nom in secrets_image and _nomme_dans_les_tests(patched_tests_path, nom):
+                documentees.setdefault(nom, secrets_image[nom])
         self._noms_documentes = sorted(documentees)
         results["variables_documentees"] = self._noms_documentes
         # L'environnement du premier passage, tel que livré : l'adresse du
@@ -2887,6 +3293,10 @@ class BentoMLRunner(BaseRunner):
             return "systeme"
         if diag.get("docker_error") or diag.get("image_error"):
             return "systeme"
+        # Une variable que le README fait fournir et que nous n'avons pas
+        # fournie : le service a raison de refuser de démarrer.
+        if self._variables_documentees_absentes(logs):
+            return "systeme"
 
         # Le programme de l'apprenant a demarre puis a rendu la main en erreur.
         exit_code = diag.get("container_exit_code")
@@ -2898,6 +3308,47 @@ class BentoMLRunner(BaseRunner):
             return "apprenant"
 
         return "indetermine"
+
+    def _variables_documentees_absentes(self, logs: str) -> list:
+        """Noms de variables (avec `_`) cités à la fois par les logs du
+        conteneur et par le README, que nous n'avons pas fournis."""
+        # Seules les lignes d'erreur comptent : une variable citée dans un log
+        # ordinaire ne dit pas qu'elle manque.
+        erreurs = "\n".join(l for l in (logs or "").splitlines()
+                            if re.search(r"error|exception|missing|required|not set|must be|\bset\b",
+                                         l, re.IGNORECASE))
+        noms = set(re.findall(r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9]*_[A-Z0-9_]+)(?![A-Za-z0-9_])", erreurs))
+        if not noms:
+            return []
+        fournis = set(getattr(self, "_container_env", None) or {})
+        try:
+            documentation = "\n".join(
+                texte for chemin, texte in self._iter_submission_texts()
+                if os.path.basename(chemin).lower().startswith("readme"))
+        except Exception:
+            return []
+        return sorted(nom for nom in noms - fournis
+                      if not nom.startswith("BENTOML_")
+                      and re.search(rf"(?<![A-Za-z0-9_]){re.escape(nom)}(?![A-Za-z0-9_])", documentation))
+
+    def _cause_de_la_faute(self, faute: str, diag: Dict[str, Any], logs: str) -> str:
+        """La cause, en clair, qui accompagne `fault`."""
+        absentes = self._variables_documentees_absentes(logs)
+        if faute == "systeme" and absentes:
+            return ("variables d'environnement exigées par le README non fournies au conteneur : "
+                    + ", ".join(absentes))
+        code = diag.get("container_exit_code")
+        derniere = next((l.strip() for l in reversed((logs or "").splitlines()) if l.strip()), "")
+        derniere = _expurger(derniere, self._valeurs_a_masquer_conteneur())[:300]
+        if faute == "apprenant":
+            return f"le service de l'image s'arrête au démarrage (code {code}) : {derniere}"
+        if faute == "systeme":
+            return "l'environnement de correction n'a pas pu exécuter l'image"
+        return "cause non établie"
+
+    def _valeurs_a_masquer_conteneur(self) -> list:
+        return [str(v) for v in (getattr(self, "_container_env", None) or {}).values()
+                if v and len(str(v)) >= 4]
 
     def _http_timeout(self, base: int) -> int:
         """Delai d'une requete HTTP, allonge quand on emule.
@@ -2963,9 +3414,23 @@ class BentoMLRunner(BaseRunner):
             return self._container_env
 
         requis = set()
+        lues_sans_defaut = set()
         for _, texte in self._read_service_from_image():
             requis.update(re.findall(
                 r'os\.environ\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*\]', texte))
+            lues_sans_defaut.update(_lectures_env_sans_defaut(texte))
+        # 469475 : `os.environ.get('API_USERNAME', '')` puis RuntimeError au
+        # démarrage, et un README qui fait générer ces valeurs (`--env-file`).
+        # Lecture sans défaut (ou défaut vide) ET nom cité par la
+        # documentation de la copie : la fournir, c'est suivre le README.
+        if lues_sans_defaut - requis:
+            documentation = "\n".join(
+                texte for chemin, texte in self._iter_submission_texts()
+                if os.path.basename(chemin).lower().startswith("readme"))
+            cites = {nom for nom in lues_sans_defaut - requis
+                     if re.search(rf"(?<![A-Za-z0-9_]){re.escape(nom)}(?![A-Za-z0-9_])", documentation)}
+            self._env_cite_readme = cites
+            requis.update(cites)
 
         env: Dict[str, str] = {}
         if requis:
@@ -2981,13 +3446,43 @@ class BentoMLRunner(BaseRunner):
                         continue
                     declares.setdefault(nom, valeur)
             import secrets
+            generees = set()
             for nom in sorted(requis):
                 env[nom] = declares.get(nom) or secrets.token_hex(32)
+                if not declares.get(nom):
+                    generees.add(nom)
+            self._env_genere = generees
             self.logger.info(
                 "Variables exigees par le service : " + ", ".join(sorted(requis)))
 
         self._container_env = env
         return env
+
+    def _champs_identifiants(self) -> Dict[str, Any]:
+        """credentials_source, credentials_in_tests et identifiants_dans_la_copie
+        pour un résultat où /login n'a pas été appelé (image non chargée,
+        conteneur mort) : lecture statique du rendu, sans l'image (460660)."""
+        if not self.credentials_source:
+            try:
+                textes = sorted(self._iter_submission_texts(), key=lambda t: looks_like_test_file(t[0]))
+                trouve = find_credentials_in_texts(textes)
+            except Exception:
+                trouve = None
+            if trouve:
+                self.credentials_source, self.credentials_in_tests = trouve["source"], trouve["in_tests"]
+                self._paire_statique = {"username": trouve["username"], "password": trouve["password"]}
+        paire = getattr(self, "_paire_statique", None)
+        return {
+            "credentials_source": self.credentials_source,
+            "credentials_in_tests": self.credentials_in_tests,
+            "identifiants_dans_la_copie": self._identifiants_dans_la_copie(paire) if paire else None,
+        }
+
+    def _valeurs_generees(self) -> set:
+        """Valeurs que nous avons tirées au hasard pour le conteneur (aucune
+        valeur documentée) : elles ne figurent pas dans la copie."""
+        env = getattr(self, "_container_env", None) or {}
+        return {env[nom] for nom in getattr(self, "_env_genere", set()) if nom in env}
 
     def _completer_environnement_image(self, platform: Optional[str], attrs: dict) -> None:
         """L'image réellement exécutée, son architecture, et les limites du
@@ -3242,7 +3737,8 @@ class BentoMLRunner(BaseRunner):
         trouves = []
         for current, dirs, files in os.walk(self.eval_dir):
             dirs[:] = [d for d in dirs
-                       if d not in {".git", ".venv", "venv", "__pycache__", ".bentoml_home"}]
+                       if d not in {".git", ".venv", "venv", "__pycache__", ".bentoml_home",
+                                    DOSSIER_CONSTRUCTION}]
             trouves += [os.path.join(current, f) for f in sorted(files) if f.endswith(".bento")]
 
         if trouves:
@@ -3263,7 +3759,8 @@ class BentoMLRunner(BaseRunner):
         image ou un `.bento` déjà compilé, et abandonnait en une seconde.
         """
         for current, dirs, files in os.walk(self.eval_dir):
-            dirs[:] = [d for d in dirs if d not in {".git", ".venv", "__pycache__", "node_modules"}]
+            dirs[:] = [d for d in dirs if d not in {".git", ".venv", "__pycache__", "node_modules",
+                                                    DOSSIER_CONSTRUCTION}]
             if "bentofile.yaml" in files:
                 return current
         return None
@@ -3284,6 +3781,18 @@ class BentoMLRunner(BaseRunner):
                 "pouvoir l'évaluer, au lieu de refuser la copie."
             ),
         )
+
+        # Construire sur une copie du rendu : prepare_data, train_model et
+        # `bentoml build` écrivent (data/, models/, __pycache__, .bento), et
+        # ce qui atterrissait dans la copie lui était reproché ensuite. La
+        # copie vit dans le rendu (dossier caché) : un moteur conteneurisé
+        # monte ce chemin-là chez le démon Docker, pas un /tmp à lui.
+        copie = os.path.join(self.eval_dir, DOSSIER_CONSTRUCTION)
+        shutil.rmtree(copie, ignore_errors=True)
+        shutil.copytree(source_root, copie, symlinks=True, ignore=shutil.ignore_patterns(
+            DOSSIER_CONSTRUCTION, ".git", ".venv", "venv", "__pycache__", "node_modules", "*.tar"))
+        self._dossier_construction = copie
+        source_root = copie
 
         image = os.environ.get("EXAM_BENTOML_BUILDER_IMAGE", "python:3.11-slim")
         # Tout dans un seul conteneur : installer, suivre la procedure de
@@ -3313,7 +3822,8 @@ class BentoMLRunner(BaseRunner):
             f"chown -R {os.getuid()}:{os.getgid()} /src 2>/dev/null || true"
         )
         resultat = subprocess.run(
-            ["docker", "run", "--rm", "-v", f"{source_root}:/src", image, "sh", "-c", script],
+            ["docker", "run", "--rm", "-e", "PYTHONDONTWRITEBYTECODE=1",
+             "-v", f"{source_root}:/src", image, "sh", "-c", script],
             capture_output=True, text=True, timeout=1800,
         )
         sortie = (resultat.stdout or "") + (resultat.stderr or "")
@@ -3326,6 +3836,13 @@ class BentoMLRunner(BaseRunner):
                     "error": f"aucun .bento produit par la construction : {sortie[-400:]}"}
         self.logger.info(f"✓ .bento construit : {chemin}")
         return {"success": True, "bento": chemin}
+
+    def _ranger_construction(self) -> None:
+        """Supprimer la copie de travail de la construction depuis la source."""
+        dossier = getattr(self, "_dossier_construction", None)
+        if dossier:
+            shutil.rmtree(dossier, ignore_errors=True)
+            self._dossier_construction = None
 
     def _auto_containerize_bento(self, bento_file_path: Optional[str] = None) -> Dict[str, Any]:
         """
