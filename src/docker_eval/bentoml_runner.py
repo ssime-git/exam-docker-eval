@@ -2675,6 +2675,12 @@ class BentoMLRunner(BaseRunner):
                     or not _nomme_dans_les_tests(patched_tests_path, nom)):
                 continue
             documentees[nom] = secrets_image.get(nom, valeur)
+        # Variables que le README fait générer (469475 : `.env.runtime`) et
+        # que les tests lisent : le premier passage les reçoit, avec la
+        # valeur donnée au conteneur. Suivre le README n'est pas réparer.
+        for nom in sorted(getattr(self, "_env_cite_readme", set())):
+            if nom in secrets_image and _nomme_dans_les_tests(patched_tests_path, nom):
+                documentees.setdefault(nom, secrets_image[nom])
         self._noms_documentes = sorted(documentees)
         results["variables_documentees"] = self._noms_documentes
         # L'environnement du premier passage, tel que livré : l'adresse du
@@ -3421,9 +3427,10 @@ class BentoMLRunner(BaseRunner):
             documentation = "\n".join(
                 texte for chemin, texte in self._iter_submission_texts()
                 if os.path.basename(chemin).lower().startswith("readme"))
-            requis.update(nom for nom in lues_sans_defaut
-                          if re.search(rf"(?<![A-Za-z0-9_]){re.escape(nom)}(?![A-Za-z0-9_])",
-                                       documentation))
+            cites = {nom for nom in lues_sans_defaut - requis
+                     if re.search(rf"(?<![A-Za-z0-9_]){re.escape(nom)}(?![A-Za-z0-9_])", documentation)}
+            self._env_cite_readme = cites
+            requis.update(cites)
 
         env: Dict[str, str] = {}
         if requis:

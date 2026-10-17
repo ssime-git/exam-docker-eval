@@ -152,3 +152,49 @@ def test_variable_documentee_non_fournie_n_est_pas_la_faute_de_la_copie(tmp_path
     resultat = runner._run_image_only_evaluation()
     assert resultat["fault"] == "systeme"
     assert "API_USERNAME" in resultat["cause"]
+
+
+CONFTEST_469475 = '''import os
+import pytest
+
+
+@pytest.fixture(scope="session")
+def settings():
+    keys = ("API_USERNAME", "API_PASSWORD", "JWT_SECRET")
+    result = {key: os.environ.get(key, "") for key in keys}
+    assert all(result.values()), "Create .env.runtime using the README before testing."
+    return result
+
+
+@pytest.fixture(scope="session")
+def base_url():
+    return os.environ.get("API_BASE_URL", "http://127.0.0.1:3000")
+'''
+
+
+def test_premier_passage_pytest_recoit_les_variables_que_le_readme_fait_generer(tmp_path, monkeypatch):
+    runner = copie(tmp_path)
+    (tmp_path / "requirements.txt").write_text("pytest>=8\nrequests\n")
+    (tmp_path / "tests" / "conftest.py").write_text(CONFTEST_469475)
+    monkeypatch.setattr(bentoml_runner.shutil, "which", lambda nom: "/usr/bin/uvx")
+    conteneur = runner._env_required_by_image()
+    passages = []
+
+    def faux_run(commande, **kwargs):
+        if commande[0] == "docker":
+            return _Resultat(0, "")
+        passages.append((list(commande), dict(kwargs.get("env") or {})))
+        chemin = next(a.split("=", 1)[1] for a in commande if a.startswith("--junit-xml="))
+        with open(chemin, "w") as f:
+            f.write('<testsuite tests="1" failures="0" errors="0" skipped="0"></testsuite>')
+        return _Resultat(0, "1 passed")
+
+    monkeypatch.setattr(bentoml_runner.subprocess, "run", faux_run)
+    resultat = runner._run_pytest("http://localhost:32772")
+    _, env_premier = passages[0]
+    # Suivre le README (générer ces valeurs) n'est pas une réparation.
+    for nom in ("API_USERNAME", "API_PASSWORD", "JWT_SECRET"):
+        # Variable locale : un échec n'affiche pas l'environnement de l'hôte.
+        recu = env_premier.get(nom)
+        assert recu == conteneur[nom], nom
+    assert set(resultat["variables_documentees"]) >= {"API_USERNAME", "API_PASSWORD", "JWT_SECRET"}
