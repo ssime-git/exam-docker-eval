@@ -236,6 +236,9 @@ CORPS_DOCUMENTES = ("readme", "tests", "openapi")
 # input_data: T)`), essayés en enveloppe quand aucun nom n'a pu être lu.
 ENVELOPPES_COURANTES = ("input_data", "data", "input")
 
+# Copie de travail de la construction depuis la source, dans le rendu.
+DOSSIER_CONSTRUCTION = ".scriptorium_construction"
+
 
 def _cle_corps(corps) -> str:
     return json.dumps(corps, sort_keys=True, default=str)
@@ -953,15 +956,19 @@ class BentoMLRunner(BaseRunner):
                     if not self.image_name:
                         source_root = self._find_bento_source()
                         if source_root:
-                            construit = self._build_bento_from_source(source_root)
+                            try:
+                                construit = self._build_bento_from_source(source_root)
+                                bento_result = (self._auto_containerize_bento(
+                                    bento_file_path=construit.get("bento"))
+                                    if construit.get("success") else {})
+                            finally:
+                                self._ranger_construction()
                             if construit.get("success"):
-                                bento_result = self._auto_containerize_bento(
-                                    bento_file_path=construit.get("bento")
-                                )
                                 if bento_result.get("success"):
                                     self.image_name = bento_result["image_name"]
                                     auto_containerized = True
                                     image_loaded = True
+                                    self._image_construite = True
                                     self.logger.info(f"✓ Image construite depuis la source : {self.image_name}")
                             else:
                                 self.logger.warning(construit.get("error", "construction en échec"))
@@ -1273,7 +1280,10 @@ class BentoMLRunner(BaseRunner):
         if getattr(self, "_image_tags", None) is None:
             self._image_tags = tags_du_tar(self.image_tar) if self.image_tar else []
         return {"image_tags": list(self._image_tags),
-                "images_chargees": list(getattr(self, "_images_chargees", []) or [])}
+                "images_chargees": list(getattr(self, "_images_chargees", []) or []),
+                # Distinct d'image_loaded : l'image n'a pas été livrée, nous
+                # l'avons construite depuis la source du rendu.
+                "image_construite_par_le_correcteur": bool(getattr(self, "_image_construite", False))}
 
     def _run_image_only_evaluation(self) -> Dict[str, Any]:
         """
@@ -3679,7 +3689,8 @@ class BentoMLRunner(BaseRunner):
         trouves = []
         for current, dirs, files in os.walk(self.eval_dir):
             dirs[:] = [d for d in dirs
-                       if d not in {".git", ".venv", "venv", "__pycache__", ".bentoml_home"}]
+                       if d not in {".git", ".venv", "venv", "__pycache__", ".bentoml_home",
+                                    DOSSIER_CONSTRUCTION}]
             trouves += [os.path.join(current, f) for f in sorted(files) if f.endswith(".bento")]
 
         if trouves:
@@ -3700,7 +3711,8 @@ class BentoMLRunner(BaseRunner):
         image ou un `.bento` déjà compilé, et abandonnait en une seconde.
         """
         for current, dirs, files in os.walk(self.eval_dir):
-            dirs[:] = [d for d in dirs if d not in {".git", ".venv", "__pycache__", "node_modules"}]
+            dirs[:] = [d for d in dirs if d not in {".git", ".venv", "__pycache__", "node_modules",
+                                                    DOSSIER_CONSTRUCTION}]
             if "bentofile.yaml" in files:
                 return current
         return None
@@ -3721,6 +3733,18 @@ class BentoMLRunner(BaseRunner):
                 "pouvoir l'évaluer, au lieu de refuser la copie."
             ),
         )
+
+        # Construire sur une copie du rendu : prepare_data, train_model et
+        # `bentoml build` écrivent (data/, models/, __pycache__, .bento), et
+        # ce qui atterrissait dans la copie lui était reproché ensuite. La
+        # copie vit dans le rendu (dossier caché) : un moteur conteneurisé
+        # monte ce chemin-là chez le démon Docker, pas un /tmp à lui.
+        copie = os.path.join(self.eval_dir, DOSSIER_CONSTRUCTION)
+        shutil.rmtree(copie, ignore_errors=True)
+        shutil.copytree(source_root, copie, symlinks=True, ignore=shutil.ignore_patterns(
+            DOSSIER_CONSTRUCTION, ".git", ".venv", "venv", "__pycache__", "node_modules", "*.tar"))
+        self._dossier_construction = copie
+        source_root = copie
 
         image = os.environ.get("EXAM_BENTOML_BUILDER_IMAGE", "python:3.11-slim")
         # Tout dans un seul conteneur : installer, suivre la procedure de
@@ -3750,7 +3774,8 @@ class BentoMLRunner(BaseRunner):
             f"chown -R {os.getuid()}:{os.getgid()} /src 2>/dev/null || true"
         )
         resultat = subprocess.run(
-            ["docker", "run", "--rm", "-v", f"{source_root}:/src", image, "sh", "-c", script],
+            ["docker", "run", "--rm", "-e", "PYTHONDONTWRITEBYTECODE=1",
+             "-v", f"{source_root}:/src", image, "sh", "-c", script],
             capture_output=True, text=True, timeout=1800,
         )
         sortie = (resultat.stdout or "") + (resultat.stderr or "")
@@ -3763,6 +3788,13 @@ class BentoMLRunner(BaseRunner):
                     "error": f"aucun .bento produit par la construction : {sortie[-400:]}"}
         self.logger.info(f"✓ .bento construit : {chemin}")
         return {"success": True, "bento": chemin}
+
+    def _ranger_construction(self) -> None:
+        """Supprimer la copie de travail de la construction depuis la source."""
+        dossier = getattr(self, "_dossier_construction", None)
+        if dossier:
+            shutil.rmtree(dossier, ignore_errors=True)
+            self._dossier_construction = None
 
     def _auto_containerize_bento(self, bento_file_path: Optional[str] = None) -> Dict[str, Any]:
         """
