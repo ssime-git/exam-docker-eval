@@ -78,8 +78,8 @@ def test_tous_les_loaded_image_sont_pris(tmp_path, monkeypatch):
     monkeypatch.setattr("docker_eval.base_runner.subprocess.run", faux_run)
     image = runner._load_docker_image_cli()
     assert image is not None
-    assert runner._infos_image()["images_chargees"] == ["svc:latest", "svc:qdo3"]
     tagues = [c[2] for c in commandes if c[:2] == ["docker", "tag"]]
     # Chaque image chargée est adoptée, donc supprimée au ménage.
     assert tagues == ["svc:latest", "svc:qdo3"]
     assert len(runner._exam_images) == 2
+    assert runner._infos_image()["images_chargees"] == ["svc:latest", "svc:qdo3"]
