@@ -888,6 +888,7 @@ class BentoMLRunner(BaseRunner):
                         "error": "Failed to load Docker image",
                         "exit_code": 2,
                         "image_loaded": False,
+                        **self._champs_identifiants(),
                     }
                 image_loaded = True
             else:
@@ -1101,6 +1102,7 @@ class BentoMLRunner(BaseRunner):
                 "container_started": container_started,
                 "api_ready": api_ready,
                 "container_logs": self._capture_container_logs(),
+                **self._champs_identifiants(),
             }
             # L'echec est une etape comme une autre : il doit se lire dans la
             # trace, au bon endroit, avec ce que le conteneur a dit.
@@ -1133,6 +1135,7 @@ class BentoMLRunner(BaseRunner):
                 "container_started": container_started,
                 "api_ready": api_ready,
                 "container_logs": self._capture_container_logs(),
+                **self._champs_identifiants(),
             }
             # L'echec est une etape comme une autre : il doit se lire dans la
             # trace, au bon endroit, avec ce que le conteneur a dit.
@@ -1249,6 +1252,7 @@ class BentoMLRunner(BaseRunner):
                             ),
                             "exit_code": 2,
                             "image_loaded": False,
+                            **self._champs_identifiants(),
                         }
                     self.image_name = bento_result["image_name"]
                 else:
@@ -1257,6 +1261,7 @@ class BentoMLRunner(BaseRunner):
                         "error": "Failed to load Docker image with docker load -i",
                         "exit_code": 2,
                         "image_loaded": False,
+                        **self._champs_identifiants(),
                     }
             image_loaded = True
 
@@ -1305,6 +1310,7 @@ class BentoMLRunner(BaseRunner):
                     "image_name": self.image_name,
                     "image_loaded": image_loaded,
                     "container_started": False,
+                    **self._champs_identifiants(),
                 }
 
             self.cli_container_id = (run_result.stdout or "").strip() or self.container_name
@@ -1348,6 +1354,8 @@ class BentoMLRunner(BaseRunner):
                 "port_mode": port_mode,
                 "host_port": str(host_port),
                 "execution_mode": "image_only_cli",
+                "credentials_source": self.credentials_source,
+                "credentials_in_tests": self.credentials_in_tests,
             }
             self._log_execution_end(result)
             return result
@@ -1365,8 +1373,7 @@ class BentoMLRunner(BaseRunner):
                 "container_started": container_started,
                 "api_ready": api_ready,
                 "execution_mode": "image_only_cli",
-                "credentials_source": self.credentials_source,
-                "credentials_in_tests": self.credentials_in_tests,
+                **self._champs_identifiants(),
             }
             if container_started:
                 # Même relevé que le chemin testcontainers : sans lui, un
@@ -2029,6 +2036,16 @@ class BentoMLRunner(BaseRunner):
         results["all_passed"] = results["login_passed"] and results["predict_passed"]
         if login_ok is not None and predict_ok is not None:
             results.update(self._sonder_securite_et_contrat(base_url, login_ok, *predict_ok))
+        if "identifiants_dans_la_copie" not in results:
+            # /login ou /predict en échec (464154) : la présence de la paire
+            # dans le README ou les tests reste une mesure statique. Paire
+            # du login réussi, sinon celle lue dans la copie ; aucune paire
+            # connue : non mesuré.
+            paire = login_ok
+            if paire is None and contract.get("credentials_source"):
+                paire = {"username": contract["usernames"][0], "password": contract["passwords"][0]}
+            results["identifiants_dans_la_copie"] = (
+                self._identifiants_dans_la_copie(paire) if paire is not None else None)
 
         return results
 
@@ -3320,6 +3337,26 @@ class BentoMLRunner(BaseRunner):
 
         self._container_env = env
         return env
+
+    def _champs_identifiants(self) -> Dict[str, Any]:
+        """credentials_source, credentials_in_tests et identifiants_dans_la_copie
+        pour un résultat où /login n'a pas été appelé (image non chargée,
+        conteneur mort) : lecture statique du rendu, sans l'image (460660)."""
+        if not self.credentials_source:
+            try:
+                textes = sorted(self._iter_submission_texts(), key=lambda t: looks_like_test_file(t[0]))
+                trouve = find_credentials_in_texts(textes)
+            except Exception:
+                trouve = None
+            if trouve:
+                self.credentials_source, self.credentials_in_tests = trouve["source"], trouve["in_tests"]
+                self._paire_statique = {"username": trouve["username"], "password": trouve["password"]}
+        paire = getattr(self, "_paire_statique", None)
+        return {
+            "credentials_source": self.credentials_source,
+            "credentials_in_tests": self.credentials_in_tests,
+            "identifiants_dans_la_copie": self._identifiants_dans_la_copie(paire) if paire else None,
+        }
 
     def _valeurs_generees(self) -> set:
         """Valeurs que nous avons tirées au hasard pour le conteneur (aucune
