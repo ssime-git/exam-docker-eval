@@ -650,6 +650,29 @@ def _lectures_env_sans_defaut(texte: str) -> set:
     return noms
 
 
+_CHAMPS_MOT_DE_PASSE = ("password", "passwd", "pwd", "mot_de_passe", "pass")
+_CHAMPS_UTILISATEUR = ("username", "user", "login", "email", "user_name", "name")
+
+
+def _champ(dico: dict, noms) -> Optional[str]:
+    return next((cle for cle in dico if str(cle).lower() in noms), None)
+
+
+def identifiants_du_login(corps, profondeur: int = 0) -> Optional[dict]:
+    """Le dict du corps /login qui porte le mot de passe, quel que soit le
+    nom de l'enveloppe (`credentials`, `data`, `input_data`...), ou None.
+    461573 : seul `credentials` était reconnu."""
+    if not isinstance(corps, dict) or profondeur > 3:
+        return None
+    if _champ(corps, _CHAMPS_MOT_DE_PASSE):
+        return corps
+    for valeur in corps.values():
+        trouve = identifiants_du_login(valeur, profondeur + 1)
+        if trouve is not None:
+            return trouve
+    return None
+
+
 def _est_utilisateur(nom: str) -> bool:
     return "USER" in nom.upper() or nom.upper().endswith("_LOGIN")
 
@@ -1937,9 +1960,13 @@ class BentoMLRunner(BaseRunner):
             entetes_falsifies = {**sans_auth, acces["entete"]: _alterer(valeur)}
 
         mauvais_login = json.loads(json.dumps(login_ok))
-        cible = mauvais_login.get("credentials", mauvais_login) if isinstance(mauvais_login, dict) else {}
-        if isinstance(cible, dict) and "password" in cible:
-            cible["password"] = "mauvais-mot-de-passe-scriptorium"
+        cible = identifiants_du_login(mauvais_login)
+        if cible is not None:
+            cible[_champ(cible, _CHAMPS_MOT_DE_PASSE)] = "mauvais-mot-de-passe-scriptorium"
+        if mauvais_login == login_ok:
+            # Aucun mot de passe à changer : renvoyer le bon corps mesurerait
+            # un accès accepté qui n'en est pas un.
+            mauvais_login = None
         invalide = json.loads(json.dumps(corps))
         cible_inv = next((v for v in invalide.values() if isinstance(v, dict)), invalide) if isinstance(invalide, dict) else {}
         for cle, val in list(cible_inv.items()) if isinstance(cible_inv, dict) else []:
@@ -1949,7 +1976,8 @@ class BentoMLRunner(BaseRunner):
             "predict_sans_token": code("POST", "/predict", json=corps, headers=sans_auth),
             "predict_token_falsifie": (code("POST", "/predict", json=corps, headers=entetes_falsifies)
                                        if entetes_falsifies is not None else None),
-            "login_mauvais_identifiants": code("POST", "/login", json=mauvais_login),
+            "login_mauvais_identifiants": (code("POST", "/login", json=mauvais_login)
+                                           if mauvais_login is not None else None),
             "mecanisme": mecanisme,
         }
 
@@ -1996,8 +2024,11 @@ class BentoMLRunner(BaseRunner):
         (« README.md avec les commandes strictes et ordonnées pour [...]
         lancer les tests », « Le dossier tests/ ») ; des identifiants écrits
         dans src/service.py ne documentent rien pour qui relance pytest."""
-        cible = login_ok.get("credentials", login_ok) if isinstance(login_ok, dict) else {}
-        utilisateur, mot_de_passe = str(cible.get("username", "")), str(cible.get("password", ""))
+        cible = identifiants_du_login(login_ok) or {}
+        champ_utilisateur = _champ(cible, _CHAMPS_UTILISATEUR)
+        champ_mot_de_passe = _champ(cible, _CHAMPS_MOT_DE_PASSE)
+        utilisateur = str(cible.get(champ_utilisateur, "")) if champ_utilisateur else ""
+        mot_de_passe = str(cible.get(champ_mot_de_passe, "")) if champ_mot_de_passe else ""
         if not utilisateur or not mot_de_passe:
             return False
         if mot_de_passe in self._valeurs_generees():
