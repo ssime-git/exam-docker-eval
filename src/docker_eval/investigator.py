@@ -365,6 +365,10 @@ class Investigator:
                 self._interrompre(f"réponse LLM inexploitable : {erreur}", en_attente, echecs, debut)
                 return
             action = demande.get("action")
+            if action != "verdict" and len(observations) >= ACTIONS_MAX:
+                # Budget d'actions consomme : toute action de plus est refusee,
+                # le tour de verdict final a deja ete offert (voir plus bas).
+                break
             if action == "verdict":
                 if self.scoreur is None:
                     self.runner.record_step(
@@ -445,7 +449,13 @@ class Investigator:
             messages.append({"role": "assistant", "content": brut})
             messages.append({"role": "user", "content": f"Observation :\n{observation[:SORTIE_MAX]}"})
             if len(observations) >= ACTIONS_MAX:
-                break
+                # Derniere action faite : on offre un dernier tour pour le
+                # verdict au lieu de sortir sans (le LLM n'avait aucun moyen de
+                # conclure apres sa 6e action : 464154, 469475).
+                messages.append({"role": "user", "content":
+                    "Budget d'actions épuisé : aucune action de plus. Réponds "
+                    "maintenant par un verdict (faute 'indetermine' si la cause "
+                    "n'est pas établie)."})
         if en_attente is not None:
             self._declasser(en_attente, echecs, debut,
                             "budget d'actions épuisé avant un nouveau verdict")

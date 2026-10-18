@@ -267,3 +267,31 @@ def test_scoreur_http_sans_lettre(monkeypatch):
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
     assert mod.scorer_affirmation("p", "a", base_url="http://x/v1", api_key="", model="m") == {}
+
+
+def test_verdict_offert_apres_la_derniere_action(tmp_path, monkeypatch):
+    """Apres ACTIONS_MAX actions, le LLM a un dernier tour pour conclure
+    (464154, 469475 : « budget d'actions epuise sans verdict » alors qu'il
+    n'avait jamais pu repondre)."""
+    inv, runner, messages = enqueteur(
+        tmp_path, monkeypatch, [LOGS] * mod.ACTIONS_MAX + [PRUDENT])
+    inv.investiguer([ECHEC])
+
+    dernier = runner.steps[-1]
+    assert dernier["title"] == "Investigation — verdict"
+    assert dernier["exit_code"] == 0
+    assert "faute : indetermine" in dernier["output"]
+    assert "budget d'actions épuisé sans verdict" not in dernier["output"]
+    # le LLM est prevenu que le budget est consomme
+    assert "Budget d'actions épuisé" in messages[-1][-1]["content"]
+
+
+def test_action_apres_budget_refusee(tmp_path, monkeypatch):
+    inv, runner, _ = enqueteur(
+        tmp_path, monkeypatch, [LOGS] * (mod.ACTIONS_MAX + 1))
+    inv.investiguer([ECHEC])
+
+    actions = [t for t in runner.titres() if t.startswith("Investigation ") and " : " in t]
+    assert len(actions) == mod.ACTIONS_MAX
+    assert runner.steps[-1]["exit_code"] == 1
+    assert "budget d'actions épuisé sans verdict" in runner.steps[-1]["output"]
