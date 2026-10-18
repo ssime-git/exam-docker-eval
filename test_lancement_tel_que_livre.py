@@ -633,7 +633,22 @@ def test_scale_garde_par_le_up_par_defaut_apres_echec_de_la_recette(tmp_path, mo
         echecs_up=1)
     assert len(ups) == 2
     assert all("api-v1=3" in _apres_up(l) for l in ups)
+    # Échec non imputé : le monitoring de la recette reste demandé.
+    assert all(l[l.index("--profile") + 1] == "monitoring" and l.index("--profile") < l.index("up") for l in ups)
     assert resultat["lancement_tel_que_livre"]["cause"] == "non_mesure"
+
+
+def test_profil_de_la_recette_abandonne_apres_faute_de_la_copie(tmp_path, monkeypatch):
+    """Faute établie de la copie au up de la recette : la réparation mesure
+    le reste sans ses profils (comportement antérieur), le scale reste."""
+    makefile = "start-project:\n\tdocker compose --profile monitoring up -d --build --scale api-v1=3\n"
+    _, resultat, ups = _run_reel(tmp_path, monkeypatch, makefile, appel(
+        "docker", "compose", "--profile", "monitoring", "up", "-d", "--build", "--scale", "api-v1=3"),
+        echecs_up=1, imputation="copie")
+    assert len(ups) == 2
+    assert "--profile" in ups[0] and "--profile" not in ups[1]
+    assert "api-v1=3" in ups[1]
+    assert resultat["lancement_tel_que_livre"]["cause"] == "copie"
 
 
 def test_scale_non_transmis_leve(tmp_path, monkeypatch):

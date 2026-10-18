@@ -354,7 +354,7 @@ def test_reconstruction_garde_le_scale_de_la_recette(tmp_path, monkeypatch):
     from docker_eval import lancement
     runner, _ = runner_467094(tmp_path, monkeypatch)
     monkeypatch.setattr(module, "DockerCompose", tc.DockerCompose)
-    up = ["docker", "compose", "up", "-d", "--build", "--scale", "bike-api=2"]
+    up = ["docker", "compose", "--profile", "monitoring", "up", "-d", "--build", "--scale", "bike-api=2"]
     tel = {"commande": "make", "code": 0, "cause": None, "motif": None, "extrait": "", "up": up}
     monkeypatch.setattr(runner, "_jouer_lancement", lambda: {"tel_que_livre": tel, "up": lancement.traduire_up(up)})
     ups = []
@@ -374,3 +374,4 @@ def test_reconstruction_garde_le_scale_de_la_recette(tmp_path, monkeypatch):
     assert [l[l.index("-f") + 1] for l in ups] == [
         "docker-compose.eval.yml", "docker-compose.eval.yml", "docker-compose.datee.yml"]
     assert all(l[l.index("up") + 1:][:2] == ["--scale", "bike-api=2"] for l in ups)
+    assert all(l[l.index("--profile") + 1] == "monitoring" for l in ups)

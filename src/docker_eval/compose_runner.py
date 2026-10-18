@@ -630,6 +630,16 @@ class ComposeRunner(BaseRunner):
         # `--scale` de la recette gardés par le up par défaut et la
         # reconstruction datée (banc nginx, 461091).
         self._echelles_up = {}
+        # Profils de la recette gardés par ces mêmes up quand l'échec du up de
+        # la recette n'est pas imputé à la copie (458925 : le monitoring).
+        self._profils_up = []
+
+    def _commande_up(self, compose_name: str) -> str:
+        """La ligne du up par défaut, avec les profils et `--scale` gardés."""
+        return (f"docker compose -f {compose_name}"
+                + "".join(f" --profile {p}" for p in self._profils_up)
+                + " up --build"
+                + "".join(f" --scale {s}={n}" for s, n in self._echelles_up.items()))
 
     @staticmethod
     def _nom_fixe_en_alias(service: dict) -> bool:
@@ -1066,8 +1076,12 @@ class ComposeRunner(BaseRunner):
                     except Exception:
                         pass
                     self.compose = None
-                    # Le up par défaut repart sans la cause du premier.
+                    # Le up par défaut repart sans la cause du premier. Il
+                    # garde les profils de la recette, sauf faute établie de
+                    # la copie : la réparation mesure alors le reste sans eux.
                     self._cause_demarrage = None
+                    if imputation != "copie":
+                        self._profils_up = list(up["profils"])
                     extrait = (f"`{' '.join(self._lancement['up'])}` (le up de la recette) échoue "
                                f"(imputation {imputation or 'non classée'}) : "
                                f"{lancement.masquer_secrets(str(exc))[-600:]}")
@@ -1084,17 +1098,17 @@ class ComposeRunner(BaseRunner):
                 # remplace, gardent les `--scale` de la recette pour les
                 # services de ce compose : la topologie voulue par la copie
                 # (répartition de charge) n'est pas une réparation. Les
-                # profils, eux, restent ceux du up par défaut.
+                # profils aussi, sauf faute établie de la copie (plus haut).
                 connus = set(self._services_du_compose(os.path.join(self.eval_dir, compose_name)))
                 self._echelles_up = {s: n for s, n in echelles.items() if s in connus}
-                if self._echelles_up:
-                    commande_up += "".join(f" --scale {s}={n}" for s, n in self._echelles_up.items())
+                commande_up = self._commande_up(compose_name)
                 self.compose = _avec_echelles(DockerCompose(
                     context=self.eval_dir,
                     compose_file_name=compose_name,
                     pull=False,  # Use local builds
                     build=True,  # Build images before starting
-                    env_file=None  # No .env file needed
+                    env_file=None,  # No .env file needed
+                    profiles=self._profils_up or None,
                 ), self._echelles_up)
 
             # Start services with context manager (auto-cleanup on exit)
@@ -1112,9 +1126,7 @@ class ComposeRunner(BaseRunner):
                         if nom_datee is None:
                             raise
                         compose_name = nom_datee
-                        commande_up = (f"docker compose -f {nom_datee} up --build"
-                                       + "".join(f" --scale {s}={n}" for s, n in self._echelles_up.items())
-                                       + " (reconstruction datée)")
+                        commande_up = self._commande_up(nom_datee) + " (reconstruction datée)"
                     demarrage = _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate, True)
                 with demarrage:
                     self.record_step(
@@ -2438,7 +2450,8 @@ class ComposeRunner(BaseRunner):
             self._cause_demarrage = None
             self.compose = _avec_echelles(
                 DockerCompose(context=self.eval_dir, compose_file_name=reconstruction_datee.COMPOSE_DATE,
-                              pull=False, build=True, env_file=None), self._echelles_up)
+                              pull=False, build=True, env_file=None, profiles=self._profils_up or None),
+                self._echelles_up)
             contraints = ", ".join(f"{p['service']} : {p['paquet']} {p['installe']} (exclues : {', '.join(p['exclues'])})"
                                    for p in self._reconstruction["paquets_contraints"]) or "aucun"
             resume_contraintes = f"paquets contraints : {contraints}" + (
