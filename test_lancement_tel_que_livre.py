@@ -678,3 +678,55 @@ def test_scale_d_un_service_absent_du_compose_par_defaut_n_est_pas_garde(tmp_pat
     assert len(ups) == 2
     assert "ailleurs=2" in ups[0] and "api-v1=3" in ups[0]
     assert "ailleurs=2" not in ups[1] and "api-v1=3" in ups[1]
+
+
+# --- AppleDouble `._*` (460188) : artefacts macOS écartés avant le lancement --
+
+APPLEDOUBLE = b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        " + b"\x00" * 40
+
+
+def test_460188_appledouble_ecartes_avant_le_lancement(tmp_path, monkeypatch):
+    regles = tmp_path / "deployment" / "prometheus" / "rules"
+    regles.mkdir(parents=True)
+    (regles / "alert_rules.yml").write_text("groups: []\n")
+    (regles / "._alert_rules.yml").write_bytes(APPLEDOUBLE)
+    (tmp_path / "._docker-compose.yml").write_bytes(APPLEDOUBLE)
+    # Un fichier de l'apprenant au nom en `._` mais sans l'en-tête : il reste.
+    (regles / "._notes.yml").write_text("groups: []\n")
+    os.symlink("/etc/hostname", tmp_path / "._lien")
+    demon = DemonLancement(appels=appel("docker", "compose", "up", "-d", "--build"))
+    runner = runner_lancement(tmp_path, monkeypatch, demon)
+    runner.record_submission_step()
+    runner._relever_date_reference()
+    runner._ecarter_appledouble()
+    runner._jouer_lancement()
+    noms = set()
+    for _, donnees in demon.archives:
+        noms |= set(tarfile.open(fileobj=io.BytesIO(donnees)).getnames())
+    assert "travail/deployment/prometheus/rules/._alert_rules.yml" not in noms
+    assert "travail/._docker-compose.yml" not in noms
+    assert "travail/deployment/prometheus/rules/._notes.yml" in noms
+    assert "travail/deployment/prometheus/rules/alert_rules.yml" in noms
+    assert os.path.islink(tmp_path / "._lien")
+    [etape] = [e for e in runner.steps if e["title"] == "Fichiers AppleDouble écartés"]
+    assert etape["exit_code"] == 0
+    assert "deployment/prometheus/rules/._alert_rules.yml" in etape["output"]
+    assert "._notes.yml" not in etape["output"]
+    assert runner._reparations == []
+    # Rendus au nettoyage : la copie de travail retrouve son contenu.
+    runner._remettre_appledouble()
+    assert (regles / "._alert_rules.yml").read_bytes() == APPLEDOUBLE
+
+
+def test_appledouble_ecartes_dans_run_evaluation_sans_reparation(tmp_path, monkeypatch):
+    (tmp_path / "deployment").mkdir()
+    (tmp_path / "deployment" / "._prometheus.yml").write_bytes(APPLEDOUBLE)
+    passage = {"tel_que_livre": ATTEINT, "up": lancement.traduire_up(ATTEINT["up"]),
+               "produit": {".env": "GRAFANA_ADMIN_PASSWORD=x\n"}}
+    runner, resultat, _ = _run(tmp_path, monkeypatch, passage)
+    titres = [e["title"] for e in runner.steps]
+    assert "Fichiers AppleDouble écartés" in titres
+    assert titres.index("Fichiers AppleDouble écartés") < titres.index("Ports hôte relâchés")
+    assert resultat["reparations"] == []
+    # Remis par le nettoyage de run_evaluation.
+    assert (tmp_path / "deployment" / "._prometheus.yml").read_bytes() == APPLEDOUBLE

@@ -27,6 +27,7 @@ from . import reconstruction_datee
 # docker-compose.yml (on garde ce dernier en tete, c'est le nom demande par
 # les enonces).
 NOMS_COMPOSE = ("docker-compose.yml", "docker-compose.yaml", "compose.yaml", "compose.yml")
+_ENTETE_APPLEDOUBLE = b"\x00\x05\x16\x07"
 _DOSSIERS_IGNORES = {".git", ".venv", "venv", "node_modules", "__pycache__", "__MACOSX"}
 
 # Réglages DNS d'un service, retirés du compose réécrit (469634).
@@ -625,6 +626,9 @@ class ComposeRunner(BaseRunner):
         self._date_reference = None
         self._reconstruction = None
         self._fichiers_harnais = []
+        # {chemin: contenu} des AppleDouble `._*` écartés avant le lancement
+        # (460188), remis au nettoyage.
+        self._appledouble = {}
         # {service: {clé DNS: valeur d'origine}} retirés du compose réécrit.
         self._dns_retires = {}
         # `--scale` de la recette gardés par le up par défaut et la
@@ -935,6 +939,7 @@ class ComposeRunner(BaseRunner):
                 duration=time.time() - compose_resolution_started,
             )
             self._consigner_date_reference()
+            self._ecarter_appledouble()
 
             # Passage « lancement tel que livré » (politique du 16/10) : la
             # commande de l'énoncé, jouée par make dans le conteneur jetable.
@@ -2216,6 +2221,57 @@ class ComposeRunner(BaseRunner):
                 except Exception:
                     pass
 
+    def _ecarter_appledouble(self) -> None:
+        """Écarter les AppleDouble `._X` de la copie de travail avant le
+        lancement : métadonnées d'archivage macOS (famille de `__MACOSX`), pas
+        des fichiers de l'apprenant. 460188 : `rules/._alert_rules.yml` et
+        `provisioning/dashboards/._dashboards.yaml`, lus par Prometheus et
+        Grafana, les faisaient planter (« yaml: control characters are not
+        allowed »). Ni réparation ni point : une étape lisible, et les
+        fichiers remis au nettoyage. Seuls les vrais AppleDouble partent :
+        nom `._X`, fichier régulier (pas de lien), en-tête 0x00051607."""
+        debut = time.time()
+        for racine, dossiers, fichiers in os.walk(self.eval_dir):
+            dossiers[:] = [d for d in dossiers if d not in _DOSSIERS_IGNORES]
+            for nom in fichiers:
+                chemin = os.path.join(racine, nom)
+                if not nom.startswith("._") or os.path.islink(chemin) or not os.path.isfile(chemin):
+                    continue
+                try:
+                    with open(chemin, "rb") as lecteur:
+                        if lecteur.read(4) != _ENTETE_APPLEDOUBLE:
+                            continue
+                        lecteur.seek(0)
+                        contenu = lecteur.read()
+                    os.remove(chemin)
+                except OSError as erreur:
+                    self.logger.warning(f"AppleDouble {chemin} non écarté : {erreur}")
+                    continue
+                self._appledouble[chemin] = contenu
+        if self._appledouble:
+            self.record_step(
+                "Fichiers AppleDouble écartés",
+                command="retrait des `._*` à en-tête AppleDouble (0x00051607) de la copie de travail",
+                output="\n".join(sorted(os.path.relpath(c, self.eval_dir) for c in self._appledouble)),
+                exit_code=0,
+                duration=time.time() - debut,
+                note=("Métadonnées macOS ajoutées par l'archivage, pas des fichiers de l'apprenant : "
+                      "écartées sans pénalité avant le lancement, remises au nettoyage."),
+            )
+
+    def _remettre_appledouble(self) -> list:
+        erreurs = []
+        for chemin, contenu in self._appledouble.items():
+            try:
+                with open(chemin, "xb") as sortie:
+                    sortie.write(contenu)
+            except FileExistsError:
+                pass
+            except OSError as e:
+                erreurs.append(f"{os.path.relpath(chemin, self.eval_dir)} non remis : {e}")
+        self._appledouble = {}
+        return erreurs
+
     def _retirer_rapatries(self) -> list:
         """Remettre le projet dans l'état livré : fichiers produits par la
         recette retirés, fichiers modifiés rendus. Rend les erreurs."""
@@ -3184,6 +3240,7 @@ class ComposeRunner(BaseRunner):
         # interpoler le fichier pour démonter la stack (469217). Les fichiers
         # produits par la recette (rapatriés) suivent la même règle.
         errors.extend(self._retirer_rapatries())
+        errors.extend(self._remettre_appledouble())
         for chemin in list(self._fichiers_harnais):
             try:
                 os.remove(chemin)
