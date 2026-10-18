@@ -449,6 +449,7 @@ def fichiers_de_tests(dossier: str) -> list:
 # Les noms sous lesquels les tests des apprenants attendent l'adresse du
 # service ; EXAM_TEST_ENV (pi_test_env) s'y ajoute.
 NOMS_URL_PAR_DEFAUT = "BASE_URL,API_URL,SERVICE_URL,SERVICE_BASE_URL,API_BASE_URL,BENTO_URL"
+NOMS_CONTENEUR_PAR_DEFAUT = "API_CONTAINER_NAME,CONTAINER_NAME,SERVICE_CONTAINER_NAME"
 
 IGNORER_PARASITES_MACOS = ["--ignore-glob=*/._*", "--ignore-glob=*/__MACOSX/*"]
 
@@ -2696,6 +2697,12 @@ class BentoMLRunner(BaseRunner):
         noms_url = _noms_d_url_lus_par_les_tests(patched_tests_path)
         for nom in noms_url:
             env[nom] = base_url
+        # Des tests vont dans l'image par `docker exec <conteneur>` (469475 :
+        # tests/test_model.py lit API_CONTAINER_NAME, repli « admission-api »,
+        # le nom du README). Notre conteneur porte un autre nom : sans cette
+        # variable, 2 tests sur 33 echouaient pour une faute du harnais.
+        for nom in NOMS_CONTENEUR_PAR_DEFAUT.split(","):
+            env[nom] = self.container_name
         # Les tests importent le code de l'apprenant, qui vit dans le projet.
         env["PYTHONPATH"] = os.pathsep.join(
             [p for p in (projet, env.get("PYTHONPATH")) if p]
