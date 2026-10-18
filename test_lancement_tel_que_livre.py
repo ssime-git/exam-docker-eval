@@ -124,14 +124,15 @@ def test_les_appels_enregistres_se_relisent():
 
 def test_up_traduit_en_arguments_du_moteur():
     assert lancement.traduire_up(["docker", "compose", "up", "-d", "--build"]) == {
-        "fichiers": [], "profils": [], "env_files": [], "services": []}
+        "fichiers": [], "profils": [], "env_files": [], "services": [], "echelles": {}}
     assert lancement.traduire_up(["docker-compose", "-f", "a.yml", "--file=b.yml", "--profile", "mon",
                                   "--env-file", ".env.prod", "-p", "autre", "up", "-d", "nginx", "api"]) == {
         "fichiers": ["a.yml", "b.yml"], "profils": ["mon"], "env_files": [".env.prod"],
-        "services": ["nginx", "api"]}
+        "services": ["nginx", "api"], "echelles": {}}
     # Une option que le moteur ne sait pas rejouer : pas de traduction approximative.
     assert lancement.traduire_up(["docker", "compose", "--project-directory", "ailleurs", "up"]) is None
-    assert lancement.traduire_up(["docker", "compose", "up", "--scale", "api=3"]) is None
+    assert lancement.traduire_up(["docker", "compose", "up", "--no-deps", "api"]) is None
+    assert lancement.traduire_up(["docker", "compose", "--dry-run", "up"]) is None
 
 
 def test_lancement_atteint_le_up():
@@ -515,3 +516,150 @@ def test_up_de_la_recette_en_echec_non_impute_n_est_pas_un_zero(tmp_path, monkey
     resultat, _ = _run_recette(tmp_path, monkeypatch, [False, True], "non_mesure", reessai=False)
     tel = resultat["lancement_tel_que_livre"]
     assert tel["code"] is None and tel["cause"] == "non_mesure"
+
+
+# --- `--scale` et `--profile` de la recette rejoués par le vrai DockerCompose -
+#
+# Banc nginx : 461091 (`docker compose up -d --build --scale api-v1=3`) et
+# 458925 (`--profile monitoring up -d --build --scale api-v1=3`) étaient
+# déclarées « up_non_reproductible » et le moteur levait une seule réplique,
+# sans le monitoring. Le double est au niveau du binaire : testcontainers
+# construit la vraie ligne de commande, seul `subprocess.run` est remplacé.
+
+COMPOSE_ECHELLE = (
+    "services:\n"
+    "  api-v1:\n    build: ./src/api\n    container_name: api_v1\n    ports:\n      - \"8000\"\n"
+    "  nginx:\n    image: nginx\n    ports:\n      - \"8080:80\"\n    depends_on:\n      - api-v1\n"
+    "  prometheus:\n    image: prom/prometheus\n    profiles: [\"monitoring\"]\n")
+
+
+def test_scale_et_profils_traduits():
+    assert lancement.traduire_up(["docker", "compose", "up", "-d", "--build", "--scale", "api-v1=3"]) == {
+        "fichiers": [], "profils": [], "env_files": [], "services": [], "echelles": {"api-v1": 3}}
+    assert lancement.traduire_up(["docker", "compose", "--profile", "monitoring", "--profile=logs", "up", "-d",
+                                  "--scale=api-v1=3", "--scale", "worker=0"]) == {
+        "fichiers": [], "profils": ["monitoring", "logs"], "env_files": [], "services": [],
+        "echelles": {"api-v1": 3, "worker": 0}}
+    for invalide in (["--scale", "api=x"], ["--scale", "api"], ["--scale"], ["--scale", "=3"]):
+        assert lancement.traduire_up(["docker", "compose", "up", *invalide]) is None, invalide
+
+
+def _run_reel(tmp_path, monkeypatch, makefile, appels_recette, echecs_up=0, imputation="non_mesure",
+              reessai=False):
+    """run_evaluation complet jusqu'après le up : `_jouer_lancement` réel
+    (docker factice enregistré), vrai DockerCompose, `subprocess.run`
+    enregistré. `echecs_up` : nombre de `up` qui échouent d'abord."""
+    import subprocess
+    import testcontainers.compose.compose as tc
+    ecrire(tmp_path / "docker-compose.yml", COMPOSE_ECHELLE)
+    ecrire(tmp_path / "deployments" / "nginx" / "nginx.conf", tsn.NGINX)
+    ecrire(tmp_path / "Makefile", makefile)
+    demon = DemonLancement(appels=appels_recette, travail={})
+    monkeypatch.setattr(compose_runner, "client_docker", lambda: demon)
+    lignes, restants = [], [echecs_up]
+
+    def run(cmd, **kwargs):
+        lignes.append(list(cmd))
+        if "up" in cmd and restants[0] > 0:
+            restants[0] -= 1
+            raise subprocess.CalledProcessError(1, cmd, b"", b"container eval-api-v1-1 is unhealthy")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+    monkeypatch.setattr(tc, "subprocess_run", run)
+    runner = ComposeRunner("461091", str(tmp_path), timeout=60, logger=logging.getLogger("t"))
+
+    def diagnostiquer(exc, reessai_possible):
+        runner._cause_demarrage = {"imputation": imputation, "cause": "delai_depasse", "services": {},
+                                   "reessai": None}
+        return reessai and reessai_possible
+    monkeypatch.setattr(runner, "_diagnostiquer_up_rate", diagnostiquer)
+
+    def arret():
+        raise _Arret("arrêt après le up")
+    monkeypatch.setattr(runner, "_retenir_images_de_la_copie", arret)
+    resultat = runner.run_evaluation()
+    ups = [l for l in lignes if "up" in l]
+    return runner, resultat, ups
+
+
+def _apres_up(ligne):
+    return ligne[ligne.index("up") + 1:]
+
+
+def test_461091_scale_de_la_recette_rejoue(tmp_path, monkeypatch):
+    makefile = "start-project:\n\tdocker compose up -d --build --scale api-v1=3\n"
+    runner, resultat, ups = _run_reel(tmp_path, monkeypatch, makefile,
+                                      appel("docker", "compose", "up", "-d", "--build", "--scale", "api-v1=3"))
+    tel = resultat["lancement_tel_que_livre"]
+    assert tel["cause"] is None and tel["code"] == 0, tel
+    assert len(ups) == 1
+    suite = _apres_up(ups[0])
+    assert suite[suite.index("--scale") + 1] == "api-v1=3"
+    # Le compose dérivé ne garde pas le container_name : compose refuserait de scaler.
+    fichier = ups[0][ups[0].index("-f") + 1]
+    assert "container_name" not in lire(tmp_path / fichier)
+    [etape] = [e for e in runner.steps if e["title"].startswith("Build et démarrage Compose")]
+    assert "--scale api-v1=3" in etape["command"]
+
+
+def test_458925_profil_et_scale_de_la_recette_rejoues(tmp_path, monkeypatch):
+    makefile = "start-project:\n\tdocker compose --profile monitoring up -d --build --scale api-v1=3\n"
+    _, resultat, ups = _run_reel(tmp_path, monkeypatch, makefile, appel(
+        "docker", "compose", "--profile", "monitoring", "up", "-d", "--build", "--scale", "api-v1=3"))
+    tel = resultat["lancement_tel_que_livre"]
+    assert tel["cause"] is None and tel["code"] == 0, tel
+    [ligne] = ups
+    avant = ligne[:ligne.index("up")]
+    assert avant[avant.index("--profile") + 1] == "monitoring"
+    suite = _apres_up(ligne)
+    assert suite[suite.index("--scale") + 1] == "api-v1=3"
+
+
+def test_scale_garde_au_reessai_du_up(tmp_path, monkeypatch):
+    makefile = "start-project:\n\tdocker compose up -d --build --scale api-v1=3\n"
+    _, resultat, ups = _run_reel(tmp_path, monkeypatch, makefile,
+                                 appel("docker", "compose", "up", "-d", "--build", "--scale", "api-v1=3"),
+                                 echecs_up=1, reessai=True)
+    assert len(ups) == 2
+    assert all(_apres_up(l)[_apres_up(l).index("--scale") + 1] == "api-v1=3" for l in ups)
+    assert resultat["lancement_tel_que_livre"]["code"] == 0
+
+
+def test_scale_garde_par_le_up_par_defaut_apres_echec_de_la_recette(tmp_path, monkeypatch):
+    """Le up de la recette échoue (non imputé) : le up par défaut du moteur
+    garde le nombre de répliques, sinon la répartition de charge retombe à 0."""
+    makefile = "start-project:\n\tdocker compose --profile monitoring up -d --build --scale api-v1=3\n"
+    _, resultat, ups = _run_reel(tmp_path, monkeypatch, makefile, appel(
+        "docker", "compose", "--profile", "monitoring", "up", "-d", "--build", "--scale", "api-v1=3"),
+        echecs_up=1)
+    assert len(ups) == 2
+    assert all("api-v1=3" in _apres_up(l) for l in ups)
+    assert resultat["lancement_tel_que_livre"]["cause"] == "non_mesure"
+
+
+def test_scale_non_transmis_leve(tmp_path, monkeypatch):
+    """Si testcontainers change sa ligne `up`, le `--scale` ne se perd pas en silence."""
+    import subprocess
+    import testcontainers.compose.compose as tc
+    lignes = []
+    monkeypatch.setattr(tc, "subprocess_run",
+                        lambda cmd, **kw: lignes.append(cmd) or subprocess.CompletedProcess(cmd, 0, b"", b""))
+
+    def start_autre(self):
+        self._run_command(cmd=[*self.compose_command_property, "--ansi", "never", "up", "--wait"])
+    monkeypatch.setattr(tc.DockerCompose, "start", start_autre)
+    compose = compose_runner._avec_echelles(
+        tc.DockerCompose(context=str(tmp_path), compose_file_name="c.yml"), {"api-v1": 3})
+    with pytest.raises(RuntimeError, match="--scale"):
+        compose.start()
+
+
+def test_scale_d_un_service_absent_du_compose_par_defaut_n_est_pas_garde(tmp_path, monkeypatch):
+    """Recette en échec puis up par défaut : un `--scale` visant un service
+    que ce compose n'a pas ferait échouer compose (« no such service »)."""
+    makefile = "start-project:\n\tdocker compose up -d --build --scale api-v1=3 --scale ailleurs=2\n"
+    _, _, ups = _run_reel(tmp_path, monkeypatch, makefile, appel(
+        "docker", "compose", "up", "-d", "--build", "--scale", "api-v1=3", "--scale", "ailleurs=2"),
+        echecs_up=1)
+    assert len(ups) == 2
+    assert "ailleurs=2" in ups[0] and "api-v1=3" in ups[0]
+    assert "ailleurs=2" not in ups[1] and "api-v1=3" in ups[1]

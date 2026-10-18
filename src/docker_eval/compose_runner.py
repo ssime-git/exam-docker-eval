@@ -508,6 +508,39 @@ def annoter_bruit_de_sondes(sondes: list) -> None:
             )
 
 
+def _avec_echelles(compose, echelles: dict):
+    """Ajouter `--scale service=N` au `up` de ce DockerCompose.
+
+    testcontainers n'a pas d'option de mise à l'échelle : la ligne `up` qu'il
+    construit est complétée au passage, sur cette instance seulement, si bien
+    que le réessai de `_DemarrageSansDemontage` (nouveau start() sur le même
+    objet) la garde. Un `start()` dont la ligne `up` n'a pas reçu les
+    `--scale` lève : une version de testcontainers qui changerait sa ligne
+    ne doit pas ramener silencieusement à une réplique (banc nginx, 461091).
+    """
+    if not echelles:
+        return compose
+    options = [x for service, n in echelles.items() for x in ("--scale", f"{service}={n}")]
+    lancer, demarrer = compose._run_command, compose.start
+    vus = []
+
+    def run(cmd, *args, **kwargs):
+        base = list(compose.compose_command_property)
+        if isinstance(cmd, list) and cmd[:len(base)] == base and cmd[len(base):len(base) + 1] == ["up"]:
+            cmd = [*cmd[:len(base) + 1], *options, *cmd[len(base) + 1:]]
+            vus.append(cmd)
+        return lancer(cmd, *args, **kwargs)
+
+    def start():
+        avant = len(vus)
+        demarrer()
+        if len(vus) == avant:
+            raise RuntimeError("`--scale` non transmis : la ligne `up` de testcontainers a changé")
+
+    compose._run_command, compose.start = run, start
+    return compose
+
+
 class _DemarrageSansDemontage:
     """`with compose:` sans le démontage que testcontainers fait sur un `up`
     raté : son __enter__ appelle __exit__ en cas d'échec, et les conteneurs
@@ -594,6 +627,9 @@ class ComposeRunner(BaseRunner):
         self._fichiers_harnais = []
         # {service: {clé DNS: valeur d'origine}} retirés du compose réécrit.
         self._dns_retires = {}
+        # `--scale` de la recette gardés par le up par défaut et la
+        # reconstruction datée (banc nginx, 461091).
+        self._echelles_up = {}
 
     @staticmethod
     def _nom_fixe_en_alias(service: dict) -> bool:
@@ -984,9 +1020,10 @@ class ComposeRunner(BaseRunner):
             commande_up = f"docker compose -f {compose_name} up --build"
             deja_demarre = False
             relatifs = [os.path.relpath(f, self.eval_dir) for f in fichiers_recette]
+            echelles = dict((up or {}).get("echelles") or {})
             personnalise = up is not None and (
                 relatifs not in ([], [os.path.relpath(compose_file, self.eval_dir)])
-                or bool(up["profils"] or up["env_files"] or up["services"]))
+                or bool(up["profils"] or up["env_files"] or up["services"] or echelles))
             if personnalise:
                 noms = []
                 for chemin in fichiers_recette or [compose_file]:
@@ -999,13 +1036,15 @@ class ComposeRunner(BaseRunner):
                 commande_recette = (f"docker compose {' '.join(f'-f {n}' for n in noms)}"
                                     + "".join(f" --profile {p}" for p in up["profils"])
                                     + "".join(f" --env-file {e}" for e in up["env_files"])
-                                    + " up --build" + "".join(f" {s}" for s in up["services"]))
+                                    + " up --build"
+                                    + "".join(f" --scale {s}={n}" for s, n in echelles.items())
+                                    + "".join(f" {s}" for s in up["services"]))
                 recette_started = time.time()
                 try:
-                    self.compose = DockerCompose(
+                    self.compose = _avec_echelles(DockerCompose(
                         context=self.eval_dir, compose_file_name=noms if len(noms) > 1 else noms[0],
                         pull=False, build=True, env_file=up["env_files"] or None,
-                        profiles=up["profils"] or None, services=up["services"] or None)
+                        profiles=up["profils"] or None, services=up["services"] or None), echelles)
                     # Même démarrage que le up du moteur : réessai sur un
                     # healthcheck seulement lent (467094), cause classée.
                     _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate).__enter__()
@@ -1041,13 +1080,22 @@ class ComposeRunner(BaseRunner):
                              extrait=extrait)
             if not deja_demarre:
                 self._noter_reparations_de_lancement(compose_name)
-                self.compose = DockerCompose(
+                # Le up par défaut, et la reconstruction datée qui le
+                # remplace, gardent les `--scale` de la recette pour les
+                # services de ce compose : la topologie voulue par la copie
+                # (répartition de charge) n'est pas une réparation. Les
+                # profils, eux, restent ceux du up par défaut.
+                connus = set(self._services_du_compose(os.path.join(self.eval_dir, compose_name)))
+                self._echelles_up = {s: n for s, n in echelles.items() if s in connus}
+                if self._echelles_up:
+                    commande_up += "".join(f" --scale {s}={n}" for s, n in self._echelles_up.items())
+                self.compose = _avec_echelles(DockerCompose(
                     context=self.eval_dir,
                     compose_file_name=compose_name,
                     pull=False,  # Use local builds
                     build=True,  # Build images before starting
                     env_file=None  # No .env file needed
-                )
+                ), self._echelles_up)
 
             # Start services with context manager (auto-cleanup on exit)
             self.logger.info("Starting Docker Compose services...")
@@ -1064,7 +1112,9 @@ class ComposeRunner(BaseRunner):
                         if nom_datee is None:
                             raise
                         compose_name = nom_datee
-                        commande_up = f"docker compose -f {nom_datee} up --build (reconstruction datée)"
+                        commande_up = (f"docker compose -f {nom_datee} up --build"
+                                       + "".join(f" --scale {s}={n}" for s, n in self._echelles_up.items())
+                                       + " (reconstruction datée)")
                     demarrage = _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate, True)
                 with demarrage:
                     self.record_step(
@@ -2386,8 +2436,9 @@ class ComposeRunner(BaseRunner):
             except Exception as erreur:
                 notes.append(f"arrêt de la stack d'origine : {erreur}")
             self._cause_demarrage = None
-            self.compose = DockerCompose(context=self.eval_dir, compose_file_name=reconstruction_datee.COMPOSE_DATE,
-                                         pull=False, build=True, env_file=None)
+            self.compose = _avec_echelles(
+                DockerCompose(context=self.eval_dir, compose_file_name=reconstruction_datee.COMPOSE_DATE,
+                              pull=False, build=True, env_file=None), self._echelles_up)
             contraints = ", ".join(f"{p['service']} : {p['paquet']} {p['installe']} (exclues : {', '.join(p['exclues'])})"
                                    for p in self._reconstruction["paquets_contraints"]) or "aucun"
             resume_contraintes = f"paquets contraints : {contraints}" + (

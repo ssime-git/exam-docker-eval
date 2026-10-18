@@ -344,3 +344,33 @@ def test_pas_de_reconstruction_pour_un_plantage(tmp_path, monkeypatch):
     assert lances == ["docker-compose.eval.yml"]
     assert "reconstruction_datee" not in result
     assert result["cause_demarrage"]["imputation"] == "copie"
+
+
+def test_reconstruction_garde_le_scale_de_la_recette(tmp_path, monkeypatch):
+    """Banc nginx (461091) : le `--scale` de la recette vaut pour chaque `up`
+    qui la remplace, reconstruction datée comprise. Vrai DockerCompose, seul
+    `subprocess.run` est enregistré."""
+    import testcontainers.compose.compose as tc
+    from docker_eval import lancement
+    runner, _ = runner_467094(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "DockerCompose", tc.DockerCompose)
+    up = ["docker", "compose", "up", "-d", "--build", "--scale", "bike-api=2"]
+    tel = {"commande": "make", "code": 0, "cause": None, "motif": None, "extrait": "", "up": up}
+    monkeypatch.setattr(runner, "_jouer_lancement", lambda: {"tel_que_livre": tel, "up": lancement.traduire_up(up)})
+    ups = []
+
+    def run(cmd, **kwargs):
+        if "up" in cmd:
+            ups.append(list(cmd))
+            if "docker-compose.datee.yml" not in cmd:
+                raise subprocess.CalledProcessError(
+                    1, cmd, b"", b"dependency failed to start: container bike-api-1 is unhealthy\n")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+    monkeypatch.setattr(tc, "subprocess_run", run)
+
+    result = runner.run_evaluation()
+
+    assert result["reconstruction_datee"]["resultat"] == "saine"
+    assert [l[l.index("-f") + 1] for l in ups] == [
+        "docker-compose.eval.yml", "docker-compose.eval.yml", "docker-compose.datee.yml"]
+    assert all(l[l.index("up") + 1:][:2] == ["--scale", "bike-api=2"] for l in ups)
