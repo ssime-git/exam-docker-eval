@@ -409,11 +409,12 @@
     },
     {
      "champ": "corps_source",
-     "confiance": "sure",
+     "confiance": "a_confirmer",
      "op": "dans",
      "attendu": [
       "readme"
-     ]
+     ],
+     "pourquoi": "466786 : README sans enveloppe input_data ; une seule requête (200) ; « image » si l'enveloppe vient de la signature (politique du moteur), « readme » si le corps du README a passé tel quel"
     },
     {
      "champ": "mecanisme",
@@ -676,7 +677,8 @@
      "op": "dans",
      "attendu": [
       "tests"
-     ]
+     ],
+     "pourquoi": "466786 : README sans enveloppe input_data ; une seule requête (200) ; « image » si l'enveloppe vient de la signature (politique du moteur), « readme » si le corps du README a passé tel quel"
     },
     {
      "champ": "mecanisme",
