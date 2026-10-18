@@ -1574,8 +1574,11 @@ class ComposeRunner(BaseRunner):
         for nom in boucles:
             marques[nom] = ("restarting", 1)
         _, morts = self._classer_services(marques)
-        if not morts or self._reconstruction is not None or self._cause_demarrage is not None \
-                or not getattr(self, "_compose_name", None):
+        # Une cause déjà retenue reste, sauf si son réessai a réussi (healthcheck
+        # lent, panne réseau du build) : la stack debout est alors à diagnostiquer.
+        cause = self._cause_demarrage
+        if not morts or self._reconstruction is not None or not getattr(self, "_compose_name", None) \
+                or cause is not None and (cause.get("reessai") or {}).get("resultat") != "sain":
             return etats, boucles
         debut = time.time()
         releve = self._releve_sante()

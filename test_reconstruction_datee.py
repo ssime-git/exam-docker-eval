@@ -388,6 +388,11 @@ LOGS_461338 = (
 )
 
 
+PANNE_PYPI = (b"------\n > [4/5] RUN pip install -r requirements.txt:\n"
+              b"55.31 pip._vendor.urllib3.exceptions.ReadTimeoutError: HTTPSConnectionPool("
+              b"host='files.pythonhosted.org', port=443): Read timed out.\n------\n")
+
+
 def etat_en_boucle():
     return {"State": {"Status": "restarting", "ExitCode": 1, "OOMKilled": False},
             "RestartCount": 7,
@@ -401,7 +406,7 @@ def etat_sain():
                                   "com.docker.compose.project": "eval_copie-test"}, "Env": []}}
 
 
-def runner_461338(tmp_path, monkeypatch, datee_saine=True, logs=LOGS_461338):
+def runner_461338(tmp_path, monkeypatch, datee_saine=True, logs=LOGS_461338, build_reseau=0):
     """Le up passe (pas de healthcheck bloquant), puis bike-api redémarre en
     boucle. Après la reconstruction datée : sain, ou toujours en boucle."""
     runner, _ = runner_467094(tmp_path, monkeypatch)
@@ -413,6 +418,10 @@ def runner_461338(tmp_path, monkeypatch, datee_saine=True, logs=LOGS_461338):
 
         def start(self):
             lances.append(self.kwargs["compose_file_name"])
+            if len(lances) <= build_reseau:
+                raise subprocess.CalledProcessError(
+                    1, ["docker", "compose", "up"], output=PANNE_PYPI, stderr=b"failed to solve: process "
+                    b"\"/bin/sh -c pip install -r requirements.txt\" did not complete successfully: exit code: 2\n")
 
         def __exit__(self, *_a):
             return False
@@ -421,6 +430,8 @@ def runner_461338(tmp_path, monkeypatch, datee_saine=True, logs=LOGS_461338):
             pass
 
     def conteneurs():
+        if len(lances) <= build_reseau:
+            return []  # build raté : `compose ps` ne liste rien
         datee = bool(lances) and lances[-1] == "docker-compose.datee.yml"
         if datee and datee_saine:
             return [Conteneur(etat_sain(), b"Uvicorn running on http://0.0.0.0:8080\n")]
@@ -481,3 +492,17 @@ def test_plantage_apres_up_reussi_diagnostique_sans_reconstruction(tmp_path, mon
     assert result["cause_demarrage"]["cause"] == "plantage_application"
     assert result["fault"] == "apprenant" and result["success"] is False
     assert any(s["title"] == "Services qui redémarrent en boucle" for s in result["steps"])
+
+
+def test_panne_reseau_reessayee_puis_boucle_reconstruction_datee(tmp_path, monkeypatch):
+    """Un build relancé après une panne réseau, puis bike-api en boucle : le
+    réessai réussi ne doit pas masquer le diagnostic d'après démarrage."""
+    runner, lances = runner_461338(tmp_path, monkeypatch, build_reseau=1)
+
+    result = runner.run_evaluation()
+
+    assert lances == ["docker-compose.eval.yml", "docker-compose.eval.yml", "docker-compose.datee.yml"]
+    assert result["reconstruction_datee"]["resultat"] == "saine"
+    assert result["cause_demarrage"]["imputation"] == "copie_datee"
+    assert result["cause_demarrage"]["cause_initiale"]["cause"] == "conflit_versions_dependances"
+    assert result["success"] is True and "fault" not in result
