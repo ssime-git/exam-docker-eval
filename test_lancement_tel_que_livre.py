@@ -331,7 +331,10 @@ def _run(tmp_path, monkeypatch, passage, compose_text=None, config=(1, "required
     appels = []
 
     def compose_factice(**kwargs):
-        appels.append(kwargs)
+        # Ce que compose lirait à cet instant : les AppleDouble encore là.
+        appels.append(dict(kwargs, _appledouble=sorted(
+            os.path.relpath(os.path.join(d, f), tmp_path) for d, _, fs in os.walk(tmp_path)
+            for f in fs if f.startswith("._"))))
         raise _Arret("arrêt avant compose up")
     monkeypatch.setattr(compose_runner, "DockerCompose", compose_factice)
     runner = ComposeRunner("469217", str(tmp_path), timeout=60, logger=logging.getLogger("t"))
@@ -723,7 +726,9 @@ def test_appledouble_ecartes_dans_run_evaluation_sans_reparation(tmp_path, monke
     (tmp_path / "deployment" / "._prometheus.yml").write_bytes(APPLEDOUBLE)
     passage = {"tel_que_livre": ATTEINT, "up": lancement.traduire_up(ATTEINT["up"]),
                "produit": {".env": "GRAFANA_ADMIN_PASSWORD=x\n"}}
-    runner, resultat, _ = _run(tmp_path, monkeypatch, passage)
+    runner, resultat, appels = _run(tmp_path, monkeypatch, passage)
+    # 460188 : au moment du up, le fichier que Prometheus lirait n'est plus là.
+    assert appels and appels[0]["_appledouble"] == []
     titres = [e["title"] for e in runner.steps]
     assert "Fichiers AppleDouble écartés" in titres
     assert titres.index("Fichiers AppleDouble écartés") < titres.index("Ports hôte relâchés")
