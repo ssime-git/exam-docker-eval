@@ -689,6 +689,9 @@ class ComposeRunner(BaseRunner):
         # `--scale` de la recette gardés par le up par défaut et la
         # reconstruction datée (banc nginx, 461091).
         self._echelles_up = {}
+        # POST /predict déclarés ou construits qui ont rendu une prédiction
+        # 2xx : les sondes de comportement les reprennent (461091).
+        self._requetes_qui_predisent = []
         # Profils de la recette gardés par ces mêmes up quand l'échec du up de
         # la recette n'est pas imputé à la copie (458925 : le monitoring).
         self._profils_up = []
@@ -1741,6 +1744,8 @@ class ComposeRunner(BaseRunner):
             if sonde.get("code") != 401:
                 break
         code = sonde.get("code")
+        if sondes_nginx.predit(sonde):
+            self._requetes_qui_predisent.append(requete)
         self.record_step(
             "Requête construite par le correcteur : POST /predict",
             command=f"POST {racine_url}/predict + corps JSON {requete['corps']} + Authorization Basic "
@@ -1787,6 +1792,9 @@ class ComposeRunner(BaseRunner):
                      "le 401 est la réponse attendue, la protection fonctionne\n")
         sonde["duration_seconds"] = time.time() - started
         code = sonde.get("code")
+        if requete["methode"] == "POST" and requete["chemin"].rstrip("/").endswith("/predict") \
+                and sondes_nginx.predit(sonde):
+            self._requetes_qui_predisent.append(requete)
         self.record_step(
             f"Requête déclarée ({requete['source']}) : {requete['methode']} {requete['chemin']}",
             command=f"{requete['methode']} {url}"
@@ -1808,11 +1816,10 @@ class ComposeRunner(BaseRunner):
         négatifs : c'est lui qui rend 200. Sans requête déclarée, celle que
         le moteur construit depuis le schéma de l'API ; à défaut, un POST
         sans corps : le code reste lisible (422 n'est pas 401 ni 503)."""
-        for requete in requetes_declarees(self.eval_dir):
-            if (requete["methode"] == "POST" and requete["chemin"].rstrip("/").endswith("/predict")
-                    and requete.get("port") in (None, 80, 443)
-                    and not (requete["identifiants"] and code_attendu_negatif(requete["identifiants"]))):
-                return requete
+        requete = sondes_nginx.choisir_requete_predict(
+            self._requetes_qui_predisent, requetes_declarees(self.eval_dir), code_attendu_negatif)
+        if requete is not None:
+            return requete
         construite = getattr(self, "_requete_construite_memo", None)
         if construite:
             return construite
@@ -1969,7 +1976,7 @@ class ComposeRunner(BaseRunner):
                 return {"code_variante": variante.get("code"),
                         "corps_differents": (defaut.get("extrait") != variante.get("extrait")) if deux_codes else None}
 
-            if defaut is not None:
+            if defaut is not None and sondes_nginx.predit(defaut):
                 try:
                     comportement["ab"] = {"entete": entete_impose, "valeur": valeur_imposee,
                                           "code_defaut": defaut.get("code"),
@@ -2029,6 +2036,8 @@ class ComposeRunner(BaseRunner):
                 }
             except Exception:
                 comportement["rafale"] = None
+            if defaut is not None and not sondes_nginx.predit(defaut):
+                sondes_nginx.sans_prediction(comportement, defaut)
 
         # Répartition : après la rafale, chaque réplique v1 a-t-elle servi ?
         # Les services v1 sont les serveurs de l'upstream par défaut du map ;

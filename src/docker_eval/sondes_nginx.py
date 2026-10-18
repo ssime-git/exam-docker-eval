@@ -381,6 +381,42 @@ def nettoyer_sortie(texte, maxi: int = 1500) -> str:
     return propre if len(propre) <= maxi else propre[-maxi:]
 
 
+def predit(sonde: dict | None) -> bool:
+    """La sonde a obtenu une prédiction : un code 2xx."""
+    code = (sonde or {}).get("code")
+    return isinstance(code, int) and 200 <= code < 300
+
+
+def choisir_requete_predict(qui_predisent: list, declarees: list, negative) -> dict | None:
+    """Le POST /predict des sondes de comportement : d'abord une requête qui
+    a déjà rendu une prédiction 2xx (461091 : le curl du Makefile perd son
+    corps, ceux de tests/run_tests.sh prédisent), sinon la première déclarée
+    vers le proxy avec des identifiants non négatifs. `negative(couple)` :
+    vrai pour un couple volontairement faux."""
+    for requete in qui_predisent:
+        if not (requete.get("identifiants") and negative(requete["identifiants"])):
+            return requete
+    for requete in declarees:
+        if (requete["methode"] == "POST" and requete["chemin"].rstrip("/").endswith("/predict")
+                and requete.get("port") in (None, 80, 443)
+                and not (requete["identifiants"] and negative(requete["identifiants"]))):
+            return requete
+    return None
+
+
+def sans_prediction(comportement: dict, defaut: dict | None) -> None:
+    """Notre POST nominal n'obtient pas de prédiction (422, 404…) : le
+    routage A/B et le retour en 2xx après la rafale ne se mesurent pas sur
+    une requête rejetée. Non mesurés, jamais un 0 pour la copie ; la
+    limitation de débit (429/503, posée par nginx avant l'API) reste lue."""
+    code = (defaut or {}).get("code")
+    comportement["ab"] = None
+    comportement["ab_non_mesure"] = (f"aucune requête n'obtient de prédiction (POST nominal → {code}) : "
+                                     "le routage ne se prouve pas sur une requête rejetée")
+    if comportement.get("rafale"):
+        comportement["rafale"]["retour_2xx_apres_pause"] = None
+
+
 def _oui_non(valeur, oui="oui", non="non", inconnu="non mesuré") -> str:
     return inconnu if valeur is None else (oui if valeur else non)
 
@@ -390,7 +426,7 @@ def resume_comportement(c: dict) -> str:
     lignes = []
     ab = c.get("ab")
     if ab is None:
-        lignes.append("routage A/B : non mesuré (pas de base TLS)")
+        lignes.append(f"routage A/B : non mesuré ({c.get('ab_non_mesure') or 'pas de base TLS'})")
     else:
         lignes.append(
             f"routage A/B (en-tête de l'énoncé) : POST sans en-tête → {ab['code_defaut']}, avec {ab['entete']}: "
