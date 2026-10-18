@@ -54,22 +54,35 @@ def etat_docker():
     return images, conteneurs, volumes
 
 
-def nettoyer(avant):
-    images_av, conteneurs_av, volumes_av = avant
-    images, conteneurs, volumes = etat_docker()
-    for c in conteneurs - conteneurs_av:
-        sh("docker", "rm", "-f", c)
+def nettoyer(avant, copie, sortie):
+    """Ne retire que ce qui porte la marque du passage : le conteneur du
+    moteur (banc-bentoml-<copie>), ceux du service (bentoml_eval_<copie>),
+    les images eval_<copie>/… et service_eval:<copie>, et les tags que le tar
+    de la copie a chargés. Jamais de prune, rien d'autre : une autre session
+    Docker peut tourner en parallèle."""
+    images_av, conteneurs_av, _ = avant
+    for ligne in sh("docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}} {{.Names}}").stdout.split("\n"):
+        if not ligne.strip():
+            continue
+        ident, nom = ligne.split(" ", 1)
+        if ident not in conteneurs_av and (nom.startswith(f"banc-bentoml-{copie}") or nom.startswith(f"bentoml_eval_{copie}")):
+            sh("docker", "rm", "-f", ident)
+    tags_copie = set()
+    try:
+        tags_copie = set(json.loads((sortie / "eval.json").read_text())["result"].get("image_tags") or [])
+    except Exception:
+        pass
+    images, _, _ = etat_docker()
     for ident, refs in images.items():
         nouvelles = refs - images_av.get(ident, set())
-        if ident not in images_av:
+        a_nous = {r for r in nouvelles if r.startswith(f"eval_{copie}/") or r == f"service_eval:{copie}" or r in tags_copie}
+        if not a_nous:
+            continue
+        if ident not in images_av and a_nous == nouvelles:
             sh("docker", "rmi", "-f", ident)
         else:
-            # Image préexistante retaguée par le passage : retirer le tag seul.
-            for ref in nouvelles:
-                if not ref.endswith(":<none>"):
-                    sh("docker", "rmi", ref)
-    for v in volumes - volumes_av:
-        sh("docker", "volume", "rm", v)
+            for ref in a_nous:
+                sh("docker", "rmi", ref)
 
 
 # --- copie de travail -------------------------------------------------------
@@ -96,6 +109,21 @@ def commande_production(copie, travail):
     if meta.get("imageTar"):
         args += ["--image-tar", str(travail / meta["imageTar"])]
     return args
+
+
+def conventions_du_skill():
+    """Conventions d'examen du frontmatter du skill, servies au moteur comme le
+    fait pi-corrector (skills.ts, parseEngineEnv, #49)."""
+    texte = (SKILL / "bentoml-exam-corrector" / "SKILL.md").read_text()
+    entete = texte.split("---", 2)[1] if texte.startswith("---") else ""
+    valeurs = {}
+    for ligne in entete.splitlines():
+        if ":" in ligne:
+            cle, val = ligne.split(":", 1)
+            valeurs[cle.strip()] = val.strip()
+    table = {"pi_default_service_port": "EXAM_DEFAULT_SERVICE_PORT", "pi_test_packages": "EXAM_TEST_PACKAGES",
+             "pi_test_env": "EXAM_TEST_ENV", "pi_stack_mode": "EXAM_STACK_MODE"}
+    return {var: valeurs[cle] for cle, var in table.items() if valeurs.get(cle)}
 
 
 def lancer(copie, sortie):
@@ -125,6 +153,7 @@ def lancer(copie, sortie):
         "-e", "PI_CORRECTOR_DOCKER_HOST=localhost",
         "-e", f"EXAM_DOCKER_EVAL={MOTEUR / 'src'}",
         "-e", f"UV_CACHE_DIR={cache}", "-e", f"HOME={maison}",
+        *[x for var, val in conventions_du_skill().items() for x in ("-e", f"{var}={val}")],
         "-v", f"{LOURD}:{LOURD}", "-v", f"{MOTEUR}:{MOTEUR}:ro", "-v", f"{SKILL}:{SKILL}:ro",
         "-w", str(sortie), "--entrypoint", "bash", IMAGE_RUNNER, "-lc",
         " ".join(_q(a) for a in interieur),
@@ -139,7 +168,7 @@ def lancer(copie, sortie):
         sh("docker", "rm", "-f", f"banc-bentoml-{copie}")
         code, sortie_texte = "délai", f"délai de {DELAI} s dépassé\n{e.stdout or ''}\n{e.stderr or ''}"
     finally:
-        nettoyer(avant)
+        nettoyer(avant, copie, sortie)
     (sortie / "sortie.txt").write_text(sortie_texte)
     # Ce que le passage a laissé dans la copie, hors artefacts déclarés du
     # correcteur : un __pycache__ ou un .pytest_cache passerait pour livré.
@@ -150,6 +179,7 @@ def lancer(copie, sortie):
         "moteur_sha": sh("git", "-C", str(MOTEUR), "rev-parse", "HEAD").stdout.strip(),
         "moteur_modifie": bool(sh("git", "-C", str(MOTEUR), "status", "--porcelain", "src").stdout.strip()),
         "skill_sha": sh("git", "-C", str(SKILL), "rev-parse", "HEAD").stdout.strip(),
+        "conventions": conventions_du_skill(),
         "fichiers_crees": crees[:50],
         "moteur_importe": next((l for l in sortie_texte.split("\n") if "docker_eval" in l and "src" in l), None),
     }, indent=2))

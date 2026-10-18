@@ -315,14 +315,15 @@
     },
     {
      "champ": "predict_passed",
-     "confiance": "sure",
-     "attendu": true
+     "confiance": "a_confirmer",
+     "attendu": true,
+     "pourquoi": "le « succès » de production (moteur 45f4e6e) était un faux positif : réponse {'error': 'Invalid or expired token', 'status': 401} en HTTP 200, refusée depuis eef0257. Le service rend-il une prédiction avec le jeton dans input_data ?"
     },
     {
      "champ": "mecanisme",
-     "confiance": "sure",
+     "confiance": "a_confirmer",
      "attendu": "jeton_corps",
-     "pourquoi": "moteur #41"
+     "pourquoi": "moteur #41, si une requête réussit"
     },
     {
      "champ": "corps_source",
@@ -347,7 +348,7 @@
       -0.05,
       1.05
      ],
-     "pourquoi": "l'ancien rapport lisait 401 comme prédiction"
+     "pourquoi": "l'ancien rapport lisait le 401 d'un refus comme prédiction"
     },
     {
      "champ": "pytest.passed",
@@ -1015,7 +1016,7 @@
      "champ": "instruction_recuperation",
      "confiance": "ecart_connu",
      "attendu": null,
-     "pourquoi": "18/10 : ni docker pull ni URL dans le README"
+     "pourquoi": "18/10 : ni docker pull ni URL d'archive d'image dans le README. Piège : le README télécharge admission.csv par curl, ce n'est pas une instruction de récupération d'image"
     },
     {
      "champ": "readme_image_citee",
@@ -1217,6 +1218,18 @@
      "attendu": [
       422
      ]
+    },
+    {
+     "champ": "image_absente",
+     "confiance": "sure",
+     "op": "vide",
+     "pourquoi": "l'image est livrée ; le curl du jeu de données (admission.csv) n'est pas une instruction de récupération d'image"
+    },
+    {
+     "champ": "image_source",
+     "confiance": "sure",
+     "op": "vide",
+     "pourquoi": "image chargée depuis l'archive"
     },
     {
      "champ": "identifiants_dans_la_copie",
