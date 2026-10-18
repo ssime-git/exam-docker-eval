@@ -1218,6 +1218,7 @@ class ComposeRunner(BaseRunner):
                     # attendre un conteneur pipeline-1 inexistant faisait tourner
                     # 600s de boucle NotFound avant un timeout impute a la copie.
                     services = self._services_du_compose(os.path.join(self.eval_dir, compose_name))
+                    self._compose_name = compose_name
                     # Convention d'examen declarable (pi_stack_mode, #49) :
                     # serving | pipeline | auto (defaut : deviner par la
                     # presence d'un service `pipeline`).
@@ -1459,6 +1460,10 @@ class ComposeRunner(BaseRunner):
         stack debout qui répond sur ses ports.
         """
         etats = self._record_service_states()
+        # Avant les sondes : une stack tombée sur un conflit de versions est
+        # reconstruite, et seule la stack évaluée est sondée (461338).
+        boucles = self._boucles_de_redemarrage()
+        etats, boucles = self._reconstruire_si_conflit(etats, boucles)
 
         sondes = self._sonder_ports_publies()
         annoter_bruit_de_sondes(sondes)
@@ -1507,7 +1512,6 @@ class ComposeRunner(BaseRunner):
                 self.record_step("Sondes de comportement Prometheus",
                                  output=f"non mesurées : erreur interne du harnais ({erreur})", exit_code=0)
 
-        boucles = self._boucles_de_redemarrage()
         for nom in boucles:
             etats[nom] = ("restarting", etats.get(nom, ("", 1))[1] or 1)
         if boucles:
@@ -1559,6 +1563,46 @@ class ComposeRunner(BaseRunner):
         if prometheus is not None:
             resultat["prometheus_comportement"] = prometheus
         return resultat
+
+    def _reconstruire_si_conflit(self, etats: dict, boucles: set) -> tuple:
+        """Services en échec après un `up` réussi : même diagnostic que pour
+        un `up` raté et, sur un conflit de versions, la même reconstruction
+        datée unique (461338, 460188 : pas de healthcheck bloquant, le `up`
+        passe puis bike-api redémarre en boucle sur « pyarrow requires NumPy
+        2.0 »). Rend (etats, boucles) de la stack à évaluer."""
+        marques = dict(etats)
+        for nom in boucles:
+            marques[nom] = ("restarting", 1)
+        _, morts = self._classer_services(marques)
+        if not morts or self._reconstruction is not None or self._cause_demarrage is not None \
+                or not getattr(self, "_compose_name", None):
+            return etats, boucles
+        debut = time.time()
+        releve = self._releve_sante()
+        noms = diagnostic_demarrage.services_non_sains(
+            {s: a for s, (_, a) in releve.items()}, {s for s, (c, _) in releve.items() if c.name in boucles})
+        if not noms:
+            return etats, boucles
+        self._consigner_diagnostic(releve, noms, "", time.time() - debut)
+        if not reconstruction_datee.doit_reconstruire(self._cause_demarrage):
+            return etats, boucles
+        derniers = {}
+
+        def verifier():
+            self._wait_for_services()
+            derniers["boucles"] = self._boucles_de_redemarrage()
+            observes = self._etats_du_projet()
+            for nom in derniers["boucles"]:
+                observes[nom] = ("restarting", 1)
+            return sorted(self._classer_services(observes)[1])
+        origine = self.compose
+        self._tenter_reconstruction_datee(
+            self._compose_name, RuntimeError(f"service(s) en échec après le démarrage : {sorted(morts)}"), verifier)
+        if self.compose is origine:
+            return etats, boucles  # rien n'a été relancé
+        # La stack d'origine est arrêtée : l'évaluation porte sur la reconstruite.
+        etats = self._record_service_states()
+        return etats, derniers.get("boucles") if "boucles" in derniers else self._boucles_de_redemarrage()
 
     def _sonder_chemins_declares(self, sondes_racine: list) -> list:
         """Sonder, à travers le port TLS du reverse proxy, les chemins que la
@@ -2471,12 +2515,16 @@ class ComposeRunner(BaseRunner):
         except Exception:
             return None
 
-    def _tenter_reconstruction_datee(self, compose_name: str, exc: Exception) -> str | None:
+    def _tenter_reconstruction_datee(self, compose_name: str, exc: Exception, verifier=None) -> str | None:
         """Rebâtir une fois la stack aux versions de la date du rendu.
 
         Seulement sur un conflit de versions entre dépendances (467094). Rend
         le nom du compose dérivé si la stack devient saine, l'évaluation
         continue alors dessus ; sinon None, et le classement initial reste.
+
+        `verifier()` : après un `up` qui passe, les services encore en échec
+        (liste vide si la stack est saine). Sans healthcheck bloquant, un
+        `up` réussi ne prouve rien (461338 : bike-api en boucle).
         """
         cause = self._cause_demarrage
         if self._reconstruction is not None or not reconstruction_datee.doit_reconstruire(cause):
@@ -2574,6 +2622,12 @@ class ComposeRunner(BaseRunner):
                 "\n" + "\n".join(notes) if notes else "")
             try:
                 _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate).__enter__()
+                defaillants = verifier() if verifier is not None else []
+                if defaillants:
+                    self._cause_demarrage = initiale
+                    terminer(f"{resume_contraintes}\nla stack reconstruite démarre mais reste en échec : "
+                             f"{', '.join(defaillants)}", 1)
+                    return None
             except Exception as second:
                 nouvelle = self._cause_demarrage
                 self._cause_demarrage = initiale
@@ -3148,20 +3202,6 @@ class ComposeRunner(BaseRunner):
                 boucles = {s for s, (c, _) in releve.items() if c.name in en_boucle}
             noms = diagnostic_demarrage.services_non_sains(
                 {s: a for s, (_, a) in releve.items()}, boucles)
-            causes, blocs = {}, []
-            for service in noms:
-                conteneur, attrs = releve[service]
-                try:
-                    logs = conteneur.logs(tail=200).decode("utf-8", errors="replace")
-                except Exception as erreur:
-                    logs = f"logs illisibles : {erreur}"
-                logs = diagnostic_demarrage.masquer_secrets(logs, attrs)
-                causes[service] = diagnostic_demarrage.classer_service(attrs, logs)
-                if causes[service]["cause"] == "reseau_sortant" and service in self._dns_retires:
-                    causes[service]["preuve"] += (
-                        f" (la copie déclarait {_decrire_dns(self._dns_retires[service])} "
-                        "pour ce service ; retiré par le moteur)")
-                blocs.append(diagnostic_demarrage.decrire_service(service, attrs, logs, causes[service]))
             if not noms:
                 # 460059 : aucun conteneur, le build a échoué. Une panne réseau
                 # (PyPI, apt, registre) est une panne d'infrastructure : le up
@@ -3188,34 +3228,57 @@ class ComposeRunner(BaseRunner):
                     )
                     self._etape_diagnostic = self.steps[-1]
                     return True
-            retenue = diagnostic_demarrage.classer_demarrage(causes)
-            retenue["services"] = causes
-            retenue["reessai"] = None
-            self._cause_demarrage = retenue
-            sortie = (f"cause retenue : {retenue['cause']} ({retenue['service']}) → imputation "
-                      f"{retenue['imputation']}\n{retenue['preuve']}\n\n" + "\n\n".join(blocs))
-            if not noms:
-                sortie = ("aucun service non sain relevé (le `up` a échoué avant ou sans "
-                          f"healthcheck) : {str(exc)[:300]}")
-            self.record_step(
-                "Diagnostic des services non sains",
-                command=("docker inspect (State, State.Health, Config.Healthcheck) et "
-                         "docker logs --tail 200 de chaque service non sain ou sorti "
-                         "(équivalent docker compose logs --no-color --tail 200 <service>)"),
-                output=sortie,
-                exit_code=2,
-                duration=time.time() - debut,
-                note=("Imputation : « copie » = faute établie de la copie ; « non_mesure » = cause "
-                      "de notre côté, la copie n'a pas été mesurée ; « indetermine » = ni l'un ni "
-                      "l'autre n'est établi."),
-            )
-            self._etape_diagnostic = self.steps[-1]
+            causes, retenue = self._consigner_diagnostic(
+                releve, noms, "aucun service non sain relevé (le `up` a échoué avant ou sans "
+                              f"healthcheck) : {str(exc)[:300]}", time.time() - debut)
             if not noms or not all(c["reessayable"] for c in causes.values()):
                 return False
             return self._attendre_sante(noms, releve, retenue)
         except Exception as erreur:
             self.logger.warning(f"Diagnostic des services non sains impossible : {erreur}")
             return False
+
+    def _consigner_diagnostic(self, releve: dict, noms: list, vide: str, duree: float) -> tuple:
+        """Classer les services `noms` (logs, santé, healthcheck), consigner
+        l'étape « Diagnostic des services non sains » et retenir la cause :
+        (causes, retenue). Partagé par le `up` raté et la stack tombée après
+        un `up` réussi (461338)."""
+        causes, blocs = {}, []
+        for service in noms:
+            conteneur, attrs = releve[service]
+            try:
+                logs = conteneur.logs(tail=200).decode("utf-8", errors="replace")
+            except Exception as erreur:
+                logs = f"logs illisibles : {erreur}"
+            logs = diagnostic_demarrage.masquer_secrets(logs, attrs)
+            causes[service] = diagnostic_demarrage.classer_service(attrs, logs)
+            if causes[service]["cause"] == "reseau_sortant" and service in self._dns_retires:
+                causes[service]["preuve"] += (
+                    f" (la copie déclarait {_decrire_dns(self._dns_retires[service])} "
+                    "pour ce service ; retiré par le moteur)")
+            blocs.append(diagnostic_demarrage.decrire_service(service, attrs, logs, causes[service]))
+        retenue = diagnostic_demarrage.classer_demarrage(causes)
+        retenue["services"] = causes
+        retenue["reessai"] = None
+        self._cause_demarrage = retenue
+        sortie = (f"cause retenue : {retenue['cause']} ({retenue['service']}) → imputation "
+                  f"{retenue['imputation']}\n{retenue['preuve']}\n\n" + "\n\n".join(blocs))
+        if not noms:
+            sortie = vide
+        self.record_step(
+            "Diagnostic des services non sains",
+            command=("docker inspect (State, State.Health, Config.Healthcheck) et "
+                     "docker logs --tail 200 de chaque service non sain ou sorti "
+                     "(équivalent docker compose logs --no-color --tail 200 <service>)"),
+            output=sortie,
+            exit_code=2,
+            duration=duree,
+            note=("Imputation : « copie » = faute établie de la copie ; « non_mesure » = cause "
+                  "de notre côté, la copie n'a pas été mesurée ; « indetermine » = ni l'un ni "
+                  "l'autre n'est établi."),
+        )
+        self._etape_diagnostic = self.steps[-1]
+        return causes, retenue
 
     def _attendre_sante(self, noms: list, releve: dict, retenue: dict) -> bool:
         """Attendre que des services seulement lents deviennent sains.
