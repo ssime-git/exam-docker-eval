@@ -730,3 +730,108 @@ def test_appledouble_ecartes_dans_run_evaluation_sans_reparation(tmp_path, monke
     assert resultat["reparations"] == []
     # Remis par le nettoyage de run_evaluation.
     assert (tmp_path / "deployment" / "._prometheus.yml").read_bytes() == APPLEDOUBLE
+
+
+# --- panne réseau pendant le build (460059) -----------------------------------
+
+STDERR_460059 = (
+    b"Image eval_460059-bike-api Building \nDockerfile:10\n\n--------------------\n\n"
+    b"  10 | >>> RUN pip install --upgrade pip && pip install -r requirements.txt\n\n--------------------\n\n"
+    b"failed to solve: process \"/bin/sh -c pip install --upgrade pip && pip install -r requirements.txt\" "
+    b"did not complete successfully: exit code: 2\n")
+STDOUT_460059 = (
+    b"#9 55.31 pip._vendor.urllib3.exceptions.ReadTimeoutError: HTTPSConnectionPool(host='files.pythonhosted.org',"
+    b" port=443): Read timed out.\n"
+    b"#9 ERROR: process \"/bin/sh -c pip install --upgrade pip && pip install -r requirements.txt\" did not "
+    b"complete successfully: exit code: 2\n------\n"
+    b" > [4/5] RUN pip install --upgrade pip && pip install -r requirements.txt:\n"
+    b"55.31   File \"/usr/local/lib/python3.12/site-packages/pip/_vendor/urllib3/response.py\", line 443, in "
+    b"_error_catcher\n"
+    b"55.31     raise ReadTimeoutError(self._pool, None, \"Read timed out.\")\n"
+    b"55.31 pip._vendor.urllib3.exceptions.ReadTimeoutError: HTTPSConnectionPool(host='files.pythonhosted.org', "
+    b"port=443): Read timed out.\n------\n")
+# Faute de la copie : un paquet qui n'existe pas, après un simple avertissement réseau.
+STDOUT_PAQUET_INEXISTANT = (
+    b"#9 3.1 WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after "
+    b"connection broken by 'ReadTimeoutError(\"HTTPSConnectionPool(host='pypi.org', port=443): Read timed out.\")'"
+    b": /simple/nonexistent/\n"
+    b"------\n > [4/5] RUN pip install -r requirements.txt:\n"
+    b"9.2 ERROR: Could not find a version that satisfies the requirement nonexistent==9.9 (from versions: none)\n"
+    b"9.2 ERROR: No matching distribution found for nonexistent==9.9\n------\n")
+
+
+def test_classer_echec_build():
+    from docker_eval import diagnostic_demarrage as dd
+    cause = compose_runner.classer_echec_build((STDERR_460059 + STDOUT_460059).decode())
+    assert cause["cause"] == "reseau_build" and cause["imputation"] == dd.NON_MESURE
+    assert "files.pythonhosted.org" in cause["preuve"]
+    assert compose_runner.classer_echec_build((STDERR_460059 + STDOUT_PAQUET_INEXISTANT).decode()) is None
+    apt = ("------\n > [2/5] RUN apt-get update && apt-get install -y curl:\n"
+           "0.9 W: Failed to fetch http://deb.debian.org/debian/dists/bookworm/InRelease  "
+           "Temporary failure resolving 'deb.debian.org'\n"
+           "1.2 E: Unable to locate package curl\n------\n")
+    assert compose_runner.classer_echec_build(apt)["cause"] == "reseau_build"
+    registre = ("failed to solve: python:3.12-slim: failed to resolve source metadata for "
+                "docker.io/library/python:3.12-slim: failed to do request: Head "
+                "\"https://registry-1.docker.io/v2/library/python/manifests/3.12-slim\": dial tcp: "
+                "lookup registry-1.docker.io: i/o timeout\n")
+    assert compose_runner.classer_echec_build(registre)["cause"] == "reseau_build"
+    # Le Dockerfile de la copie qui vise un service local : pas une panne réseau.
+    local = ("------\n > [5/5] RUN curl -f http://localhost:8080/health:\n"
+             "0.3 curl: (7) Failed to connect to localhost port 8080: Connection refused\n------\n")
+    assert compose_runner.classer_echec_build(local) is None
+
+
+def _run_build(tmp_path, monkeypatch, issues):
+    """run_evaluation, up par défaut, vrai DockerCompose : `issues` donne,
+    up après up, None (passe) ou le stdout du build en échec."""
+    import subprocess
+    import testcontainers.compose.compose as tc
+    ecrire(tmp_path / "docker-compose.yml", COMPOSE_ECHELLE)
+    ecrire(tmp_path / "deployments" / "nginx" / "nginx.conf", tsn.NGINX)
+    ecrire(tmp_path / "Makefile", "start-project:\n\tdocker compose up -d --build\n")
+    demon = DemonLancement(appels=appel("docker", "compose", "up", "-d", "--build"), travail={})
+    monkeypatch.setattr(compose_runner, "client_docker", lambda: demon)
+    restants, ups = list(issues), []
+
+    def run(cmd, **kwargs):
+        if "up" in cmd:
+            ups.append(cmd)
+            stdout = restants.pop(0)
+            if stdout is not None:
+                raise subprocess.CalledProcessError(1, cmd, stdout, STDERR_460059)
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+    monkeypatch.setattr(tc, "subprocess_run", run)
+    runner = ComposeRunner("460059", str(tmp_path), timeout=60, logger=logging.getLogger("t"))
+    # Après un build raté, `compose ps` ne liste rien.
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [])
+    monkeypatch.setattr(runner, "_retenir_images_de_la_copie", lambda: None)
+
+    def arret():
+        raise _Arret("arrêt après le up")
+    monkeypatch.setattr(runner, "_wait_for_services", arret)
+    return runner.run_evaluation(), ups
+
+
+def test_460059_panne_reseau_du_build_reessayee_puis_saine(tmp_path, monkeypatch):
+    resultat, ups = _run_build(tmp_path, monkeypatch, [STDOUT_460059, None])
+    assert len(ups) == 2
+    assert resultat["cause_demarrage"]["cause"] == "reseau_build"
+    assert "fault" not in resultat
+    [etape] = [e for e in resultat["steps"] if e["title"] == "Diagnostic des services non sains"]
+    assert etape["exit_code"] == 0 and "files.pythonhosted.org" in etape["output"]
+
+
+def test_460059_panne_reseau_persistante_imputee_au_systeme(tmp_path, monkeypatch):
+    resultat, ups = _run_build(tmp_path, monkeypatch, [STDOUT_460059, STDOUT_460059])
+    assert len(ups) == 2
+    cause = resultat["cause_demarrage"]
+    assert cause["cause"] == "reseau_build" and cause["imputation"] == "non_mesure"
+    assert resultat["fault"] == "systeme"
+
+
+def test_paquet_inexistant_n_est_pas_une_panne_reseau(tmp_path, monkeypatch):
+    resultat, ups = _run_build(tmp_path, monkeypatch, [STDOUT_PAQUET_INEXISTANT])
+    assert len(ups) == 1
+    assert resultat["cause_demarrage"]["cause"] != "reseau_build"
+    assert resultat.get("fault") != "systeme"

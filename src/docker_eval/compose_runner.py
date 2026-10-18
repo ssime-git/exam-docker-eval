@@ -509,6 +509,61 @@ def annoter_bruit_de_sondes(sondes: list) -> None:
             )
 
 
+# Panne réseau pendant le build (460059 : `pip install` → ReadTimeoutError
+# vers files.pythonhosted.org). Propre au build : apt, registre d'images, et
+# les erreurs urllib3/requests déjà reconnues à l'exécution. Ces motifs ne
+# servent pas à `diagnostic_demarrage.classer_service`, qui lit les logs d'exécution.
+_MOTIFS_RESEAU_BUILD = re.compile(
+    r"Temporary failure resolving '([^']+)'|Could not connect to ([A-Za-z0-9.\-]+)"
+    r"|failed to resolve source metadata for ([^\s:]+)|dial tcp:? lookup ([A-Za-z0-9.\-]+)"
+    r"|TLS handshake timeout|i/o timeout|net/http: request canceled",
+    re.IGNORECASE,
+)
+_BLOC_ECHEC = re.compile(r"^\s*>\s*\[[^\]]+\][^\n]*:\s*$")
+
+
+def _preuves_du_build(sortie: str) -> list:
+    """Les lignes qui disent pourquoi le build a échoué : le bloc de l'étape
+    en échec (` > [4/5] RUN …:` jusqu'à `------`) et les `failed to solve`.
+    Sans bloc, toute la sortie. Les avertissements (pip `WARNING: Retrying`)
+    ne prouvent rien : une étape qui échoue ensuite pour une autre raison
+    reste celle-là."""
+    lignes, preuves, dans_bloc = sortie.splitlines(), [], False
+    for ligne in lignes:
+        if _BLOC_ECHEC.match(ligne):
+            dans_bloc = True
+            continue
+        if dans_bloc and ligne.startswith("------"):
+            dans_bloc = False
+            continue
+        if dans_bloc or "failed to solve" in ligne:
+            preuves.append(ligne)
+    if not preuves:
+        preuves = lignes
+    return [l for l in preuves if not re.search(r"\bWARNING\b|Retrying", l)]
+
+
+def classer_echec_build(sortie: str) -> dict | None:
+    """Une panne réseau vers l'extérieur pendant le build, ou None.
+
+    Panne d'infrastructure (imputation non_mesure, faute « systeme ») :
+    jamais l'apprenant. Un hôte interne (localhost, service de la stack)
+    n'est pas une panne réseau."""
+    preuves = _preuves_du_build(sortie or "")
+    preuve = diagnostic_demarrage._reseau_sortant("\n".join(preuves))
+    if not preuve:
+        for ligne in preuves:
+            m = _MOTIFS_RESEAU_BUILD.search(ligne)
+            hotes = [h for h in (m.groups() if m else ()) if h]
+            if m and (not hotes or any(diagnostic_demarrage._hote_externe(h.split("/")[0]) for h in hotes)):
+                preuve = ligne.strip()[:300]
+                break
+    if not preuve:
+        return None
+    return {"cause": "reseau_build", "imputation": diagnostic_demarrage.NON_MESURE, "reessayable": True,
+            "preuve": f"panne réseau pendant le build (infrastructure, pas la copie) : {preuve}"}
+
+
 def _avec_echelles(compose, echelles: dict):
     """Ajouter `--scale service=N` au `up` de ce DockerCompose.
 
@@ -1134,6 +1189,11 @@ class ComposeRunner(BaseRunner):
                         commande_up = self._commande_up(nom_datee) + " (reconstruction datée)"
                     demarrage = _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate, True)
                 with demarrage:
+                    if (self._cause_demarrage or {}).get("cause") == "reseau_build" \
+                            and getattr(self, "_etape_diagnostic", None) is not None:
+                        # La panne réseau n'a pas persisté : le build relancé a passé.
+                        self._etape_diagnostic["exit_code"] = 0
+                        self._etape_diagnostic["output"] += "\nréessai : le build relancé passe."
                     self.record_step(
                         "Build et démarrage Compose",
                         command=commande_up,
@@ -3102,6 +3162,32 @@ class ComposeRunner(BaseRunner):
                         f" (la copie déclarait {_decrire_dns(self._dns_retires[service])} "
                         "pour ce service ; retiré par le moteur)")
                 blocs.append(diagnostic_demarrage.decrire_service(service, attrs, logs, causes[service]))
+            if not noms:
+                # 460059 : aucun conteneur, le build a échoué. Une panne réseau
+                # (PyPI, apt, registre) est une panne d'infrastructure : le up
+                # est relancé une fois, et si elle persiste la faute est au
+                # système, jamais à l'apprenant.
+                sortie_build = "\n".join(
+                    contenu.decode("utf-8", errors="replace") if isinstance(contenu, bytes) else str(contenu)
+                    for contenu in (getattr(exc, "stderr", None), getattr(exc, "stdout", None)) if contenu)
+                reseau = classer_echec_build(sortie_build)
+                if reseau is not None:
+                    retenue = {"imputation": reseau["imputation"], "cause": reseau["cause"], "service": None,
+                               "preuve": lancement.masquer_secrets(reseau["preuve"]), "services": {},
+                               # Rendu « sain » si le second build passe ; la
+                               # branche du second échec le réécrit.
+                               "reessai": {"motif": "panne réseau pendant le build", "resultat": "sain"}}
+                    self._cause_demarrage = retenue
+                    self.record_step(
+                        "Diagnostic des services non sains",
+                        command="sortie du build (bloc de l'étape en échec, `failed to solve`)",
+                        output=(f"cause retenue : reseau_build → imputation {retenue['imputation']}\n"
+                                f"{retenue['preuve']}\nle build est relancé une fois."),
+                        exit_code=2,
+                        duration=time.time() - debut,
+                    )
+                    self._etape_diagnostic = self.steps[-1]
+                    return True
             retenue = diagnostic_demarrage.classer_demarrage(causes)
             retenue["services"] = causes
             retenue["reessai"] = None
