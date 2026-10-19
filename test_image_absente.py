@@ -145,6 +145,9 @@ def test_464154_login_introuvable(tmp_path, monkeypatch):
         return types.SimpleNamespace(status_code=404, text="Not Found", headers={}, json=lambda: {})
 
     def faux_get(url, **kw):
+        # BentoML sert son OpenAPI sur /docs.json, pas /openapi.json.
+        if not url.endswith("/docs.json"):
+            return types.SimpleNamespace(status_code=404, json=lambda: {})
         return types.SimpleNamespace(status_code=200, json=lambda: {"paths": {"/login_service": {}, "/predict_service": {}}})
 
     import requests as vrai_requests

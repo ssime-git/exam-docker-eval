@@ -1491,14 +1491,17 @@ class BentoMLRunner(BaseRunner):
                 "image_construite_par_le_correcteur": bool(getattr(self, "_image_construite", False))}
 
     def _routes_declarees(self, base_url: str) -> list:
-        """Chemins de l'OpenAPI que sert le service (/openapi.json, celui de
-        BentoML et de FastAPI), vide s'il n'en sert pas."""
-        try:
-            reponse = requests.get(f"{base_url}/openapi.json", timeout=self._http_timeout(10))
-            if reponse.status_code == 200:
-                return routes_de_l_openapi(reponse.json())
-        except Exception as erreur:
-            self.logger.info(f"OpenAPI illisible : {type(erreur).__name__}")
+        """Chemins de l'OpenAPI que sert le service : /docs.json pour
+        BentoML (464154), /openapi.json pour FastAPI ; vide sans OpenAPI."""
+        for chemin in ("/docs.json", "/openapi.json"):
+            try:
+                reponse = requests.get(f"{base_url}{chemin}", timeout=self._http_timeout(10))
+                if reponse.status_code == 200:
+                    routes = routes_de_l_openapi(reponse.json())
+                    if routes:
+                        return routes
+            except Exception as erreur:
+                self.logger.info(f"OpenAPI illisible sur {chemin} : {type(erreur).__name__}")
         return []
 
     def _readme_du_rendu(self) -> str:
