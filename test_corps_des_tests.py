@@ -261,3 +261,61 @@ def test_predict_invalide():
         r.raise_for_status()
 '''
     assert bentoml_runner.corps_documentes_par_les_tests(texte) == []
+
+
+# --- Corps documentés que le moteur ne lisait pas (provenance « image » ou
+# « devine », −2 en reproductibilité au barème) -------------------------------
+
+def test_463355_corps_entre_accents_graves_apres_le_libelle():
+    """463355 : « - Body : `{"input_data": {...}}` » : un accent grave entre
+    le libellé et l'objet."""
+    readme = ('- `POST /predict` : prédiction (nécessite un token JWT valide dans le header `Authorization: Bearer <token>`)\n'
+              '  - Body : `{"input_data": {"gre_score": 320, "toefl_score": 110, "university_rating": 4, '
+              '"sop": 4.0, "lor": 4.5, "cgpa": 8.9, "research": 1}}`\n')
+    corps = next(bentoml_runner.corps_en_ligne_apres_predict(readme), None)
+    assert corps == {"input_data": {"gre_score": 320, "toefl_score": 110, "university_rating": 4,
+                                    "sop": 4.0, "lor": 4.5, "cgpa": 8.9, "research": 1}}
+
+
+def test_467058_corps_dans_un_bloc_json_apres_le_libelle():
+    """467058 : « Example body: » puis un bloc ```json."""
+    readme = ("### POST /predict\n\nHeaders:\n\n```text\nAuthorization: Bearer <token>\n```\n\nExample body:\n\n"
+              '```json\n{\n  "gre_score": 320,\n  "toefl_score": 110,\n  "university_rating": 4,\n  "sop": 4.5,\n'
+              '  "lor": 4.5,\n  "cgpa": 9.0,\n  "research": 1\n}\n```\n')
+    corps = next(bentoml_runner.corps_en_ligne_apres_predict(readme), None)
+    assert corps == {"gre_score": 320, "toefl_score": 110, "university_rating": 4, "sop": 4.5,
+                     "lor": 4.5, "cgpa": 9.0, "research": 1}
+
+
+def test_467635_corps_passe_par_une_fonction_d_aide():
+    """467635 : `post_predict(base_url, VALID_INPUT, headers)` enveloppe le
+    corps dans `{"input_data": input_data}` ; le test attend 200."""
+    texte = '''
+import requests
+VALID_INPUT = {"gre_score": 309, "toefl_score": 108, "university_rating": 4, "sop": 3.0, "lor": 4.0, "cgpa": 7.94, "research": 0}
+
+def post_predict(base_url, input_data, headers=None):
+    return requests.post(f"{base_url}/predict", headers=headers or {}, json={"input_data": input_data})
+
+def test_jwt_missing(base_url):
+    response = post_predict(base_url, VALID_INPUT)
+    assert response.status_code == 401
+
+def test_jwt_valid_token(base_url):
+    response = post_predict(base_url, VALID_INPUT, {"Authorization": "Bearer x"})
+    assert response.status_code == 200
+'''
+    assert bentoml_runner.corps_documentes_par_les_tests(texte) == [{"input_data": {
+        "gre_score": 309, "toefl_score": 108, "university_rating": 4, "sop": 3.0, "lor": 4.0, "cgpa": 7.94, "research": 0}}]
+
+
+def test_fonction_d_aide_dans_un_test_d_echec_ne_documente_rien():
+    texte = '''
+import requests
+BAD = {"gre_score": "x"}
+def post_predict(base_url, data):
+    return requests.post(f"{base_url}/predict", json=data)
+def test_invalide(base_url):
+    assert post_predict(base_url, BAD).status_code == 422
+'''
+    assert bentoml_runner.corps_documentes_par_les_tests(texte) == []

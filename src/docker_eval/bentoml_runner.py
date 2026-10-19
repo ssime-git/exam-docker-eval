@@ -301,6 +301,10 @@ def corps_en_ligne_apres_predict(texte: str):
         zone = fenetre[:suivante.start()] if suivante else fenetre
         for libelle in _LIBELLE_CORPS.finditer(zone):
             position = debut + libelle.end()
+            # « Body : `{...}` » (463355), « Example body: » puis un bloc
+            # ```json (467058) : accents graves et langue du bloc sautés.
+            saut = re.match(r"[\s`]*(?:json\b)?\s*", texte[position:position + 40], re.I)
+            position += saut.end() if saut else 0
             if position >= len(texte) or texte[position] != "{":
                 continue
             try:
@@ -371,6 +375,36 @@ def corps_documentes_par_les_tests(texte: str) -> list:
             except (ValueError, TypeError, SyntaxError, RecursionError):
                 continue
     corps_lus = []
+    # Fonctions d'aide qui postent à /predict le corps reçu en paramètre,
+    # enveloppé ou non (467635 : `post_predict(base_url, input_data)` envoie
+    # `json={"input_data": input_data}`) : nom -> (rang, paramètre, enveloppe).
+    aides = {}
+    for noeud in arbre.body:
+        if not isinstance(noeud, (ast.FunctionDef, ast.AsyncFunctionDef)) or noeud.name.startswith("test"):
+            continue
+        parametres = [a.arg for a in noeud.args.args]
+        for appel in ast.walk(noeud):
+            if not (isinstance(appel, ast.Call) and isinstance(appel.func, ast.Attribute)
+                    and appel.func.attr == "post" and _vise_predict(appel)):
+                continue
+            for mot in appel.keywords:
+                if mot.arg != "json":
+                    continue
+                valeur, enveloppe = mot.value, None
+                if (isinstance(valeur, ast.Dict) and len(valeur.keys) == 1 and isinstance(valeur.keys[0], ast.Constant)
+                        and isinstance(valeur.keys[0].value, str)):
+                    enveloppe, valeur = valeur.keys[0].value, valeur.values[0]
+                if isinstance(valeur, ast.Name) and valeur.id in parametres:
+                    aides[noeud.name] = (parametres.index(valeur.id), valeur.id, enveloppe)
+
+    def valeur_de(expression):
+        if isinstance(expression, ast.Name):
+            return constantes.get(expression.id)
+        try:
+            return ast.literal_eval(expression)
+        except (ValueError, TypeError, SyntaxError, RecursionError):
+            return None
+
     # Un test, ou le bloc `if __name__ == "__main__"` d'un script d'exemple
     # livré sous tests/ (469475 : tests/example_request.py, qui vérifie par
     # `raise_for_status()`).
@@ -383,6 +417,16 @@ def corps_documentes_par_les_tests(texte: str) -> list:
         if not (_attend_un_succes(fonction) or _leve_sur_erreur(fonction)):
             continue
         for appel in ast.walk(fonction):
+            if isinstance(appel, ast.Call) and isinstance(appel.func, ast.Name) and appel.func.id in aides:
+                rang, nom, enveloppe = aides[appel.func.id]
+                argument = appel.args[rang] if len(appel.args) > rang else next(
+                    (m.value for m in appel.keywords if m.arg == nom), None)
+                corps = valeur_de(argument) if argument is not None else None
+                if isinstance(corps, dict) and profil_reconnu(corps):
+                    corps = {enveloppe: corps} if enveloppe else corps
+                    if corps not in corps_lus:
+                        corps_lus.append(corps)
+                continue
             if not (isinstance(appel, ast.Call) and isinstance(appel.func, ast.Attribute)
                     and appel.func.attr == "post" and _vise_predict(appel)):
                 continue
