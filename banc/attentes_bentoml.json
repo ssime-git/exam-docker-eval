@@ -1,0 +1,1306 @@
+{
+ "copies": {
+  "466697": {
+   "evalDir": "",
+   "imageTar": "admission_prediction_service.tar",
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "container_started",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "api_ready",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "fault",
+     "confiance": "sure",
+     "attendu": null
+    },
+    {
+     "champ": "image_tags",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "admission_prediction_service:latest"
+     ]
+    },
+    {
+     "champ": "login_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "predict_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "corps_source",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      "readme"
+     ]
+    },
+    {
+     "champ": "mecanisme",
+     "confiance": "sure",
+     "attendu": "jeton"
+    },
+    {
+     "champ": "securite.predict_sans_token",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.predict_token_falsifie",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.login_mauvais_identifiants",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "contrat.prediction",
+     "confiance": "sure",
+     "op": "entre",
+     "attendu": [
+      -0.05,
+      1.05
+     ]
+    },
+    {
+     "champ": "contrat.predict_entree_invalide",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      400,
+      422
+     ]
+    },
+    {
+     "champ": "identifiants_dans_la_copie",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.passe",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.passed",
+     "confiance": "sure",
+     "attendu": 8
+    },
+    {
+     "champ": "pytest_tel_que_livre.total",
+     "confiance": "sure",
+     "attendu": 8
+    },
+    {
+     "champ": "reparations",
+     "confiance": "sure",
+     "attendu": []
+    },
+    {
+     "champ": "fichiers_crees",
+     "confiance": "a_confirmer",
+     "op": "vide",
+     "pourquoi": "le moteur ne laisse ni __pycache__ ni .pytest_cache dans la copie : le barème les compterait comme livrés"
+    }
+   ],
+   "cas": "JWT simple"
+  },
+  "461573": {
+   "evalDir": "",
+   "imageTar": "admission_prediction_service.tar",
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "container_started",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "api_ready",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "fault",
+     "confiance": "sure",
+     "attendu": null
+    },
+    {
+     "champ": "image_tags",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "admission_prediction_service:latest"
+     ]
+    },
+    {
+     "champ": "login_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "predict_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "corps_source",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      "tests",
+      "readme"
+     ]
+    },
+    {
+     "champ": "mecanisme",
+     "confiance": "sure",
+     "attendu": "jeton"
+    },
+    {
+     "champ": "securite.predict_sans_token",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.predict_token_falsifie",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.login_mauvais_identifiants",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "contrat.prediction",
+     "confiance": "sure",
+     "op": "entre",
+     "attendu": [
+      -0.05,
+      1.05
+     ]
+    },
+    {
+     "champ": "contrat.predict_entree_invalide",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      400,
+      422
+     ]
+    },
+    {
+     "champ": "identifiants_dans_la_copie",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.passe",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.passed",
+     "confiance": "sure",
+     "attendu": 7
+    },
+    {
+     "champ": "pytest_tel_que_livre.total",
+     "confiance": "sure",
+     "attendu": 7
+    },
+    {
+     "champ": "reparations",
+     "confiance": "sure",
+     "attendu": []
+    },
+    {
+     "champ": "fichiers_crees",
+     "confiance": "a_confirmer",
+     "op": "vide",
+     "pourquoi": "le moteur ne laisse ni __pycache__ ni .pytest_cache dans la copie : le barème les compterait comme livrés"
+    }
+   ],
+   "cas": "enveloppe data / input_data"
+  },
+  "451711": {
+   "evalDir": "examen_bentoml",
+   "imageTar": "examen_bentoml/admission_prediction_service.tar",
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "container_started",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "api_ready",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "fault",
+     "confiance": "sure",
+     "attendu": null
+    },
+    {
+     "champ": "login_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "predict_passed",
+     "confiance": "a_confirmer",
+     "attendu": true,
+     "pourquoi": "le « succès » de production (moteur 45f4e6e) était un faux positif : réponse {'error': 'Invalid or expired token', 'status': 401} en HTTP 200, refusée depuis eef0257. Le service rend-il une prédiction avec le jeton dans input_data ?"
+    },
+    {
+     "champ": "mecanisme",
+     "confiance": "a_confirmer",
+     "attendu": "jeton_corps",
+     "pourquoi": "moteur #41, si une requête réussit"
+    },
+    {
+     "champ": "corps_source",
+     "confiance": "a_confirmer",
+     "op": "dans",
+     "attendu": [
+      "readme"
+     ],
+     "pourquoi": "le README montre le corps avec le jeton"
+    },
+    {
+     "champ": "securite.refus_dans_un_200",
+     "confiance": "a_confirmer",
+     "op": "non_vide",
+     "pourquoi": "le service refuse dans un JSON en 200"
+    },
+    {
+     "champ": "contrat.prediction",
+     "confiance": "a_confirmer",
+     "op": "entre",
+     "attendu": [
+      -0.05,
+      1.05
+     ],
+     "pourquoi": "l'ancien rapport lisait le 401 d'un refus comme prédiction"
+    },
+    {
+     "champ": "pytest.passed",
+     "confiance": "sure",
+     "attendu": 10
+    },
+    {
+     "champ": "pytest_tel_que_livre.passe",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "fichiers_crees",
+     "confiance": "a_confirmer",
+     "op": "vide",
+     "pourquoi": "le moteur ne laisse ni __pycache__ ni .pytest_cache dans la copie : le barème les compterait comme livrés"
+    }
+   ],
+   "cas": "jeton dans le corps de la requête ; refus en HTTP 200 ; tests sans appel au service"
+  },
+  "466786": {
+   "evalDir": "",
+   "imageTar": "admission_prediction_service.tar",
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "container_started",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "api_ready",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "fault",
+     "confiance": "sure",
+     "attendu": null
+    },
+    {
+     "champ": "login_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "predict_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "corps_source",
+     "confiance": "a_confirmer",
+     "op": "dans",
+     "attendu": [
+      "readme"
+     ],
+     "pourquoi": "466786 : README sans enveloppe input_data ; une seule requête (200) ; « image » si l'enveloppe vient de la signature (politique du moteur), « readme » si le corps du README a passé tel quel"
+    },
+    {
+     "champ": "mecanisme",
+     "confiance": "sure",
+     "attendu": "jeton"
+    },
+    {
+     "champ": "securite.predict_sans_token",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.predict_token_falsifie",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.login_mauvais_identifiants",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "contrat.prediction",
+     "confiance": "sure",
+     "op": "entre",
+     "attendu": [
+      -0.05,
+      1.05
+     ]
+    },
+    {
+     "champ": "contrat.predict_entree_invalide",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      400,
+      422
+     ]
+    },
+    {
+     "champ": "identifiants_dans_la_copie",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.passe",
+     "confiance": "sure",
+     "attendu": false
+    },
+    {
+     "champ": "pytest_tel_que_livre.imputable",
+     "confiance": "sure",
+     "attendu": "copie"
+    },
+    {
+     "champ": "reparations",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "code_lu_dans_l_image"
+     ]
+    },
+    {
+     "champ": "fichiers_crees",
+     "confiance": "a_confirmer",
+     "op": "vide",
+     "pourquoi": "le moteur ne laisse ni __pycache__ ni .pytest_cache dans la copie : le barème les compterait comme livrés"
+    }
+   ],
+   "cas": "src non livré : les tests importent src.service et src.auth"
+  },
+  "468775": {
+   "evalDir": "",
+   "imageTar": "examen_bentoml_ready_for_submition/admission_prediction_service.tar",
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "container_started",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "api_ready",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "fault",
+     "confiance": "sure",
+     "attendu": null
+    },
+    {
+     "champ": "login_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "predict_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "corps_source",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      "readme"
+     ]
+    },
+    {
+     "champ": "mecanisme",
+     "confiance": "sure",
+     "attendu": "jeton"
+    },
+    {
+     "champ": "securite.predict_sans_token",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.predict_token_falsifie",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.login_mauvais_identifiants",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "contrat.prediction",
+     "confiance": "sure",
+     "op": "entre",
+     "attendu": [
+      -0.05,
+      1.05
+     ]
+    },
+    {
+     "champ": "contrat.predict_entree_invalide",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      400,
+      422
+     ]
+    },
+    {
+     "champ": "identifiants_dans_la_copie",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest.requirements_inutilisable",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.passe",
+     "confiance": "sure",
+     "attendu": false
+    },
+    {
+     "champ": "pytest_tel_que_livre.imputable",
+     "confiance": "sure",
+     "attendu": "copie"
+    },
+    {
+     "champ": "fichiers_crees",
+     "confiance": "a_confirmer",
+     "op": "vide",
+     "pourquoi": "le moteur ne laisse ni __pycache__ ni .pytest_cache dans la copie : le barème les compterait comme livrés"
+    }
+   ],
+   "cas": "requirements illisible (« · TXT »)"
+  },
+  "469475": {
+   "evalDir": "",
+   "imageTar": "admission_prediction_service.tar",
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "container_started",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "api_ready",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "fault",
+     "confiance": "sure",
+     "attendu": null
+    },
+    {
+     "champ": "image_tags",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "admission_prediction_service:latest"
+     ]
+    },
+    {
+     "champ": "login_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "predict_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "corps_source",
+     "confiance": "a_confirmer",
+     "op": "dans",
+     "attendu": [
+      "tests"
+     ],
+     "pourquoi": "466786 : README sans enveloppe input_data ; une seule requête (200) ; « image » si l'enveloppe vient de la signature (politique du moteur), « readme » si le corps du README a passé tel quel"
+    },
+    {
+     "champ": "mecanisme",
+     "confiance": "sure",
+     "attendu": "jeton"
+    },
+    {
+     "champ": "securite.predict_sans_token",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.predict_token_falsifie",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.login_mauvais_identifiants",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "contrat.prediction",
+     "confiance": "sure",
+     "op": "entre",
+     "attendu": [
+      -0.05,
+      1.05
+     ]
+    },
+    {
+     "champ": "contrat.predict_entree_invalide",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      422
+     ]
+    },
+    {
+     "champ": "identifiants_dans_la_copie",
+     "confiance": "sure",
+     "attendu": null,
+     "pourquoi": "#41 : paire générée en suivant le README → null, non mesuré"
+    },
+    {
+     "champ": "pytest_tel_que_livre.variables_documentees",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "API_USERNAME",
+      "API_PASSWORD",
+      "JWT_SECRET"
+     ]
+    },
+    {
+     "champ": "pytest_tel_que_livre.imputable",
+     "confiance": "a_confirmer",
+     "op": "dans",
+     "attendu": [
+      "copie",
+      null
+     ],
+     "pourquoi": "2 échecs sur 33 : dus à la copie ou au nom de conteneur imposé par le README ?"
+    },
+    {
+     "champ": "reparations",
+     "confiance": "sure",
+     "attendu": []
+    },
+    {
+     "champ": "fichiers_crees",
+     "confiance": "a_confirmer",
+     "op": "vide",
+     "pourquoi": "le moteur ne laisse ni __pycache__ ni .pytest_cache dans la copie : le barème les compterait comme livrés"
+    }
+   ],
+   "cas": "variables requises générées en suivant le README"
+  },
+  "457338": {
+   "evalDir": "project",
+   "imageTar": "project/mandatory_part/docker_image/admission_prediction_service.tar",
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "container_started",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "api_ready",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "fault",
+     "confiance": "sure",
+     "attendu": null
+    },
+    {
+     "champ": "image_tags",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "admission_prediction_service:latest"
+     ]
+    },
+    {
+     "champ": "login_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "predict_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "corps_source",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      "readme"
+     ]
+    },
+    {
+     "champ": "mecanisme",
+     "confiance": "sure",
+     "attendu": "jeton"
+    },
+    {
+     "champ": "securite.predict_sans_token",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.predict_token_falsifie",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.login_mauvais_identifiants",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "contrat.prediction",
+     "confiance": "sure",
+     "op": "entre",
+     "attendu": [
+      -0.05,
+      1.05
+     ]
+    },
+    {
+     "champ": "contrat.predict_entree_invalide",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      400,
+      422
+     ]
+    },
+    {
+     "champ": "identifiants_dans_la_copie",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.passe",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest.total",
+     "confiance": "a_confirmer",
+     "attendu": 10
+    },
+    {
+     "champ": "fichiers_crees",
+     "confiance": "a_confirmer",
+     "op": "vide",
+     "pourquoi": "le moteur ne laisse ni __pycache__ ni .pytest_cache dans la copie : le barème les compterait comme livrés"
+    }
+   ],
+   "cas": "parties obligatoire et facultative : tests et contrat de mandatory_part"
+  },
+  "462649": {
+   "evalDir": "examen_bentoml",
+   "imageTar": null,
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_construite_par_le_correcteur",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "api_ready",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "login_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "predict_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "corps_source",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      "readme"
+     ]
+    },
+    {
+     "champ": "mecanisme",
+     "confiance": "sure",
+     "attendu": "jeton"
+    },
+    {
+     "champ": "securite.predict_sans_token",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.predict_token_falsifie",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.login_mauvais_identifiants",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "contrat.prediction",
+     "confiance": "sure",
+     "op": "entre",
+     "attendu": [
+      -0.05,
+      1.05
+     ]
+    },
+    {
+     "champ": "contrat.predict_entree_invalide",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      400,
+      422
+     ]
+    },
+    {
+     "champ": "identifiants_dans_la_copie",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.passe",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "reparations",
+     "confiance": "sure",
+     "attendu": []
+    },
+    {
+     "champ": "image_absente",
+     "confiance": "ecart_connu",
+     "attendu": true,
+     "pourquoi": "18/10 : aucune image livrée"
+    },
+    {
+     "champ": "instruction_recuperation",
+     "confiance": "ecart_connu",
+     "attendu": null,
+     "pourquoi": "18/10 : ni docker pull ni URL d'archive d'image dans le README. Piège : le README télécharge admission.csv par curl, ce n'est pas une instruction de récupération d'image"
+    },
+    {
+     "champ": "readme_image_citee",
+     "confiance": "ecart_connu",
+     "op": "contient",
+     "attendu": "docker load -i admission_prediction_service.tar",
+     "pourquoi": "18/10 : citer l'instruction du README"
+    },
+    {
+     "champ": "image_source",
+     "confiance": "sure",
+     "op": "vide",
+     "pourquoi": "aucun registre ni URL à suivre"
+    },
+    {
+     "champ": "fichiers_crees",
+     "confiance": "a_confirmer",
+     "op": "vide",
+     "pourquoi": "le moteur ne laisse ni __pycache__ ni .pytest_cache dans la copie : le barème les compterait comme livrés"
+    }
+   ],
+   "cas": "sources sans image ; README : docker load -i admission_prediction_service.tar absent du rendu"
+  },
+  "464154": {
+   "evalDir": "",
+   "imageTar": "admission_prediction_service.tar",
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "container_started",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "api_ready",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "fault",
+     "confiance": "sure",
+     "attendu": null
+    },
+    {
+     "champ": "image_tags",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "admission_prediction_service:latest"
+     ]
+    },
+    {
+     "champ": "login_passed",
+     "confiance": "a_confirmer",
+     "attendu": false,
+     "pourquoi": "404 : route absente ou préfixe que le moteur ne trouve pas ?"
+    },
+    {
+     "champ": "identifiants_dans_la_copie",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.passe",
+     "confiance": "sure",
+     "attendu": false
+    },
+    {
+     "champ": "pytest_tel_que_livre.imputable",
+     "confiance": "sure",
+     "attendu": "copie"
+    },
+    {
+     "champ": "reparations",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "code_lu_dans_l_image"
+     ]
+    },
+    {
+     "champ": "fichiers_crees",
+     "confiance": "a_confirmer",
+     "op": "vide",
+     "pourquoi": "le moteur ne laisse ni __pycache__ ni .pytest_cache dans la copie : le barème les compterait comme livrés"
+    }
+   ],
+   "cas": "/login répond 404 ; tests en TestClient sur src/ non livré"
+  },
+  "462853": {
+   "evalDir": "",
+   "imageTar": "admission_prediction_service.tar",
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "container_started",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "api_ready",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "fault",
+     "confiance": "sure",
+     "attendu": null
+    },
+    {
+     "champ": "image_tags",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "admission_prediction_service:exam"
+     ]
+    },
+    {
+     "champ": "login_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "predict_passed",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "corps_source",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      "readme"
+     ]
+    },
+    {
+     "champ": "mecanisme",
+     "confiance": "sure",
+     "attendu": "jeton"
+    },
+    {
+     "champ": "securite.predict_sans_token",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.predict_token_falsifie",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "securite.login_mauvais_identifiants",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      401,
+      403
+     ]
+    },
+    {
+     "champ": "contrat.prediction",
+     "confiance": "sure",
+     "op": "entre",
+     "attendu": [
+      -0.05,
+      1.05
+     ]
+    },
+    {
+     "champ": "contrat.predict_entree_invalide",
+     "confiance": "sure",
+     "op": "dans",
+     "attendu": [
+      422
+     ]
+    },
+    {
+     "champ": "image_absente",
+     "confiance": "sure",
+     "op": "vide",
+     "pourquoi": "l'image est livrée ; le curl du jeu de données (admission.csv) n'est pas une instruction de récupération d'image"
+    },
+    {
+     "champ": "image_source",
+     "confiance": "sure",
+     "op": "vide",
+     "pourquoi": "image chargée depuis l'archive"
+    },
+    {
+     "champ": "identifiants_dans_la_copie",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.passe",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "pytest_tel_que_livre.variables_documentees",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "API_USERNAME",
+      "API_PASSWORD",
+      "JWT_SECRET"
+     ]
+    },
+    {
+     "champ": "reparations",
+     "confiance": "sure",
+     "attendu": []
+    },
+    {
+     "champ": "fichiers_crees",
+     "confiance": "a_confirmer",
+     "op": "vide",
+     "pourquoi": "le moteur ne laisse ni __pycache__ ni .pytest_cache dans la copie : le barème les compterait comme livrés"
+    }
+   ],
+   "cas": "variables documentées par le README ; tag :exam"
+  },
+  "460660": {
+   "evalDir": "exam_FLAK",
+   "imageTar": "exam_FLAK/admission_prediction_service.tar",
+   "attentes": [
+    {
+     "champ": "rapport_present",
+     "confiance": "sure",
+     "attendu": true
+    },
+    {
+     "champ": "image_tags",
+     "confiance": "sure",
+     "op": "contient",
+     "attendu": [
+      "admission_prediction_service:latest"
+     ]
+    },
+    {
+     "champ": "image_loaded",
+     "confiance": "sure",
+     "attendu": false,
+     "pourquoi": "docker load refuse l'image : « too many non-empty layers in History section » (config incohérente avec les couches livrées)"
+    },
+    {
+     "champ": "fault",
+     "confiance": "sure",
+     "attendu": "apprenant",
+     "pourquoi": "image livrée incohérente, refusée par Docker lui-même"
+    }
+   ],
+   "cas": "docker load échoue (format docker save ancien, couches 2024)"
+  }
+ },
+ "_lisezmoi": [
+  "Attentes du banc moteur bentoml, écrites avant de lire les résultats du moteur.",
+  "confiance : sure (bloque), a_confirmer (affiché), ecart_connu (demandé, pas encore dans le moteur).",
+  "evalDir et imageTar : ceux de la commande de production (_grade_contract.json), relatifs à la racine extraite."
+ ]
+}
