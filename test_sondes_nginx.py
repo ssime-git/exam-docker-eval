@@ -670,3 +670,46 @@ def test_sans_cible_test_rien_n_est_lance(tmp_path, monkeypatch):
     resultat = runner._executer_make_test()
     assert resultat == {"code": None, "sortie": "pas de cible `test` dans le Makefile"}
     assert demon.cree is None
+
+
+# --- A/B et rafale reprennent la requête qui prédit (461091) -----------------
+#
+# Banc réel (20261018-200633) : le Makefile de 461091 déclare un POST /predict
+# dont le corps et `--user` sont perdus (fins de ligne CRLF, lignes vides
+# entre les continuations) : 401, puis 422 avec les identifiants. Les curl de
+# tests/run_tests.sh rendent 200. L'A/B (422 → 422) et la rafale (6×422,
+# 14×429) partaient pourtant de la requête du Makefile.
+
+MAKEFILE_461091 = 'test-api:\n\tcurl -k -X POST "https://localhost/predict"\n'
+
+
+def test_461091_ab_et_rafale_reprennent_la_requete_qui_predit(tmp_path, monkeypatch):
+    runner, appels = runner_469145(tmp_path, monkeypatch)
+    ecrire(tmp_path / "Makefile", MAKEFILE_461091)
+    declarees = runner._sonder_chemins_declares(SONDES_RACINE)
+    assert any(s.get("declared") and s.get("code") == 200 for s in declarees)
+    comportement = runner._sonder_comportement_nginx(SONDES_RACINE)
+    ab = comportement["ab"]
+    assert ab["code_defaut"] == 200 and ab["code_variante"] == 200 and ab["corps_differents"] is True
+    rafale = comportement["rafale"]
+    assert "422" not in rafale["codes"] and rafale["codes"].get("200") == 6
+    assert rafale["retour_2xx_apres_pause"] is True
+
+
+def test_sans_requete_qui_predit_ab_et_retour_non_mesures(tmp_path, monkeypatch):
+    """Aucune requête n'obtient de prédiction : notre requête rejetée (422)
+    ne prouve rien contre le routage ni contre le retour après la pause."""
+    runner, _ = runner_469145(tmp_path, monkeypatch)
+    ecrire(tmp_path / "tests" / "run_tests.sh",
+           '#!/bin/bash\ncurl -s -X POST "https://localhost/predict" -H "Content-Type: application/json" '
+           "-d '{\"texte\": \"x\"}' --user admin:admin -k\n")
+    runner._sonder_chemins_declares(SONDES_RACINE)
+    comportement = runner._sonder_comportement_nginx(SONDES_RACINE)
+    assert comportement["ab"] is None
+    rafale = comportement["rafale"]
+    # La limitation reste mesurée (nginx coupe avant l'API), pas le retour en 2xx.
+    assert rafale["limite_declenchee"] is True
+    assert rafale["retour_2xx_apres_pause"] is None
+    etape = next(s for s in runner.steps if s["title"] == "Sondes de comportement nginx")
+    assert "routage A/B : non mesuré" in etape["output"] and "422" in etape["output"]
+    assert "2xx après une pause : non mesuré" in etape["output"]

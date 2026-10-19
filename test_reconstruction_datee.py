@@ -344,3 +344,165 @@ def test_pas_de_reconstruction_pour_un_plantage(tmp_path, monkeypatch):
     assert lances == ["docker-compose.eval.yml"]
     assert "reconstruction_datee" not in result
     assert result["cause_demarrage"]["imputation"] == "copie"
+
+
+def test_reconstruction_garde_le_scale_de_la_recette(tmp_path, monkeypatch):
+    """Banc nginx (461091) : le `--scale` de la recette vaut pour chaque `up`
+    qui la remplace, reconstruction datée comprise. Vrai DockerCompose, seul
+    `subprocess.run` est enregistré."""
+    import testcontainers.compose.compose as tc
+    from docker_eval import lancement
+    runner, _ = runner_467094(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "DockerCompose", tc.DockerCompose)
+    up = ["docker", "compose", "--profile", "monitoring", "up", "-d", "--build", "--scale", "bike-api=2"]
+    tel = {"commande": "make", "code": 0, "cause": None, "motif": None, "extrait": "", "up": up}
+    monkeypatch.setattr(runner, "_jouer_lancement", lambda: {"tel_que_livre": tel, "up": lancement.traduire_up(up)})
+    ups = []
+
+    def run(cmd, **kwargs):
+        if "up" in cmd:
+            ups.append(list(cmd))
+            if "docker-compose.datee.yml" not in cmd:
+                raise subprocess.CalledProcessError(
+                    1, cmd, b"", b"dependency failed to start: container bike-api-1 is unhealthy\n")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+    monkeypatch.setattr(tc, "subprocess_run", run)
+
+    result = runner.run_evaluation()
+
+    assert result["reconstruction_datee"]["resultat"] == "saine"
+    assert [l[l.index("-f") + 1] for l in ups] == [
+        "docker-compose.eval.yml", "docker-compose.eval.yml", "docker-compose.datee.yml"]
+    assert all(l[l.index("up") + 1:][:2] == ["--scale", "bike-api=2"] for l in ups)
+    assert all(l[l.index("--profile") + 1] == "monitoring" for l in ups)
+
+
+# --- après un up réussi : service en boucle sur un conflit de versions (461338) -
+
+LOGS_461338 = (
+    "  File \"/usr/local/lib/python3.12/site-packages/sklearn/utils/fixes.py\", line 421, in <module>\n"
+    "    import pyarrow\n"
+    "  File \"/usr/local/lib/python3.12/site-packages/pyarrow/__init__.py\", line 59, in <module>\n"
+    "ImportError: pyarrow requires NumPy 2.0 or newer, found 1.26.4\n"
+    "Traceback (most recent call last):\n  File \"/usr/local/bin/uvicorn\", line 8, in <module>\n"
+)
+
+
+PANNE_PYPI = (b"------\n > [4/5] RUN pip install -r requirements.txt:\n"
+              b"55.31 pip._vendor.urllib3.exceptions.ReadTimeoutError: HTTPSConnectionPool("
+              b"host='files.pythonhosted.org', port=443): Read timed out.\n------\n")
+
+
+def etat_en_boucle():
+    return {"State": {"Status": "restarting", "ExitCode": 1, "OOMKilled": False},
+            "RestartCount": 7,
+            "Config": {"Labels": {"com.docker.compose.service": "bike-api",
+                                  "com.docker.compose.project": "eval_copie-test"}, "Env": []}}
+
+
+def etat_sain():
+    return {"State": {"Status": "running", "ExitCode": 0, "OOMKilled": False}, "RestartCount": 0,
+            "Config": {"Labels": {"com.docker.compose.service": "bike-api",
+                                  "com.docker.compose.project": "eval_copie-test"}, "Env": []}}
+
+
+def runner_461338(tmp_path, monkeypatch, datee_saine=True, logs=LOGS_461338, build_reseau=0):
+    """Le up passe (pas de healthcheck bloquant), puis bike-api redémarre en
+    boucle. Après la reconstruction datée : sain, ou toujours en boucle."""
+    runner, _ = runner_467094(tmp_path, monkeypatch)
+    lances = []
+
+    class Compose:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            lances.append(self.kwargs["compose_file_name"])
+            if len(lances) <= build_reseau:
+                raise subprocess.CalledProcessError(
+                    1, ["docker", "compose", "up"], output=PANNE_PYPI, stderr=b"failed to solve: process "
+                    b"\"/bin/sh -c pip install -r requirements.txt\" did not complete successfully: exit code: 2\n")
+
+        def __exit__(self, *_a):
+            return False
+
+        def stop(self):
+            pass
+
+    def conteneurs():
+        if len(lances) <= build_reseau:
+            return []  # build raté : `compose ps` ne liste rien
+        datee = bool(lances) and lances[-1] == "docker-compose.datee.yml"
+        if datee and datee_saine:
+            return [Conteneur(etat_sain(), b"Uvicorn running on http://0.0.0.0:8080\n")]
+        return [Conteneur(etat_en_boucle(), logs.encode())]
+    monkeypatch.setattr(module, "DockerCompose", Compose)
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", conteneurs)
+    monkeypatch.setattr(runner, "_evaluer_services_persistants",
+                        ComposeRunner._evaluer_services_persistants.__get__(runner))
+    monkeypatch.setattr(runner, "_sonder_ports_publies", lambda: [])
+    monkeypatch.setattr(runner, "_capture_logs", lambda: "")
+    monkeypatch.delenv("LIORA_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("PI_CORRECTOR_INVESTIGATE_URL", raising=False)
+    return runner, lances
+
+
+def test_461338_boucle_apres_up_reussi_reconstruction_datee(tmp_path, monkeypatch):
+    runner, lances = runner_461338(tmp_path, monkeypatch)
+
+    result = runner.run_evaluation()
+
+    assert lances == ["docker-compose.eval.yml", "docker-compose.datee.yml"]
+    rec = result["reconstruction_datee"]
+    assert rec["resultat"] == "saine"
+    assert rec["preuve"] == "ImportError: pyarrow requires NumPy 2.0 or newer, found 1.26.4"
+    cause = result["cause_demarrage"]
+    assert cause["imputation"] == "copie_datee"
+    assert cause["cause_initiale"]["cause"] == "conflit_versions_dependances"
+    assert any(r["id"] == "reconstruction_datee" for r in result["reparations"])
+    assert result["success"] is True and "fault" not in result
+    # Les étapes de la stack d'origine en boucle ne contredisent pas la stack évaluée.
+    assert not any(s["title"] == "Services qui redémarrent en boucle" for s in result["steps"])
+    diag = next(s for s in result["steps"] if s["title"] == "Diagnostic des services non sains")
+    assert diag["exit_code"] == 0
+
+
+def test_461338_reconstruction_toujours_en_boucle_n_est_pas_saine(tmp_path, monkeypatch):
+    runner, lances = runner_461338(tmp_path, monkeypatch, datee_saine=False)
+
+    result = runner.run_evaluation()
+
+    assert lances == ["docker-compose.eval.yml", "docker-compose.datee.yml"]
+    assert result["reconstruction_datee"]["resultat"] == "echec"
+    assert result["cause_demarrage"]["cause"] == "conflit_versions_dependances"
+    assert not any(r["id"] == "reconstruction_datee" for r in result["reparations"])
+    assert result["success"] is False
+    assert result["fault"] == "indetermine"
+
+
+def test_plantage_apres_up_reussi_diagnostique_sans_reconstruction(tmp_path, monkeypatch):
+    """Hors conflit de versions : le diagnostic est consigné, pas de reconstruction."""
+    logs = "Traceback (most recent call last):\n  File \"/app/main.py\", line 3\nNameError: name 'x' is not defined\n"
+    runner, lances = runner_461338(tmp_path, monkeypatch, logs=logs)
+
+    result = runner.run_evaluation()
+
+    assert lances == ["docker-compose.eval.yml"]
+    assert "reconstruction_datee" not in result
+    assert result["cause_demarrage"]["cause"] == "plantage_application"
+    assert result["fault"] == "apprenant" and result["success"] is False
+    assert any(s["title"] == "Services qui redémarrent en boucle" for s in result["steps"])
+
+
+def test_panne_reseau_reessayee_puis_boucle_reconstruction_datee(tmp_path, monkeypatch):
+    """Un build relancé après une panne réseau, puis bike-api en boucle : le
+    réessai réussi ne doit pas masquer le diagnostic d'après démarrage."""
+    runner, lances = runner_461338(tmp_path, monkeypatch, build_reseau=1)
+
+    result = runner.run_evaluation()
+
+    assert lances == ["docker-compose.eval.yml", "docker-compose.eval.yml", "docker-compose.datee.yml"]
+    assert result["reconstruction_datee"]["resultat"] == "saine"
+    assert result["cause_demarrage"]["imputation"] == "copie_datee"
+    assert result["cause_demarrage"]["cause_initiale"]["cause"] == "conflit_versions_dependances"
+    assert result["success"] is True and "fault" not in result

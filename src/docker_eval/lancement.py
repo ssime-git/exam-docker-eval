@@ -123,8 +123,9 @@ _GLOBALES_A_VALEUR = {"-f", "--file", "-p", "--project-name", "--profile", "--en
                       "--ansi", "--progress", "--parallel"}
 _GLOBALES_SANS_VALEUR = {"--compatibility", "--verbose"}
 # Options de `up` sans effet sur ce qui est lancé (le moteur détache, construit
-# et attend de lui-même) ; `--scale`, `--no-start`, `--dry-run`… changent la
-# stack : pas de traduction approximative.
+# et attend de lui-même). `--scale service=N` est rejoué tel quel (banc nginx,
+# 461091) ; `--no-start`, `--no-deps`, `--dry-run`… changent la stack : pas de
+# traduction approximative.
 _UP_SANS_VALEUR = {"-d", "--detach", "--build", "--force-recreate", "--remove-orphans", "--wait",
                    "--quiet-pull", "--always-recreate-deps", "--renew-anon-volumes", "-V",
                    "--no-recreate", "--abort-on-container-exit", "--no-color", "--no-log-prefix",
@@ -171,13 +172,14 @@ def est_non_reproduit(argv: list) -> bool:
 def traduire_up(argv: list) -> dict | None:
     """Le `compose up` de la recette en arguments du moteur, ou None si le
     moteur ne peut pas le rejouer fidèlement. `-p` est ignoré : le nom de
-    projet du moteur porte le nettoyage."""
+    projet du moteur porte le nettoyage. `echelles` : {service: répliques}
+    des `--scale service=N`."""
     sous, index = _sous_commande(argv)
     if sous != "up":
         return None
     depart = 1 if os.path.basename(argv[0]) == "docker-compose" else 2
     globales, options = argv[depart:index], argv[index + 1:]
-    resultat = {"fichiers": [], "profils": [], "env_files": [], "services": []}
+    resultat = {"fichiers": [], "profils": [], "env_files": [], "services": [], "echelles": {}}
     cles = {"-f": "fichiers", "--file": "fichiers", "--profile": "profils", "--env-file": "env_files"}
     i = 0
     while i < len(globales):
@@ -205,6 +207,18 @@ def traduire_up(argv: list) -> dict | None:
             i += 1
         elif nom in _UP_A_VALEUR:
             i += 1 if "=" in a else 2
+        elif nom == "--scale":
+            if "=" in a:
+                valeur, pas = a.partition("=")[2], 1
+            elif i + 1 < len(options):
+                valeur, pas = options[i + 1], 2
+            else:
+                return None
+            service, egal, repliques = valeur.partition("=")
+            if not (service and egal and repliques.isascii() and repliques.isdigit()):
+                return None
+            resultat["echelles"][service] = int(repliques)
+            i += pas
         elif a.startswith("-"):
             return None
         else:

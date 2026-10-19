@@ -124,14 +124,15 @@ def test_les_appels_enregistres_se_relisent():
 
 def test_up_traduit_en_arguments_du_moteur():
     assert lancement.traduire_up(["docker", "compose", "up", "-d", "--build"]) == {
-        "fichiers": [], "profils": [], "env_files": [], "services": []}
+        "fichiers": [], "profils": [], "env_files": [], "services": [], "echelles": {}}
     assert lancement.traduire_up(["docker-compose", "-f", "a.yml", "--file=b.yml", "--profile", "mon",
                                   "--env-file", ".env.prod", "-p", "autre", "up", "-d", "nginx", "api"]) == {
         "fichiers": ["a.yml", "b.yml"], "profils": ["mon"], "env_files": [".env.prod"],
-        "services": ["nginx", "api"]}
+        "services": ["nginx", "api"], "echelles": {}}
     # Une option que le moteur ne sait pas rejouer : pas de traduction approximative.
     assert lancement.traduire_up(["docker", "compose", "--project-directory", "ailleurs", "up"]) is None
-    assert lancement.traduire_up(["docker", "compose", "up", "--scale", "api=3"]) is None
+    assert lancement.traduire_up(["docker", "compose", "up", "--no-deps", "api"]) is None
+    assert lancement.traduire_up(["docker", "compose", "--dry-run", "up"]) is None
 
 
 def test_lancement_atteint_le_up():
@@ -330,7 +331,10 @@ def _run(tmp_path, monkeypatch, passage, compose_text=None, config=(1, "required
     appels = []
 
     def compose_factice(**kwargs):
-        appels.append(kwargs)
+        # Ce que compose lirait à cet instant : les AppleDouble encore là.
+        appels.append(dict(kwargs, _appledouble=sorted(
+            os.path.relpath(os.path.join(d, f), tmp_path) for d, _, fs in os.walk(tmp_path)
+            for f in fs if f.startswith("._"))))
         raise _Arret("arrêt avant compose up")
     monkeypatch.setattr(compose_runner, "DockerCompose", compose_factice)
     runner = ComposeRunner("469217", str(tmp_path), timeout=60, logger=logging.getLogger("t"))
@@ -515,3 +519,324 @@ def test_up_de_la_recette_en_echec_non_impute_n_est_pas_un_zero(tmp_path, monkey
     resultat, _ = _run_recette(tmp_path, monkeypatch, [False, True], "non_mesure", reessai=False)
     tel = resultat["lancement_tel_que_livre"]
     assert tel["code"] is None and tel["cause"] == "non_mesure"
+
+
+# --- `--scale` et `--profile` de la recette rejoués par le vrai DockerCompose -
+#
+# Banc nginx : 461091 (`docker compose up -d --build --scale api-v1=3`) et
+# 458925 (`--profile monitoring up -d --build --scale api-v1=3`) étaient
+# déclarées « up_non_reproductible » et le moteur levait une seule réplique,
+# sans le monitoring. Le double est au niveau du binaire : testcontainers
+# construit la vraie ligne de commande, seul `subprocess.run` est remplacé.
+
+COMPOSE_ECHELLE = (
+    "services:\n"
+    "  api-v1:\n    build: ./src/api\n    container_name: api_v1\n    ports:\n      - \"8000\"\n"
+    "  nginx:\n    image: nginx\n    ports:\n      - \"8080:80\"\n    depends_on:\n      - api-v1\n"
+    "  prometheus:\n    image: prom/prometheus\n    profiles: [\"monitoring\"]\n")
+
+
+def test_scale_et_profils_traduits():
+    assert lancement.traduire_up(["docker", "compose", "up", "-d", "--build", "--scale", "api-v1=3"]) == {
+        "fichiers": [], "profils": [], "env_files": [], "services": [], "echelles": {"api-v1": 3}}
+    assert lancement.traduire_up(["docker", "compose", "--profile", "monitoring", "--profile=logs", "up", "-d",
+                                  "--scale=api-v1=3", "--scale", "worker=0"]) == {
+        "fichiers": [], "profils": ["monitoring", "logs"], "env_files": [], "services": [],
+        "echelles": {"api-v1": 3, "worker": 0}}
+    for invalide in (["--scale", "api=x"], ["--scale", "api"], ["--scale"], ["--scale", "=3"]):
+        assert lancement.traduire_up(["docker", "compose", "up", *invalide]) is None, invalide
+
+
+def _run_reel(tmp_path, monkeypatch, makefile, appels_recette, echecs_up=0, imputation="non_mesure",
+              reessai=False):
+    """run_evaluation complet jusqu'après le up : `_jouer_lancement` réel
+    (docker factice enregistré), vrai DockerCompose, `subprocess.run`
+    enregistré. `echecs_up` : nombre de `up` qui échouent d'abord."""
+    import subprocess
+    import testcontainers.compose.compose as tc
+    ecrire(tmp_path / "docker-compose.yml", COMPOSE_ECHELLE)
+    ecrire(tmp_path / "deployments" / "nginx" / "nginx.conf", tsn.NGINX)
+    ecrire(tmp_path / "Makefile", makefile)
+    demon = DemonLancement(appels=appels_recette, travail={})
+    monkeypatch.setattr(compose_runner, "client_docker", lambda: demon)
+    lignes, restants = [], [echecs_up]
+
+    def run(cmd, **kwargs):
+        lignes.append(list(cmd))
+        if "up" in cmd and restants[0] > 0:
+            restants[0] -= 1
+            raise subprocess.CalledProcessError(1, cmd, b"", b"container eval-api-v1-1 is unhealthy")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+    monkeypatch.setattr(tc, "subprocess_run", run)
+    runner = ComposeRunner("461091", str(tmp_path), timeout=60, logger=logging.getLogger("t"))
+
+    def diagnostiquer(exc, reessai_possible):
+        runner._cause_demarrage = {"imputation": imputation, "cause": "delai_depasse", "services": {},
+                                   "reessai": None}
+        return reessai and reessai_possible
+    monkeypatch.setattr(runner, "_diagnostiquer_up_rate", diagnostiquer)
+
+    def arret():
+        raise _Arret("arrêt après le up")
+    monkeypatch.setattr(runner, "_retenir_images_de_la_copie", arret)
+    resultat = runner.run_evaluation()
+    ups = [l for l in lignes if "up" in l]
+    return runner, resultat, ups
+
+
+def _apres_up(ligne):
+    return ligne[ligne.index("up") + 1:]
+
+
+def test_461091_scale_de_la_recette_rejoue(tmp_path, monkeypatch):
+    makefile = "start-project:\n\tdocker compose up -d --build --scale api-v1=3\n"
+    runner, resultat, ups = _run_reel(tmp_path, monkeypatch, makefile,
+                                      appel("docker", "compose", "up", "-d", "--build", "--scale", "api-v1=3"))
+    tel = resultat["lancement_tel_que_livre"]
+    assert tel["cause"] is None and tel["code"] == 0, tel
+    assert len(ups) == 1
+    suite = _apres_up(ups[0])
+    assert suite[suite.index("--scale") + 1] == "api-v1=3"
+    # Le compose dérivé ne garde pas le container_name : compose refuserait de scaler.
+    fichier = ups[0][ups[0].index("-f") + 1]
+    assert "container_name" not in lire(tmp_path / fichier)
+    [etape] = [e for e in runner.steps if e["title"].startswith("Build et démarrage Compose")]
+    assert "--scale api-v1=3" in etape["command"]
+
+
+def test_458925_profil_et_scale_de_la_recette_rejoues(tmp_path, monkeypatch):
+    makefile = "start-project:\n\tdocker compose --profile monitoring up -d --build --scale api-v1=3\n"
+    _, resultat, ups = _run_reel(tmp_path, monkeypatch, makefile, appel(
+        "docker", "compose", "--profile", "monitoring", "up", "-d", "--build", "--scale", "api-v1=3"))
+    tel = resultat["lancement_tel_que_livre"]
+    assert tel["cause"] is None and tel["code"] == 0, tel
+    [ligne] = ups
+    avant = ligne[:ligne.index("up")]
+    assert avant[avant.index("--profile") + 1] == "monitoring"
+    suite = _apres_up(ligne)
+    assert suite[suite.index("--scale") + 1] == "api-v1=3"
+
+
+def test_scale_garde_au_reessai_du_up(tmp_path, monkeypatch):
+    makefile = "start-project:\n\tdocker compose up -d --build --scale api-v1=3\n"
+    _, resultat, ups = _run_reel(tmp_path, monkeypatch, makefile,
+                                 appel("docker", "compose", "up", "-d", "--build", "--scale", "api-v1=3"),
+                                 echecs_up=1, reessai=True)
+    assert len(ups) == 2
+    assert all(_apres_up(l)[_apres_up(l).index("--scale") + 1] == "api-v1=3" for l in ups)
+    assert resultat["lancement_tel_que_livre"]["code"] == 0
+
+
+def test_scale_garde_par_le_up_par_defaut_apres_echec_de_la_recette(tmp_path, monkeypatch):
+    """Le up de la recette échoue (non imputé) : le up par défaut du moteur
+    garde le nombre de répliques, sinon la répartition de charge retombe à 0."""
+    makefile = "start-project:\n\tdocker compose --profile monitoring up -d --build --scale api-v1=3\n"
+    _, resultat, ups = _run_reel(tmp_path, monkeypatch, makefile, appel(
+        "docker", "compose", "--profile", "monitoring", "up", "-d", "--build", "--scale", "api-v1=3"),
+        echecs_up=1)
+    assert len(ups) == 2
+    assert all("api-v1=3" in _apres_up(l) for l in ups)
+    # Échec non imputé : le monitoring de la recette reste demandé.
+    assert all(l[l.index("--profile") + 1] == "monitoring" and l.index("--profile") < l.index("up") for l in ups)
+    assert resultat["lancement_tel_que_livre"]["cause"] == "non_mesure"
+
+
+def test_profil_de_la_recette_abandonne_apres_faute_de_la_copie(tmp_path, monkeypatch):
+    """Faute établie de la copie au up de la recette : la réparation mesure
+    le reste sans ses profils (comportement antérieur), le scale reste."""
+    makefile = "start-project:\n\tdocker compose --profile monitoring up -d --build --scale api-v1=3\n"
+    _, resultat, ups = _run_reel(tmp_path, monkeypatch, makefile, appel(
+        "docker", "compose", "--profile", "monitoring", "up", "-d", "--build", "--scale", "api-v1=3"),
+        echecs_up=1, imputation="copie")
+    assert len(ups) == 2
+    assert "--profile" in ups[0] and "--profile" not in ups[1]
+    assert "api-v1=3" in ups[1]
+    assert resultat["lancement_tel_que_livre"]["cause"] == "copie"
+
+
+def test_scale_non_transmis_leve(tmp_path, monkeypatch):
+    """Si testcontainers change sa ligne `up`, le `--scale` ne se perd pas en silence."""
+    import subprocess
+    import testcontainers.compose.compose as tc
+    lignes = []
+    monkeypatch.setattr(tc, "subprocess_run",
+                        lambda cmd, **kw: lignes.append(cmd) or subprocess.CompletedProcess(cmd, 0, b"", b""))
+
+    def start_autre(self):
+        self._run_command(cmd=[*self.compose_command_property, "--ansi", "never", "up", "--wait"])
+    monkeypatch.setattr(tc.DockerCompose, "start", start_autre)
+    compose = compose_runner._avec_echelles(
+        tc.DockerCompose(context=str(tmp_path), compose_file_name="c.yml"), {"api-v1": 3})
+    with pytest.raises(RuntimeError, match="--scale"):
+        compose.start()
+
+
+def test_scale_d_un_service_absent_du_compose_par_defaut_n_est_pas_garde(tmp_path, monkeypatch):
+    """Recette en échec puis up par défaut : un `--scale` visant un service
+    que ce compose n'a pas ferait échouer compose (« no such service »)."""
+    makefile = "start-project:\n\tdocker compose up -d --build --scale api-v1=3 --scale ailleurs=2\n"
+    _, _, ups = _run_reel(tmp_path, monkeypatch, makefile, appel(
+        "docker", "compose", "up", "-d", "--build", "--scale", "api-v1=3", "--scale", "ailleurs=2"),
+        echecs_up=1)
+    assert len(ups) == 2
+    assert "ailleurs=2" in ups[0] and "api-v1=3" in ups[0]
+    assert "ailleurs=2" not in ups[1] and "api-v1=3" in ups[1]
+
+
+# --- AppleDouble `._*` (460188) : artefacts macOS écartés avant le lancement --
+
+APPLEDOUBLE = b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        " + b"\x00" * 40
+
+
+def test_460188_appledouble_ecartes_avant_le_lancement(tmp_path, monkeypatch):
+    regles = tmp_path / "deployment" / "prometheus" / "rules"
+    regles.mkdir(parents=True)
+    (regles / "alert_rules.yml").write_text("groups: []\n")
+    (regles / "._alert_rules.yml").write_bytes(APPLEDOUBLE)
+    (tmp_path / "._docker-compose.yml").write_bytes(APPLEDOUBLE)
+    # Un fichier de l'apprenant au nom en `._` mais sans l'en-tête : il reste.
+    (regles / "._notes.yml").write_text("groups: []\n")
+    os.symlink("/etc/hostname", tmp_path / "._lien")
+    demon = DemonLancement(appels=appel("docker", "compose", "up", "-d", "--build"))
+    runner = runner_lancement(tmp_path, monkeypatch, demon)
+    runner.record_submission_step()
+    runner._relever_date_reference()
+    runner._ecarter_appledouble()
+    runner._jouer_lancement()
+    noms = set()
+    for _, donnees in demon.archives:
+        noms |= set(tarfile.open(fileobj=io.BytesIO(donnees)).getnames())
+    assert "travail/deployment/prometheus/rules/._alert_rules.yml" not in noms
+    assert "travail/._docker-compose.yml" not in noms
+    assert "travail/deployment/prometheus/rules/._notes.yml" in noms
+    assert "travail/deployment/prometheus/rules/alert_rules.yml" in noms
+    assert os.path.islink(tmp_path / "._lien")
+    [etape] = [e for e in runner.steps if e["title"] == "Fichiers AppleDouble écartés"]
+    assert etape["exit_code"] == 0
+    assert "deployment/prometheus/rules/._alert_rules.yml" in etape["output"]
+    assert "._notes.yml" not in etape["output"]
+    assert runner._reparations == []
+    # Rendus au nettoyage : la copie de travail retrouve son contenu.
+    runner._remettre_appledouble()
+    assert (regles / "._alert_rules.yml").read_bytes() == APPLEDOUBLE
+
+
+def test_appledouble_ecartes_dans_run_evaluation_sans_reparation(tmp_path, monkeypatch):
+    (tmp_path / "deployment").mkdir()
+    (tmp_path / "deployment" / "._prometheus.yml").write_bytes(APPLEDOUBLE)
+    passage = {"tel_que_livre": ATTEINT, "up": lancement.traduire_up(ATTEINT["up"]),
+               "produit": {".env": "GRAFANA_ADMIN_PASSWORD=x\n"}}
+    runner, resultat, appels = _run(tmp_path, monkeypatch, passage)
+    # 460188 : au moment du up, le fichier que Prometheus lirait n'est plus là.
+    assert appels and appels[0]["_appledouble"] == []
+    titres = [e["title"] for e in runner.steps]
+    assert "Fichiers AppleDouble écartés" in titres
+    assert titres.index("Fichiers AppleDouble écartés") < titres.index("Ports hôte relâchés")
+    assert resultat["reparations"] == []
+    # Remis par le nettoyage de run_evaluation.
+    assert (tmp_path / "deployment" / "._prometheus.yml").read_bytes() == APPLEDOUBLE
+
+
+# --- panne réseau pendant le build (460059) -----------------------------------
+
+STDERR_460059 = (
+    b"Image eval_460059-bike-api Building \nDockerfile:10\n\n--------------------\n\n"
+    b"  10 | >>> RUN pip install --upgrade pip && pip install -r requirements.txt\n\n--------------------\n\n"
+    b"failed to solve: process \"/bin/sh -c pip install --upgrade pip && pip install -r requirements.txt\" "
+    b"did not complete successfully: exit code: 2\n")
+STDOUT_460059 = (
+    b"#9 55.31 pip._vendor.urllib3.exceptions.ReadTimeoutError: HTTPSConnectionPool(host='files.pythonhosted.org',"
+    b" port=443): Read timed out.\n"
+    b"#9 ERROR: process \"/bin/sh -c pip install --upgrade pip && pip install -r requirements.txt\" did not "
+    b"complete successfully: exit code: 2\n------\n"
+    b" > [4/5] RUN pip install --upgrade pip && pip install -r requirements.txt:\n"
+    b"55.31   File \"/usr/local/lib/python3.12/site-packages/pip/_vendor/urllib3/response.py\", line 443, in "
+    b"_error_catcher\n"
+    b"55.31     raise ReadTimeoutError(self._pool, None, \"Read timed out.\")\n"
+    b"55.31 pip._vendor.urllib3.exceptions.ReadTimeoutError: HTTPSConnectionPool(host='files.pythonhosted.org', "
+    b"port=443): Read timed out.\n------\n")
+# Faute de la copie : un paquet qui n'existe pas, après un simple avertissement réseau.
+STDOUT_PAQUET_INEXISTANT = (
+    b"#9 3.1 WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after "
+    b"connection broken by 'ReadTimeoutError(\"HTTPSConnectionPool(host='pypi.org', port=443): Read timed out.\")'"
+    b": /simple/nonexistent/\n"
+    b"------\n > [4/5] RUN pip install -r requirements.txt:\n"
+    b"9.2 ERROR: Could not find a version that satisfies the requirement nonexistent==9.9 (from versions: none)\n"
+    b"9.2 ERROR: No matching distribution found for nonexistent==9.9\n------\n")
+
+
+def test_classer_echec_build():
+    from docker_eval import diagnostic_demarrage as dd
+    cause = compose_runner.classer_echec_build((STDERR_460059 + STDOUT_460059).decode())
+    assert cause["cause"] == "reseau_build" and cause["imputation"] == dd.NON_MESURE
+    assert "files.pythonhosted.org" in cause["preuve"]
+    assert compose_runner.classer_echec_build((STDERR_460059 + STDOUT_PAQUET_INEXISTANT).decode()) is None
+    apt = ("------\n > [2/5] RUN apt-get update && apt-get install -y curl:\n"
+           "0.9 W: Failed to fetch http://deb.debian.org/debian/dists/bookworm/InRelease  "
+           "Temporary failure resolving 'deb.debian.org'\n"
+           "1.2 E: Unable to locate package curl\n------\n")
+    assert compose_runner.classer_echec_build(apt)["cause"] == "reseau_build"
+    registre = ("failed to solve: python:3.12-slim: failed to resolve source metadata for "
+                "docker.io/library/python:3.12-slim: failed to do request: Head "
+                "\"https://registry-1.docker.io/v2/library/python/manifests/3.12-slim\": dial tcp: "
+                "lookup registry-1.docker.io: i/o timeout\n")
+    assert compose_runner.classer_echec_build(registre)["cause"] == "reseau_build"
+    # Le Dockerfile de la copie qui vise un service local : pas une panne réseau.
+    local = ("------\n > [5/5] RUN curl -f http://localhost:8080/health:\n"
+             "0.3 curl: (7) Failed to connect to localhost port 8080: Connection refused\n------\n")
+    assert compose_runner.classer_echec_build(local) is None
+
+
+def _run_build(tmp_path, monkeypatch, issues):
+    """run_evaluation, up par défaut, vrai DockerCompose : `issues` donne,
+    up après up, None (passe) ou le stdout du build en échec."""
+    import subprocess
+    import testcontainers.compose.compose as tc
+    ecrire(tmp_path / "docker-compose.yml", COMPOSE_ECHELLE)
+    ecrire(tmp_path / "deployments" / "nginx" / "nginx.conf", tsn.NGINX)
+    ecrire(tmp_path / "Makefile", "start-project:\n\tdocker compose up -d --build\n")
+    demon = DemonLancement(appels=appel("docker", "compose", "up", "-d", "--build"), travail={})
+    monkeypatch.setattr(compose_runner, "client_docker", lambda: demon)
+    restants, ups = list(issues), []
+
+    def run(cmd, **kwargs):
+        if "up" in cmd:
+            ups.append(cmd)
+            stdout = restants.pop(0)
+            if stdout is not None:
+                raise subprocess.CalledProcessError(1, cmd, stdout, STDERR_460059)
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+    monkeypatch.setattr(tc, "subprocess_run", run)
+    runner = ComposeRunner("460059", str(tmp_path), timeout=60, logger=logging.getLogger("t"))
+    # Après un build raté, `compose ps` ne liste rien.
+    monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [])
+    monkeypatch.setattr(runner, "_retenir_images_de_la_copie", lambda: None)
+
+    def arret():
+        raise _Arret("arrêt après le up")
+    monkeypatch.setattr(runner, "_wait_for_services", arret)
+    return runner.run_evaluation(), ups
+
+
+def test_460059_panne_reseau_du_build_reessayee_puis_saine(tmp_path, monkeypatch):
+    resultat, ups = _run_build(tmp_path, monkeypatch, [STDOUT_460059, None])
+    assert len(ups) == 2
+    assert resultat["cause_demarrage"]["cause"] == "reseau_build"
+    assert "fault" not in resultat
+    [etape] = [e for e in resultat["steps"] if e["title"] == "Diagnostic des services non sains"]
+    assert etape["exit_code"] == 0 and "files.pythonhosted.org" in etape["output"]
+
+
+def test_460059_panne_reseau_persistante_imputee_au_systeme(tmp_path, monkeypatch):
+    resultat, ups = _run_build(tmp_path, monkeypatch, [STDOUT_460059, STDOUT_460059])
+    assert len(ups) == 2
+    cause = resultat["cause_demarrage"]
+    assert cause["cause"] == "reseau_build" and cause["imputation"] == "non_mesure"
+    assert resultat["fault"] == "systeme"
+
+
+def test_paquet_inexistant_n_est_pas_une_panne_reseau(tmp_path, monkeypatch):
+    resultat, ups = _run_build(tmp_path, monkeypatch, [STDOUT_PAQUET_INEXISTANT])
+    assert len(ups) == 1
+    assert resultat["cause_demarrage"]["cause"] != "reseau_build"
+    assert resultat.get("fault") != "systeme"

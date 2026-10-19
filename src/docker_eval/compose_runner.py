@@ -27,6 +27,7 @@ from . import reconstruction_datee
 # docker-compose.yml (on garde ce dernier en tete, c'est le nom demande par
 # les enonces).
 NOMS_COMPOSE = ("docker-compose.yml", "docker-compose.yaml", "compose.yaml", "compose.yml")
+_ENTETE_APPLEDOUBLE = b"\x00\x05\x16\x07"
 _DOSSIERS_IGNORES = {".git", ".venv", "venv", "node_modules", "__pycache__", "__MACOSX"}
 
 # Réglages DNS d'un service, retirés du compose réécrit (469634).
@@ -508,6 +509,94 @@ def annoter_bruit_de_sondes(sondes: list) -> None:
             )
 
 
+# Panne réseau pendant le build (460059 : `pip install` → ReadTimeoutError
+# vers files.pythonhosted.org). Propre au build : apt, registre d'images, et
+# les erreurs urllib3/requests déjà reconnues à l'exécution. Ces motifs ne
+# servent pas à `diagnostic_demarrage.classer_service`, qui lit les logs d'exécution.
+_MOTIFS_RESEAU_BUILD = re.compile(
+    r"Temporary failure resolving '([^']+)'|Could not connect to ([A-Za-z0-9.\-]+)"
+    r"|failed to resolve source metadata for ([^\s:]+)|dial tcp:? lookup ([A-Za-z0-9.\-]+)"
+    r"|TLS handshake timeout|i/o timeout|net/http: request canceled",
+    re.IGNORECASE,
+)
+_BLOC_ECHEC = re.compile(r"^\s*>\s*\[[^\]]+\][^\n]*:\s*$")
+
+
+def _preuves_du_build(sortie: str) -> list:
+    """Les lignes qui disent pourquoi le build a échoué : le bloc de l'étape
+    en échec (` > [4/5] RUN …:` jusqu'à `------`) et les `failed to solve`.
+    Sans bloc, toute la sortie. Les avertissements (pip `WARNING: Retrying`)
+    ne prouvent rien : une étape qui échoue ensuite pour une autre raison
+    reste celle-là."""
+    lignes, preuves, dans_bloc = sortie.splitlines(), [], False
+    for ligne in lignes:
+        if _BLOC_ECHEC.match(ligne):
+            dans_bloc = True
+            continue
+        if dans_bloc and ligne.startswith("------"):
+            dans_bloc = False
+            continue
+        if dans_bloc or "failed to solve" in ligne:
+            preuves.append(ligne)
+    if not preuves:
+        preuves = lignes
+    return [l for l in preuves if not re.search(r"\bWARNING\b|Retrying", l)]
+
+
+def classer_echec_build(sortie: str) -> dict | None:
+    """Une panne réseau vers l'extérieur pendant le build, ou None.
+
+    Panne d'infrastructure (imputation non_mesure, faute « systeme ») :
+    jamais l'apprenant. Un hôte interne (localhost, service de la stack)
+    n'est pas une panne réseau."""
+    preuves = _preuves_du_build(sortie or "")
+    preuve = diagnostic_demarrage._reseau_sortant("\n".join(preuves))
+    if not preuve:
+        for ligne in preuves:
+            m = _MOTIFS_RESEAU_BUILD.search(ligne)
+            hotes = [h for h in (m.groups() if m else ()) if h]
+            if m and (not hotes or any(diagnostic_demarrage._hote_externe(h.split("/")[0]) for h in hotes)):
+                preuve = ligne.strip()[:300]
+                break
+    if not preuve:
+        return None
+    return {"cause": "reseau_build", "imputation": diagnostic_demarrage.NON_MESURE, "reessayable": True,
+            "preuve": f"panne réseau pendant le build (infrastructure, pas la copie) : {preuve}"}
+
+
+def _avec_echelles(compose, echelles: dict):
+    """Ajouter `--scale service=N` au `up` de ce DockerCompose.
+
+    testcontainers n'a pas d'option de mise à l'échelle : la ligne `up` qu'il
+    construit est complétée au passage, sur cette instance seulement, si bien
+    que le réessai de `_DemarrageSansDemontage` (nouveau start() sur le même
+    objet) la garde. Un `start()` dont la ligne `up` n'a pas reçu les
+    `--scale` lève : une version de testcontainers qui changerait sa ligne
+    ne doit pas ramener silencieusement à une réplique (banc nginx, 461091).
+    """
+    if not echelles:
+        return compose
+    options = [x for service, n in echelles.items() for x in ("--scale", f"{service}={n}")]
+    lancer, demarrer = compose._run_command, compose.start
+    vus = []
+
+    def run(cmd, *args, **kwargs):
+        base = list(compose.compose_command_property)
+        if isinstance(cmd, list) and cmd[:len(base)] == base and cmd[len(base):len(base) + 1] == ["up"]:
+            cmd = [*cmd[:len(base) + 1], *options, *cmd[len(base) + 1:]]
+            vus.append(cmd)
+        return lancer(cmd, *args, **kwargs)
+
+    def start():
+        avant = len(vus)
+        demarrer()
+        if len(vus) == avant:
+            raise RuntimeError("`--scale` non transmis : la ligne `up` de testcontainers a changé")
+
+    compose._run_command, compose.start = run, start
+    return compose
+
+
 class _DemarrageSansDemontage:
     """`with compose:` sans le démontage que testcontainers fait sur un `up`
     raté : son __enter__ appelle __exit__ en cas d'échec, et les conteneurs
@@ -592,8 +681,27 @@ class ComposeRunner(BaseRunner):
         self._date_reference = None
         self._reconstruction = None
         self._fichiers_harnais = []
+        # {chemin: contenu} des AppleDouble `._*` écartés avant le lancement
+        # (460188), remis au nettoyage.
+        self._appledouble = {}
         # {service: {clé DNS: valeur d'origine}} retirés du compose réécrit.
         self._dns_retires = {}
+        # `--scale` de la recette gardés par le up par défaut et la
+        # reconstruction datée (banc nginx, 461091).
+        self._echelles_up = {}
+        # POST /predict déclarés ou construits qui ont rendu une prédiction
+        # 2xx : les sondes de comportement les reprennent (461091).
+        self._requetes_qui_predisent = []
+        # Profils de la recette gardés par ces mêmes up quand l'échec du up de
+        # la recette n'est pas imputé à la copie (458925 : le monitoring).
+        self._profils_up = []
+
+    def _commande_up(self, compose_name: str) -> str:
+        """La ligne du up par défaut, avec les profils et `--scale` gardés."""
+        return (f"docker compose -f {compose_name}"
+                + "".join(f" --profile {p}" for p in self._profils_up)
+                + " up --build"
+                + "".join(f" --scale {s}={n}" for s, n in self._echelles_up.items()))
 
     @staticmethod
     def _nom_fixe_en_alias(service: dict) -> bool:
@@ -889,6 +997,7 @@ class ComposeRunner(BaseRunner):
                 duration=time.time() - compose_resolution_started,
             )
             self._consigner_date_reference()
+            self._ecarter_appledouble()
 
             # Passage « lancement tel que livré » (politique du 16/10) : la
             # commande de l'énoncé, jouée par make dans le conteneur jetable.
@@ -984,9 +1093,10 @@ class ComposeRunner(BaseRunner):
             commande_up = f"docker compose -f {compose_name} up --build"
             deja_demarre = False
             relatifs = [os.path.relpath(f, self.eval_dir) for f in fichiers_recette]
+            echelles = dict((up or {}).get("echelles") or {})
             personnalise = up is not None and (
                 relatifs not in ([], [os.path.relpath(compose_file, self.eval_dir)])
-                or bool(up["profils"] or up["env_files"] or up["services"]))
+                or bool(up["profils"] or up["env_files"] or up["services"] or echelles))
             if personnalise:
                 noms = []
                 for chemin in fichiers_recette or [compose_file]:
@@ -999,13 +1109,15 @@ class ComposeRunner(BaseRunner):
                 commande_recette = (f"docker compose {' '.join(f'-f {n}' for n in noms)}"
                                     + "".join(f" --profile {p}" for p in up["profils"])
                                     + "".join(f" --env-file {e}" for e in up["env_files"])
-                                    + " up --build" + "".join(f" {s}" for s in up["services"]))
+                                    + " up --build"
+                                    + "".join(f" --scale {s}={n}" for s, n in echelles.items())
+                                    + "".join(f" {s}" for s in up["services"]))
                 recette_started = time.time()
                 try:
-                    self.compose = DockerCompose(
+                    self.compose = _avec_echelles(DockerCompose(
                         context=self.eval_dir, compose_file_name=noms if len(noms) > 1 else noms[0],
                         pull=False, build=True, env_file=up["env_files"] or None,
-                        profiles=up["profils"] or None, services=up["services"] or None)
+                        profiles=up["profils"] or None, services=up["services"] or None), echelles)
                     # Même démarrage que le up du moteur : réessai sur un
                     # healthcheck seulement lent (467094), cause classée.
                     _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate).__enter__()
@@ -1027,8 +1139,12 @@ class ComposeRunner(BaseRunner):
                     except Exception:
                         pass
                     self.compose = None
-                    # Le up par défaut repart sans la cause du premier.
+                    # Le up par défaut repart sans la cause du premier. Il
+                    # garde les profils de la recette, sauf faute établie de
+                    # la copie : la réparation mesure alors le reste sans eux.
                     self._cause_demarrage = None
+                    if imputation != "copie":
+                        self._profils_up = list(up["profils"])
                     extrait = (f"`{' '.join(self._lancement['up'])}` (le up de la recette) échoue "
                                f"(imputation {imputation or 'non classée'}) : "
                                f"{lancement.masquer_secrets(str(exc))[-600:]}")
@@ -1041,13 +1157,22 @@ class ComposeRunner(BaseRunner):
                              extrait=extrait)
             if not deja_demarre:
                 self._noter_reparations_de_lancement(compose_name)
-                self.compose = DockerCompose(
+                # Le up par défaut, et la reconstruction datée qui le
+                # remplace, gardent les `--scale` de la recette pour les
+                # services de ce compose : la topologie voulue par la copie
+                # (répartition de charge) n'est pas une réparation. Les
+                # profils aussi, sauf faute établie de la copie (plus haut).
+                connus = set(self._services_du_compose(os.path.join(self.eval_dir, compose_name)))
+                self._echelles_up = {s: n for s, n in echelles.items() if s in connus}
+                commande_up = self._commande_up(compose_name)
+                self.compose = _avec_echelles(DockerCompose(
                     context=self.eval_dir,
                     compose_file_name=compose_name,
                     pull=False,  # Use local builds
                     build=True,  # Build images before starting
-                    env_file=None  # No .env file needed
-                )
+                    env_file=None,  # No .env file needed
+                    profiles=self._profils_up or None,
+                ), self._echelles_up)
 
             # Start services with context manager (auto-cleanup on exit)
             self.logger.info("Starting Docker Compose services...")
@@ -1064,9 +1189,14 @@ class ComposeRunner(BaseRunner):
                         if nom_datee is None:
                             raise
                         compose_name = nom_datee
-                        commande_up = f"docker compose -f {nom_datee} up --build (reconstruction datée)"
+                        commande_up = self._commande_up(nom_datee) + " (reconstruction datée)"
                     demarrage = _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate, True)
                 with demarrage:
+                    if (self._cause_demarrage or {}).get("cause") == "reseau_build" \
+                            and getattr(self, "_etape_diagnostic", None) is not None:
+                        # La panne réseau n'a pas persisté : le build relancé a passé.
+                        self._etape_diagnostic["exit_code"] = 0
+                        self._etape_diagnostic["output"] += "\nréessai : le build relancé passe."
                     self.record_step(
                         "Build et démarrage Compose",
                         command=commande_up,
@@ -1091,6 +1221,7 @@ class ComposeRunner(BaseRunner):
                     # attendre un conteneur pipeline-1 inexistant faisait tourner
                     # 600s de boucle NotFound avant un timeout impute a la copie.
                     services = self._services_du_compose(os.path.join(self.eval_dir, compose_name))
+                    self._compose_name = compose_name
                     # Convention d'examen declarable (pi_stack_mode, #49) :
                     # serving | pipeline | auto (defaut : deviner par la
                     # presence d'un service `pipeline`).
@@ -1332,6 +1463,10 @@ class ComposeRunner(BaseRunner):
         stack debout qui répond sur ses ports.
         """
         etats = self._record_service_states()
+        # Avant les sondes : une stack tombée sur un conflit de versions est
+        # reconstruite, et seule la stack évaluée est sondée (461338).
+        boucles = self._boucles_de_redemarrage()
+        etats, boucles = self._reconstruire_si_conflit(etats, boucles)
 
         sondes = self._sonder_ports_publies()
         annoter_bruit_de_sondes(sondes)
@@ -1380,7 +1515,6 @@ class ComposeRunner(BaseRunner):
                 self.record_step("Sondes de comportement Prometheus",
                                  output=f"non mesurées : erreur interne du harnais ({erreur})", exit_code=0)
 
-        boucles = self._boucles_de_redemarrage()
         for nom in boucles:
             etats[nom] = ("restarting", etats.get(nom, ("", 1))[1] or 1)
         if boucles:
@@ -1432,6 +1566,49 @@ class ComposeRunner(BaseRunner):
         if prometheus is not None:
             resultat["prometheus_comportement"] = prometheus
         return resultat
+
+    def _reconstruire_si_conflit(self, etats: dict, boucles: set) -> tuple:
+        """Services en échec après un `up` réussi : même diagnostic que pour
+        un `up` raté et, sur un conflit de versions, la même reconstruction
+        datée unique (461338, 460188 : pas de healthcheck bloquant, le `up`
+        passe puis bike-api redémarre en boucle sur « pyarrow requires NumPy
+        2.0 »). Rend (etats, boucles) de la stack à évaluer."""
+        marques = dict(etats)
+        for nom in boucles:
+            marques[nom] = ("restarting", 1)
+        _, morts = self._classer_services(marques)
+        # Une cause déjà retenue reste, sauf si son réessai a réussi (healthcheck
+        # lent, panne réseau du build) : la stack debout est alors à diagnostiquer.
+        cause = self._cause_demarrage
+        if not morts or self._reconstruction is not None or not getattr(self, "_compose_name", None) \
+                or cause is not None and (cause.get("reessai") or {}).get("resultat") != "sain":
+            return etats, boucles
+        debut = time.time()
+        releve = self._releve_sante()
+        noms = diagnostic_demarrage.services_non_sains(
+            {s: a for s, (_, a) in releve.items()}, {s for s, (c, _) in releve.items() if c.name in boucles})
+        if not noms:
+            return etats, boucles
+        self._consigner_diagnostic(releve, noms, "", time.time() - debut)
+        if not reconstruction_datee.doit_reconstruire(self._cause_demarrage):
+            return etats, boucles
+        derniers = {}
+
+        def verifier():
+            self._wait_for_services()
+            derniers["boucles"] = self._boucles_de_redemarrage()
+            observes = self._etats_du_projet()
+            for nom in derniers["boucles"]:
+                observes[nom] = ("restarting", 1)
+            return sorted(self._classer_services(observes)[1])
+        origine = self.compose
+        self._tenter_reconstruction_datee(
+            self._compose_name, RuntimeError(f"service(s) en échec après le démarrage : {sorted(morts)}"), verifier)
+        if self.compose is origine:
+            return etats, boucles  # rien n'a été relancé
+        # La stack d'origine est arrêtée : l'évaluation porte sur la reconstruite.
+        etats = self._record_service_states()
+        return etats, derniers.get("boucles") if "boucles" in derniers else self._boucles_de_redemarrage()
 
     def _sonder_chemins_declares(self, sondes_racine: list) -> list:
         """Sonder, à travers le port TLS du reverse proxy, les chemins que la
@@ -1567,6 +1744,8 @@ class ComposeRunner(BaseRunner):
             if sonde.get("code") != 401:
                 break
         code = sonde.get("code")
+        if sondes_nginx.predit(sonde):
+            self._requetes_qui_predisent.append(requete)
         self.record_step(
             "Requête construite par le correcteur : POST /predict",
             command=f"POST {racine_url}/predict + corps JSON {requete['corps']} + Authorization Basic "
@@ -1613,6 +1792,9 @@ class ComposeRunner(BaseRunner):
                      "le 401 est la réponse attendue, la protection fonctionne\n")
         sonde["duration_seconds"] = time.time() - started
         code = sonde.get("code")
+        if requete["methode"] == "POST" and requete["chemin"].rstrip("/").endswith("/predict") \
+                and sondes_nginx.predit(sonde):
+            self._requetes_qui_predisent.append(requete)
         self.record_step(
             f"Requête déclarée ({requete['source']}) : {requete['methode']} {requete['chemin']}",
             command=f"{requete['methode']} {url}"
@@ -1634,11 +1816,10 @@ class ComposeRunner(BaseRunner):
         négatifs : c'est lui qui rend 200. Sans requête déclarée, celle que
         le moteur construit depuis le schéma de l'API ; à défaut, un POST
         sans corps : le code reste lisible (422 n'est pas 401 ni 503)."""
-        for requete in requetes_declarees(self.eval_dir):
-            if (requete["methode"] == "POST" and requete["chemin"].rstrip("/").endswith("/predict")
-                    and requete.get("port") in (None, 80, 443)
-                    and not (requete["identifiants"] and code_attendu_negatif(requete["identifiants"]))):
-                return requete
+        requete = sondes_nginx.choisir_requete_predict(
+            self._requetes_qui_predisent, requetes_declarees(self.eval_dir), code_attendu_negatif)
+        if requete is not None:
+            return requete
         construite = getattr(self, "_requete_construite_memo", None)
         if construite:
             return construite
@@ -1795,7 +1976,7 @@ class ComposeRunner(BaseRunner):
                 return {"code_variante": variante.get("code"),
                         "corps_differents": (defaut.get("extrait") != variante.get("extrait")) if deux_codes else None}
 
-            if defaut is not None:
+            if defaut is not None and sondes_nginx.predit(defaut):
                 try:
                     comportement["ab"] = {"entete": entete_impose, "valeur": valeur_imposee,
                                           "code_defaut": defaut.get("code"),
@@ -1855,6 +2036,8 @@ class ComposeRunner(BaseRunner):
                 }
             except Exception:
                 comportement["rafale"] = None
+            if defaut is not None and not sondes_nginx.predit(defaut):
+                sondes_nginx.sans_prediction(comportement, defaut)
 
         # Répartition : après la rafale, chaque réplique v1 a-t-elle servi ?
         # Les services v1 sont les serveurs de l'upstream par défaut du map ;
@@ -2154,6 +2337,57 @@ class ComposeRunner(BaseRunner):
                 except Exception:
                     pass
 
+    def _ecarter_appledouble(self) -> None:
+        """Écarter les AppleDouble `._X` de la copie de travail avant le
+        lancement : métadonnées d'archivage macOS (famille de `__MACOSX`), pas
+        des fichiers de l'apprenant. 460188 : `rules/._alert_rules.yml` et
+        `provisioning/dashboards/._dashboards.yaml`, lus par Prometheus et
+        Grafana, les faisaient planter (« yaml: control characters are not
+        allowed »). Ni réparation ni point : une étape lisible, et les
+        fichiers remis au nettoyage. Seuls les vrais AppleDouble partent :
+        nom `._X`, fichier régulier (pas de lien), en-tête 0x00051607."""
+        debut = time.time()
+        for racine, dossiers, fichiers in os.walk(self.eval_dir):
+            dossiers[:] = [d for d in dossiers if d not in _DOSSIERS_IGNORES]
+            for nom in fichiers:
+                chemin = os.path.join(racine, nom)
+                if not nom.startswith("._") or os.path.islink(chemin) or not os.path.isfile(chemin):
+                    continue
+                try:
+                    with open(chemin, "rb") as lecteur:
+                        if lecteur.read(4) != _ENTETE_APPLEDOUBLE:
+                            continue
+                        lecteur.seek(0)
+                        contenu = lecteur.read()
+                    os.remove(chemin)
+                except OSError as erreur:
+                    self.logger.warning(f"AppleDouble {chemin} non écarté : {erreur}")
+                    continue
+                self._appledouble[chemin] = contenu
+        if self._appledouble:
+            self.record_step(
+                "Fichiers AppleDouble écartés",
+                command="retrait des `._*` à en-tête AppleDouble (0x00051607) de la copie de travail",
+                output="\n".join(sorted(os.path.relpath(c, self.eval_dir) for c in self._appledouble)),
+                exit_code=0,
+                duration=time.time() - debut,
+                note=("Métadonnées macOS ajoutées par l'archivage, pas des fichiers de l'apprenant : "
+                      "écartées sans pénalité avant le lancement, remises au nettoyage."),
+            )
+
+    def _remettre_appledouble(self) -> list:
+        erreurs = []
+        for chemin, contenu in self._appledouble.items():
+            try:
+                with open(chemin, "xb") as sortie:
+                    sortie.write(contenu)
+            except FileExistsError:
+                pass
+            except OSError as e:
+                erreurs.append(f"{os.path.relpath(chemin, self.eval_dir)} non remis : {e}")
+        self._appledouble = {}
+        return erreurs
+
     def _retirer_rapatries(self) -> list:
         """Remettre le projet dans l'état livré : fichiers produits par la
         recette retirés, fichiers modifiés rendus. Rend les erreurs."""
@@ -2293,12 +2527,16 @@ class ComposeRunner(BaseRunner):
         except Exception:
             return None
 
-    def _tenter_reconstruction_datee(self, compose_name: str, exc: Exception) -> str | None:
+    def _tenter_reconstruction_datee(self, compose_name: str, exc: Exception, verifier=None) -> str | None:
         """Rebâtir une fois la stack aux versions de la date du rendu.
 
         Seulement sur un conflit de versions entre dépendances (467094). Rend
         le nom du compose dérivé si la stack devient saine, l'évaluation
         continue alors dessus ; sinon None, et le classement initial reste.
+
+        `verifier()` : après un `up` qui passe, les services encore en échec
+        (liste vide si la stack est saine). Sans healthcheck bloquant, un
+        `up` réussi ne prouve rien (461338 : bike-api en boucle).
         """
         cause = self._cause_demarrage
         if self._reconstruction is not None or not reconstruction_datee.doit_reconstruire(cause):
@@ -2386,14 +2624,22 @@ class ComposeRunner(BaseRunner):
             except Exception as erreur:
                 notes.append(f"arrêt de la stack d'origine : {erreur}")
             self._cause_demarrage = None
-            self.compose = DockerCompose(context=self.eval_dir, compose_file_name=reconstruction_datee.COMPOSE_DATE,
-                                         pull=False, build=True, env_file=None)
+            self.compose = _avec_echelles(
+                DockerCompose(context=self.eval_dir, compose_file_name=reconstruction_datee.COMPOSE_DATE,
+                              pull=False, build=True, env_file=None, profiles=self._profils_up or None),
+                self._echelles_up)
             contraints = ", ".join(f"{p['service']} : {p['paquet']} {p['installe']} (exclues : {', '.join(p['exclues'])})"
                                    for p in self._reconstruction["paquets_contraints"]) or "aucun"
             resume_contraintes = f"paquets contraints : {contraints}" + (
                 "\n" + "\n".join(notes) if notes else "")
             try:
                 _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate).__enter__()
+                defaillants = verifier() if verifier is not None else []
+                if defaillants:
+                    self._cause_demarrage = initiale
+                    terminer(f"{resume_contraintes}\nla stack reconstruite démarre mais reste en échec : "
+                             f"{', '.join(defaillants)}", 1)
+                    return None
             except Exception as second:
                 nouvelle = self._cause_demarrage
                 self._cause_demarrage = initiale
@@ -2968,48 +3214,83 @@ class ComposeRunner(BaseRunner):
                 boucles = {s for s, (c, _) in releve.items() if c.name in en_boucle}
             noms = diagnostic_demarrage.services_non_sains(
                 {s: a for s, (_, a) in releve.items()}, boucles)
-            causes, blocs = {}, []
-            for service in noms:
-                conteneur, attrs = releve[service]
-                try:
-                    logs = conteneur.logs(tail=200).decode("utf-8", errors="replace")
-                except Exception as erreur:
-                    logs = f"logs illisibles : {erreur}"
-                logs = diagnostic_demarrage.masquer_secrets(logs, attrs)
-                causes[service] = diagnostic_demarrage.classer_service(attrs, logs)
-                if causes[service]["cause"] == "reseau_sortant" and service in self._dns_retires:
-                    causes[service]["preuve"] += (
-                        f" (la copie déclarait {_decrire_dns(self._dns_retires[service])} "
-                        "pour ce service ; retiré par le moteur)")
-                blocs.append(diagnostic_demarrage.decrire_service(service, attrs, logs, causes[service]))
-            retenue = diagnostic_demarrage.classer_demarrage(causes)
-            retenue["services"] = causes
-            retenue["reessai"] = None
-            self._cause_demarrage = retenue
-            sortie = (f"cause retenue : {retenue['cause']} ({retenue['service']}) → imputation "
-                      f"{retenue['imputation']}\n{retenue['preuve']}\n\n" + "\n\n".join(blocs))
             if not noms:
-                sortie = ("aucun service non sain relevé (le `up` a échoué avant ou sans "
-                          f"healthcheck) : {str(exc)[:300]}")
-            self.record_step(
-                "Diagnostic des services non sains",
-                command=("docker inspect (State, State.Health, Config.Healthcheck) et "
-                         "docker logs --tail 200 de chaque service non sain ou sorti "
-                         "(équivalent docker compose logs --no-color --tail 200 <service>)"),
-                output=sortie,
-                exit_code=2,
-                duration=time.time() - debut,
-                note=("Imputation : « copie » = faute établie de la copie ; « non_mesure » = cause "
-                      "de notre côté, la copie n'a pas été mesurée ; « indetermine » = ni l'un ni "
-                      "l'autre n'est établi."),
-            )
-            self._etape_diagnostic = self.steps[-1]
+                # 460059 : aucun conteneur, le build a échoué. Une panne réseau
+                # (PyPI, apt, registre) est une panne d'infrastructure : le up
+                # est relancé une fois, et si elle persiste la faute est au
+                # système, jamais à l'apprenant.
+                sortie_build = "\n".join(
+                    contenu.decode("utf-8", errors="replace") if isinstance(contenu, bytes) else str(contenu)
+                    for contenu in (getattr(exc, "stderr", None), getattr(exc, "stdout", None)) if contenu)
+                reseau = classer_echec_build(sortie_build)
+                if reseau is not None:
+                    retenue = {"imputation": reseau["imputation"], "cause": reseau["cause"], "service": None,
+                               "preuve": lancement.masquer_secrets(reseau["preuve"]), "services": {},
+                               # Rendu « sain » si le second build passe ; la
+                               # branche du second échec le réécrit.
+                               "reessai": {"motif": "panne réseau pendant le build", "resultat": "sain"}}
+                    self._cause_demarrage = retenue
+                    self.record_step(
+                        "Diagnostic des services non sains",
+                        command="sortie du build (bloc de l'étape en échec, `failed to solve`)",
+                        output=(f"cause retenue : reseau_build → imputation {retenue['imputation']}\n"
+                                f"{retenue['preuve']}\nle build est relancé une fois."),
+                        exit_code=2,
+                        duration=time.time() - debut,
+                    )
+                    self._etape_diagnostic = self.steps[-1]
+                    return True
+            causes, retenue = self._consigner_diagnostic(
+                releve, noms, "aucun service non sain relevé (le `up` a échoué avant ou sans "
+                              f"healthcheck) : {str(exc)[:300]}", time.time() - debut)
             if not noms or not all(c["reessayable"] for c in causes.values()):
                 return False
             return self._attendre_sante(noms, releve, retenue)
         except Exception as erreur:
             self.logger.warning(f"Diagnostic des services non sains impossible : {erreur}")
             return False
+
+    def _consigner_diagnostic(self, releve: dict, noms: list, vide: str, duree: float) -> tuple:
+        """Classer les services `noms` (logs, santé, healthcheck), consigner
+        l'étape « Diagnostic des services non sains » et retenir la cause :
+        (causes, retenue). Partagé par le `up` raté et la stack tombée après
+        un `up` réussi (461338)."""
+        causes, blocs = {}, []
+        for service in noms:
+            conteneur, attrs = releve[service]
+            try:
+                logs = conteneur.logs(tail=200).decode("utf-8", errors="replace")
+            except Exception as erreur:
+                logs = f"logs illisibles : {erreur}"
+            logs = diagnostic_demarrage.masquer_secrets(logs, attrs)
+            causes[service] = diagnostic_demarrage.classer_service(attrs, logs)
+            if causes[service]["cause"] == "reseau_sortant" and service in self._dns_retires:
+                causes[service]["preuve"] += (
+                    f" (la copie déclarait {_decrire_dns(self._dns_retires[service])} "
+                    "pour ce service ; retiré par le moteur)")
+            blocs.append(diagnostic_demarrage.decrire_service(service, attrs, logs, causes[service]))
+        retenue = diagnostic_demarrage.classer_demarrage(causes)
+        retenue["services"] = causes
+        retenue["reessai"] = None
+        self._cause_demarrage = retenue
+        sortie = (f"cause retenue : {retenue['cause']} ({retenue['service']}) → imputation "
+                  f"{retenue['imputation']}\n{retenue['preuve']}\n\n" + "\n\n".join(blocs))
+        if not noms:
+            sortie = vide
+        self.record_step(
+            "Diagnostic des services non sains",
+            command=("docker inspect (State, State.Health, Config.Healthcheck) et "
+                     "docker logs --tail 200 de chaque service non sain ou sorti "
+                     "(équivalent docker compose logs --no-color --tail 200 <service>)"),
+            output=sortie,
+            exit_code=2,
+            duration=duree,
+            note=("Imputation : « copie » = faute établie de la copie ; « non_mesure » = cause "
+                  "de notre côté, la copie n'a pas été mesurée ; « indetermine » = ni l'un ni "
+                  "l'autre n'est établi."),
+        )
+        self._etape_diagnostic = self.steps[-1]
+        return causes, retenue
 
     def _attendre_sante(self, noms: list, releve: dict, retenue: dict) -> bool:
         """Attendre que des services seulement lents deviennent sains.
@@ -3120,6 +3401,7 @@ class ComposeRunner(BaseRunner):
         # interpoler le fichier pour démonter la stack (469217). Les fichiers
         # produits par la recette (rapatriés) suivent la même règle.
         errors.extend(self._retirer_rapatries())
+        errors.extend(self._remettre_appledouble())
         for chemin in list(self._fichiers_harnais):
             try:
                 os.remove(chemin)
