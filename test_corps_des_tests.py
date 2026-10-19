@@ -219,3 +219,45 @@ def test_refus_bis():
     assert r.status_code not in (200, 201)
 '''
     assert bentoml_runner.corps_documentes_par_les_tests(tests) == []
+
+
+def test_469475_script_d_exemple_sous_tests():
+    corps_documentes_par_les_tests = bentoml_runner.corps_documentes_par_les_tests
+    """469475 : tests/example_request.py, script `if __name__ == '__main__'`
+    qui se connecte puis envoie le corps à /predict et lève sur une erreur
+    (`raise_for_status`). C'est la copie qui documente le corps."""
+    texte = '''
+import requests
+if __name__ == '__main__':
+    base = "http://127.0.0.1:3000"
+    login = requests.post(base + '/login', json={'username': 'u', 'password': 'p'}, timeout=30)
+    login.raise_for_status()
+    response = requests.post(base + '/predict', headers={},
+        json={'gre_score': 320, 'toefl_score': 110, 'university_rating': 4,
+              'sop': 4.0, 'lor': 4.5, 'cgpa': 9.0, 'research': 1}, timeout=30)
+    response.raise_for_status()
+'''
+    assert corps_documentes_par_les_tests(texte) == [{'gre_score': 320, 'toefl_score': 110, 'university_rating': 4,
+                                                      'sop': 4.0, 'lor': 4.5, 'cgpa': 9.0, 'research': 1}]
+
+
+def test_script_sans_verification_de_succes_ne_documente_rien():
+    corps_documentes_par_les_tests = bentoml_runner.corps_documentes_par_les_tests
+    texte = '''
+import requests
+if __name__ == '__main__':
+    requests.post("http://x/predict", json={'gre_score': 0})
+'''
+    assert corps_documentes_par_les_tests(texte) == []
+
+
+def test_raise_for_status_sous_pytest_raises_attend_un_refus():
+    texte = '''
+import pytest, requests
+def test_predict_invalide():
+    r = requests.post("http://x/predict", json={'gre_score': 320, 'toefl_score': 110, 'university_rating': 4,
+                      'sop': 4.0, 'lor': 4.5, 'cgpa': 9.0, 'research': 1})
+    with pytest.raises(requests.HTTPError):
+        r.raise_for_status()
+'''
+    assert bentoml_runner.corps_documentes_par_les_tests(texte) == []

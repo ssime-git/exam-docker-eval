@@ -331,6 +331,15 @@ def _attend_un_succes(fonction: ast.AST) -> bool:
     return False
 
 
+def _leve_sur_erreur(bloc: ast.AST) -> bool:
+    """Le bloc appelle-t-il `.raise_for_status()` (requests, httpx) hors
+    d'un `pytest.raises`, qui attendrait justement l'erreur ?"""
+    if any(isinstance(n, ast.Attribute) and n.attr == "raises" for n in ast.walk(bloc)):
+        return False
+    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "raise_for_status"
+               for n in ast.walk(bloc))
+
+
 def _vise_predict(appel: ast.Call) -> bool:
     """Le premier argument de l'appel désigne-t-il la route /predict ?"""
     if not appel.args:
@@ -362,8 +371,16 @@ def corps_documentes_par_les_tests(texte: str) -> list:
             except (ValueError, TypeError, SyntaxError, RecursionError):
                 continue
     corps_lus = []
-    for fonction in ast.walk(arbre):
-        if not isinstance(fonction, (ast.FunctionDef, ast.AsyncFunctionDef)) or not _attend_un_succes(fonction):
+    # Un test, ou le bloc `if __name__ == "__main__"` d'un script d'exemple
+    # livré sous tests/ (469475 : tests/example_request.py, qui vérifie par
+    # `raise_for_status()`).
+    def script_principal(noeud):
+        return (isinstance(noeud, ast.If) and isinstance(noeud.test, ast.Compare)
+                and isinstance(noeud.test.left, ast.Name) and noeud.test.left.id == "__name__")
+    blocs = [n for n in ast.walk(arbre) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    blocs += [n for n in arbre.body if script_principal(n)]
+    for fonction in blocs:
+        if not (_attend_un_succes(fonction) or _leve_sur_erreur(fonction)):
             continue
         for appel in ast.walk(fonction):
             if not (isinstance(appel, ast.Call) and isinstance(appel.func, ast.Attribute)
@@ -794,6 +811,93 @@ def identifiants_du_login(corps, profondeur: int = 0) -> Optional[dict]:
     return None
 
 
+_ARCHIVE_D_IMAGE = re.compile(r"\.(?:tar|tar\.gz|tgz)$", re.I)
+# Options de `docker run` suivies d'une valeur : à sauter pour trouver l'image.
+_OPTIONS_RUN_A_VALEUR = {
+    "-p", "--publish", "-e", "--env", "--env-file", "--name", "-v", "--volume", "--mount", "--network", "--net",
+    "-w", "--workdir", "-u", "--user", "--entrypoint", "--platform", "-m", "--memory", "--cpus", "--restart",
+    "-h", "--hostname", "-l", "--label", "--add-host", "--gpus", "--shm-size", "--pull", "--dns",
+}
+
+
+def _commandes_du_readme(readme: str) -> list:
+    """Lignes du README, continuations `\\` jointes, accents graves retirés."""
+    texte = re.sub(r"\\\r?\n", " ", readme).replace("`", "\n")
+    return [l.strip() for l in texte.splitlines() if l.strip()]
+
+
+def _sans_tag(image: str) -> str:
+    nom = re.sub(r"^docker\.io/(?:library/)?", "", image.split("@")[0])
+    return re.sub(r":[^/:]+$", "", nom)
+
+
+def images_lancees_par_le_readme(readme: str) -> list:
+    """Les images que lancent les `docker run` du README, options sautées."""
+    images = []
+    for ligne in _commandes_du_readme(readme):
+        m = re.match(r"^(?:\$\s*)?(?:sudo\s+)?docker\s+(?:container\s+)?run\b(.*)$", ligne)
+        if not m:
+            continue
+        jetons = m.group(1).split()
+        i = 0
+        while i < len(jetons):
+            jeton = jetons[i]
+            if jeton.startswith("-"):
+                if "=" not in jeton and jeton in _OPTIONS_RUN_A_VALEUR:
+                    i += 1
+                i += 1
+                continue
+            images.append(jeton.strip("'\""))
+            break
+    return images
+
+
+def instruction_de_recuperation(readme: str) -> Optional[dict]:
+    """L'instruction du README qui récupère l'image quand l'archive n'est pas
+    livrée : un `docker pull` de l'image que le README lance (sans `docker
+    run`, une image d'un espace de noms : pas `python:3.11`), ou l'URL d'une
+    archive d'image (chemin en .tar/.tar.gz/.tgz, ou `curl`/`wget` qui écrit
+    un tel fichier). Le `curl` d'un CSV (462649) n'en est pas une."""
+    lignes = _commandes_du_readme(readme)
+    lancees = {_sans_tag(i) for i in images_lancees_par_le_readme(readme)}
+    for ligne in lignes:
+        m = re.match(r"^(?:\$\s*)?(?:sudo\s+)?docker\s+(?:image\s+)?pull\s+(?:--?\S+\s+)*([^\s'\"]+)", ligne)
+        if not m:
+            continue
+        ref = m.group(1)
+        if (lancees and _sans_tag(ref) in lancees) or (not lancees and "/" in ref):
+            return {"type": "registre", "ref": ref, "ligne": ligne}
+    for ligne in lignes:
+        for m in re.finditer(r"https?://[^\s'\"<>()\[\]]+", ligne):
+            url = m.group(0).rstrip(".,;")
+            sortie_tar = re.search(r"\b(?:curl|wget)\b", ligne) and re.search(
+                r"(?:^|\s)(?:-o|-O|--output|--output-document)[\s=]+['\"]?[^\s'\"]+\.(?:tar|tar\.gz|tgz)\b", ligne)
+            if _ARCHIVE_D_IMAGE.search(urlparse(url).path) or sortie_tar:
+                return {"type": "url", "url": url, "ligne": ligne}
+    return None
+
+
+def ligne_d_image_citee(readme: str) -> Optional[str]:
+    """La commande du README qui charge l'image (`docker load -i …`), citée
+    telle quelle pour dire ce qui manque."""
+    for ligne in _commandes_du_readme(readme):
+        if re.match(r"^(?:\$\s*)?(?:sudo\s+)?docker\s+(?:image\s+)?load\b", ligne):
+            return re.sub(r"^\$\s*", "", ligne)
+    return None
+
+
+# Routes que BentoML sert de lui-même : elles ne disent rien de l'API livrée.
+_ROUTES_DE_BENTOML = {"/", "/docs", "/docs.json", "/readyz", "/livez", "/healthz", "/metrics", "/schema.json"}
+
+
+def routes_de_l_openapi(document) -> list:
+    """Chemins POST/GET d'un document OpenAPI, hors routes de BentoML."""
+    chemins = (document or {}).get("paths") if isinstance(document, dict) else None
+    if not isinstance(chemins, dict):
+        return []
+    return sorted(c for c in chemins if isinstance(c, str) and c not in _ROUTES_DE_BENTOML)[:30]
+
+
 def tags_du_tar(chemin: str) -> list:
     """RepoTags d'une archive `docker save` (manifest.json), sinon noms
     d'image de l'index OCI. Lecture des seuls fichiers d'index : les tars
@@ -900,6 +1004,16 @@ class BentoMLRunner(BaseRunner):
         self.container_name = f"bentoml_eval_{student_name}".replace(" ", "_").lower()
 
     def run_evaluation(self) -> Dict[str, Any]:
+        """Évaluation, plus ce que le rendu dit de son image (462649) sur
+        tous les chemins de retour."""
+        self._recuperation = None
+        resultat = self._evaluer()
+        if isinstance(resultat, dict):
+            for cle, valeur in self._champs_image_absente().items():
+                resultat.setdefault(cle, valeur)
+        return resultat
+
+    def _evaluer(self) -> Dict[str, Any]:
         """
         Execute BentoML evaluation.
 
@@ -942,8 +1056,13 @@ class BentoMLRunner(BaseRunner):
                 resultat.setdefault("steps", self.steps)
                 return resultat
 
-            # Step 1: Load Docker image or auto-containerize .bento
-            if self.image_tar:
+            # Step 1: Load Docker image or auto-containerize .bento. Sans
+            # archive livrée, l'instruction de récupération du README d'abord.
+            recuperee = None if self.image_tar else self._recuperer_image_absente()
+            if recuperee:
+                self.image_name = recuperee
+                image_loaded = True
+            elif self.image_tar:
                 self.logger.info(f"Loading Docker image from {self.image_tar}")
                 self.image_name = self._load_docker_image()
                 self.record_exam_image(self.image_name)
@@ -1326,6 +1445,133 @@ class BentoMLRunner(BaseRunner):
                 # Distinct d'image_loaded : l'image n'a pas été livrée, nous
                 # l'avons construite depuis la source du rendu.
                 "image_construite_par_le_correcteur": bool(getattr(self, "_image_construite", False))}
+
+    def _routes_declarees(self, base_url: str) -> list:
+        """Chemins de l'OpenAPI que sert le service (/openapi.json, celui de
+        BentoML et de FastAPI), vide s'il n'en sert pas."""
+        try:
+            reponse = requests.get(f"{base_url}/openapi.json", timeout=self._http_timeout(10))
+            if reponse.status_code == 200:
+                return routes_de_l_openapi(reponse.json())
+        except Exception as erreur:
+            self.logger.info(f"OpenAPI illisible : {type(erreur).__name__}")
+        return []
+
+    def _readme_du_rendu(self) -> str:
+        """Le premier README du rendu qui parle de l'image (docker load, pull
+        ou run), sinon le premier README ; vide sans README."""
+        trouves = []
+        for dossier, sous, fichiers in os.walk(self.eval_dir):
+            profondeur = os.path.relpath(dossier, self.eval_dir).count(os.sep)
+            sous[:] = sorted(d for d in sous if not d.startswith(".") and d not in ("__MACOSX", "node_modules", "venv"))
+            if profondeur > 2:
+                sous[:] = []
+            for nom in sorted(fichiers):
+                if not nom.startswith("._") and re.match(r"^readme(?:\.[a-z]+)?$", nom, re.I):
+                    try:
+                        with open(os.path.join(dossier, nom), encoding="utf-8", errors="replace") as f:
+                            trouves.append(f.read())
+                    except OSError:
+                        pass
+        parle = [t for t in trouves if re.search(r"docker\s+(?:image\s+)?(?:load|pull)|docker\s+run", t)]
+        return (parle or trouves or [""])[0]
+
+    def _recuperer_image_absente(self) -> Optional[str]:
+        """Sans archive d'image livrée, suivre l'instruction de récupération
+        du README (docker pull ou téléchargement de l'archive) : ce n'est pas
+        une réparation, c'est ce que la copie demande de faire. Rend l'image
+        à lancer, ou None (pas d'instruction, ou instruction en échec)."""
+        readme = self._readme_du_rendu()
+        instruction = instruction_de_recuperation(readme)
+        self._recuperation = {"instruction": instruction, "citee": ligne_d_image_citee(readme),
+                              "source": None, "erreur": None}
+        if not instruction:
+            return None
+        image = None
+        try:
+            if instruction["type"] == "registre":
+                image = self._recuperer_par_pull(instruction["ref"])
+            else:
+                image = self._recuperer_par_url(instruction["url"])
+        except Exception as erreur:  # pragma: no cover - filet
+            self._recuperation["erreur"] = str(erreur)[:500]
+        if image:
+            self._recuperation["source"] = instruction["type"]
+            self.record_step(
+                "Récupérer l'image comme le README l'indique",
+                command=instruction["ligne"],
+                output=f"Image récupérée : {image}",
+                note="L'archive ne contenait pas d'image Docker ; le README dit où la récupérer.",
+            )
+        else:
+            self.record_step(
+                "Récupérer l'image comme le README l'indique",
+                command=instruction["ligne"],
+                output=self._recuperation["erreur"] or "échec",
+                exit_code=1,
+                note="L'archive ne contenait pas d'image Docker et l'instruction du README n'a pas abouti.",
+            )
+        return image
+
+    def _recuperer_par_pull(self, ref: str) -> Optional[str]:
+        with verrou_images():
+            # Une image déjà sur la machine n'est pas la nôtre : son tag
+            # partagé ne doit pas être retiré au ménage.
+            deja_la = subprocess.run(["docker", "image", "inspect", ref],
+                                     capture_output=True, text=True, timeout=60).returncode == 0
+            tire = subprocess.run(["docker", "pull", ref], capture_output=True, text=True, timeout=900)
+            if tire.returncode != 0:
+                self._recuperation["erreur"] = ((tire.stderr or "") + (tire.stdout or "")).strip()[:500]
+                return None
+            image = self.adopter_image(ref)
+            if deja_la:
+                getattr(self, "_tags_partages", {}).pop(ref, None)
+        self._image_tags = [ref]
+        self._images_chargees = [ref]
+        return image
+
+    def _recuperer_par_url(self, url: str) -> Optional[str]:
+        # Téléchargé hors de la copie : rien de ce que nous déposons ne doit
+        # passer pour livré.
+        dossier = tempfile.mkdtemp(prefix=f"image_{self.student_name}_")
+        chemin = os.path.join(dossier, "image.tar")
+        try:
+            with requests.get(url, stream=True, timeout=60, allow_redirects=True) as reponse:
+                if reponse.status_code != 200:
+                    self._recuperation["erreur"] = f"HTTP {reponse.status_code} sur {url}"
+                    return None
+                taille = 0
+                with open(chemin, "wb") as f:
+                    for bloc in reponse.iter_content(1 << 20):
+                        taille += len(bloc)
+                        if taille > 8 << 30:
+                            self._recuperation["erreur"] = "archive de plus de 8 Go, téléchargement interrompu"
+                            return None
+                        f.write(bloc)
+            self.image_tar = chemin
+            self._image_tags = tags_du_tar(chemin)
+            image = self._load_docker_image_cli()
+            if not image:
+                self._recuperation["erreur"] = (getattr(self, "_erreur_chargement", "") or "docker load sans image")[:500]
+            return image
+        finally:
+            self.image_tar = None
+            shutil.rmtree(dossier, ignore_errors=True)
+
+    def _champs_image_absente(self) -> Dict[str, Any]:
+        """image_absente, instruction_recuperation (null sans instruction),
+        image_source (registre|url, null sinon), readme_image_citee."""
+        recuperation = getattr(self, "_recuperation", None)
+        if recuperation is None:
+            return {"image_absente": False if self.image_tar else None,
+                    "instruction_recuperation": None, "image_source": None, "readme_image_citee": None}
+        champs = {"image_absente": recuperation["source"] is None,
+                  "instruction_recuperation": recuperation["instruction"],
+                  "image_source": recuperation["source"],
+                  "readme_image_citee": recuperation["citee"]}
+        if recuperation["erreur"]:
+            champs["recuperation_erreur"] = recuperation["erreur"]
+        return champs
 
     def _run_image_only_evaluation(self) -> Dict[str, Any]:
         """
@@ -2072,6 +2318,13 @@ class BentoMLRunner(BaseRunner):
                 "Login failed for all supported payload variants (status codes: %s)",
                 results["login_attempt_statuses"],
             )
+            # Tout en 404 : la route n'existe pas (464154 sert /login_service).
+            # Ce n'est pas un refus des identifiants ; les routes que le
+            # service déclare disent ce qu'il expose à la place.
+            statuts = results["login_attempt_statuses"]
+            if statuts and all(code == 404 for code in statuts):
+                results["login_introuvable"] = True
+                results["routes_declarees"] = self._routes_declarees(base_url)
 
         # Test 2: Predict endpoint (requires token), reusing the discovered wrapper when possible.
         if acces:
