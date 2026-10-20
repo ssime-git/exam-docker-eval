@@ -668,6 +668,8 @@ class BentoCompiledRunner(BaseRunner):
         Args:
             force: If True, force cleanup even if errors occur
         """
+        from .agent_hook import avant_demontage
+        avant_demontage(self, [self.container_name])
         if self.container:
             try:
                 self.container.stop()

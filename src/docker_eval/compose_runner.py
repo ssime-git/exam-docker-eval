@@ -1256,6 +1256,10 @@ class ComposeRunner(BaseRunner):
 
                     # Capture logs before cleanup
                     self.logger.info("Capturing container logs...")
+                    # Proto agent unique : la stack est encore debout ici ; après la sortie
+                    # du `with self.compose`, testcontainers l'a déjà arrêtée.
+                    from .agent_hook import avant_demontage
+                    avant_demontage(self, self._noms_pour_agent())
                     logs = self._capture_logs()
 
                     # Evaluate result
@@ -1534,7 +1538,8 @@ class ComposeRunner(BaseRunner):
         # échec (étape non annotée « attendu ») mérite un debug actif. Après
         # le teardown, plus rien n'est testable.
         echecs = [s for s in self.steps if s.get("exit_code") not in (0, None)]
-        if echecs:
+        # Proto agent unique : l'agent du crochet remplace l'investigateur.
+        if echecs and not os.environ.get("EXAM_AGENT_HOOK"):
             from .investigator import Investigator
             enqueteur = Investigator(self, self.eval_dir, list(etats.keys()))
             if enqueteur.disponible():
@@ -1551,6 +1556,10 @@ class ComposeRunner(BaseRunner):
                            "(LIORA_GATEWAY_URL/LIORA_API_KEY ou PI_CORRECTOR_INVESTIGATE_*)",
                     exit_code=0,
                 )
+        # Proto agent unique : la stack est encore debout ici ; après la sortie
+        # du `with self.compose`, testcontainers l'a déjà arrêtée.
+        from .agent_hook import avant_demontage
+        avant_demontage(self, self._noms_pour_agent())
         logs = self._capture_logs()
         resultat = {
             "success": succes,
@@ -3373,6 +3382,8 @@ class ComposeRunner(BaseRunner):
         Args:
             force: If True, ignore errors and force cleanup
         """
+        from .agent_hook import avant_demontage
+        avant_demontage(self, self._noms_pour_agent())
         started = time.time()
         errors = []
         if self.compose:
@@ -3438,6 +3449,13 @@ class ComposeRunner(BaseRunner):
                     self.record_exam_image(image)
         except Exception as erreur:
             self.logger.debug(f"images non recensées : {erreur}")
+
+    def _noms_pour_agent(self) -> list:
+        try:
+            return [c.name for c in self._conteneurs_du_projet()]
+        except Exception as erreur:
+            self.logger.warning(f"[agent-hook] conteneurs illisibles : {erreur}")
+            return []
 
     def _force_cleanup_docker_resources(self):
         """Supprimer les ressources portant les labels Compose réellement vus.
