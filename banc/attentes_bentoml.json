@@ -1079,9 +1079,9 @@
     },
     {
      "champ": "login_passed",
-     "confiance": "a_confirmer",
-     "attendu": false,
-     "pourquoi": "404 : route absente ou préfixe que le moteur ne trouve pas ?"
+     "confiance": "sure",
+     "attendu": true,
+     "pourquoi": "routes renommées /login_service et /predict_service, rejouées par le moteur (21/10) ; /predict_service plante réellement (src/service.py:117)"
     },
     {
      "champ": "identifiants_dans_la_copie",
