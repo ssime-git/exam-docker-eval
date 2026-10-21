@@ -77,7 +77,6 @@ def test_mode_image_seule_remonte_la_source_des_identifiants(tmp_path, monkeypat
 
     runner._run_api_tests = api
     runner._run_pytest = lambda url: {"executed": False}
-    runner._investiguer_echecs = lambda: None
     runner.cleanup = lambda force=False: None
     resultat = runner._run_image_only_evaluation()
     assert resultat["credentials_source"] == "README.md"
