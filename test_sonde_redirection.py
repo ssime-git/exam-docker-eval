@@ -20,7 +20,6 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from docker_eval.compose_runner import ComposeRunner
-from docker_eval.investigator import Investigator
 from docker_eval.sonde_http import SAUTS_MAX, sonder
 
 
@@ -142,8 +141,6 @@ def test_etape_racine_redirection_active_n_est_pas_une_panne(serveur, tmp_path, 
     runner = ComposeRunner("copie-test", str(tmp_path), 1, logging.getLogger("sonde"))
     monkeypatch.setattr(runner, "_conteneurs_du_projet", lambda: [_Conteneur(serveur)])
     monkeypatch.setattr(runner, "_capture_logs", lambda: "logs")
-    investigations = []
-    monkeypatch.setattr(Investigator, "investiguer", lambda self, echecs: investigations.append(echecs))
 
     resultat = runner._evaluer_services_persistants()
 
@@ -156,7 +153,6 @@ def test_etape_racine_redirection_active_n_est_pas_une_panne(serveur, tmp_path, 
     assert sonde["code"] == 301 and sonde["redirection_active"] is True
     https_ = next(s for s in resultat["steps"] if s["title"] == f"Sonde https://127.0.0.1:{serveur}/")
     assert https_["exit_code"] == 0
-    assert investigations == []
 
 
 def test_chemin_declare_qui_redirige_garde_son_200(serveur, tmp_path, monkeypatch):
@@ -180,15 +176,3 @@ def test_chemin_declare_qui_redirige_garde_son_200(serveur, tmp_path, monkeypatc
     etape = next(s for s in runner.steps if s["title"] == f"Sonde https://127.0.0.1:{serveur}/api")
     assert etape["exit_code"] == 0
     assert etape["output"].startswith("code 200 : 301 → /ok/api/ puis 200")
-
-
-def test_investigateur(serveur, tmp_path):
-    class RunnerFactice:
-        steps = []
-
-    inv = Investigator(RunnerFactice(), str(tmp_path), services=["copie-nginx-1"])
-
-    assert inv._sonde(f"http://127.0.0.1:{serveur}/").startswith(
-        f"code 301 → {CIBLE_INJOIGNABLE} : redirection active (cible non joignable")
-    assert inv._sonde(f"http://127.0.0.1:{serveur}/vers-ok") == "code 200 : 301 → /ok puis 200\nbonjour"
-    assert inv._sonde(f"http://127.0.0.1:{serveur}/ok") == "code 200\nbonjour"

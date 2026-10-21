@@ -443,7 +443,6 @@ def runner_461338(tmp_path, monkeypatch, datee_saine=True, logs=LOGS_461338, bui
     monkeypatch.setattr(runner, "_sonder_ports_publies", lambda: [])
     monkeypatch.setattr(runner, "_capture_logs", lambda: "")
     monkeypatch.delenv("LIORA_GATEWAY_URL", raising=False)
-    monkeypatch.delenv("PI_CORRECTOR_INVESTIGATE_URL", raising=False)
     return runner, lances
 
 
