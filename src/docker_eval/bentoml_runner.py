@@ -1012,6 +1012,44 @@ def _alterer(valeur: str) -> str:
     return valeur[:-4] + ("AAAA" if not valeur.endswith("AAAA") else "BBBB")
 
 
+
+
+def derniere_exception(journaux: str) -> dict:
+    """La dernière exception d'une trace Python dans les journaux du service :
+    {"lieu": "src/service.py:117", "fonction": …, "message": …}, le cadre
+    retenu étant le dernier hors bibliothèques. Vide sans trace."""
+    lignes = (journaux or "").splitlines()
+    debuts = [i for i, l in enumerate(lignes) if l.strip().startswith("Traceback (most recent call last)")]
+    if not debuts:
+        return {}
+    bloc = lignes[debuts[-1] + 1:]
+    cadres = [m for m in (re.match(r'\s*File "([^"]+)", line (\d+), in (\S+)', l) for l in bloc) if m]
+    copie = [m for m in cadres if not re.search(r"site-packages|dist-packages|/usr/lib/|<frozen", m.group(1))]
+    cadre = (copie or cadres or [None])[-1]
+    message = next((l.strip() for l in bloc if re.match(r"^[A-Za-z_][\w.]*(Error|Exception|Exit)\b.*", l.strip())), "")
+    if not cadre and not message:
+        return {}
+    resultat = {"message": message[:300]}
+    if cadre:
+        chemin = cadre.group(1)
+        # Chemin vu depuis la copie : `/home/bentoml/bento/src/src/service.py` → `src/service.py`.
+        m = re.search(r"(src/.+|[^/]+\.py)$", chemin.split("/bento/src/")[-1])
+        resultat.update({"lieu": f"{m.group(1) if m else chemin}:{cadre.group(2)}", "fonction": cadre.group(3)})
+    return resultat
+
+def routes_renommees(declarees: list) -> dict:
+    """{route de l'énoncé: route déclarée} quand la copie expose une seule
+    route de connexion et une seule de prédiction sous un autre nom
+    (`/login_service`, `/predict_service`). Vide si c'est ambigu."""
+    def unique(motif):
+        trouvees = [r for r in declarees if re.search(motif, r, re.I)]
+        return trouvees[0] if len(trouvees) == 1 else None
+    login = unique(r"login|auth|token")
+    predict = unique(r"predict")
+    if not login or not predict or (login, predict) == ("/login", "/predict"):
+        return {}
+    return {"/login": login, "/predict": predict}
+
 class BentoMLRunner(BaseRunner):
     """
     Runner for BentoML evaluations.
@@ -1489,6 +1527,11 @@ class BentoMLRunner(BaseRunner):
                 # Distinct d'image_loaded : l'image n'a pas été livrée, nous
                 # l'avons construite depuis la source du rendu.
                 "image_construite_par_le_correcteur": bool(getattr(self, "_image_construite", False))}
+
+    def _route(self, attendue: str) -> str:
+        """La route à appeler : celle de l'énoncé, ou son équivalent déclaré
+        par la copie quand elle l'a renommée."""
+        return (getattr(self, "_routes", None) or {}).get(attendue, attendue)
 
     def _routes_declarees(self, base_url: str) -> list:
         """Chemins de l'OpenAPI que sert le service : /docs.json pour
@@ -2330,7 +2373,7 @@ class BentoMLRunner(BaseRunner):
             try:
                 self.logger.info("Testing /login endpoint with adaptive payload...")
                 login_response = requests.post(
-                    f"{base_url}/login",
+                    f"{base_url}{self._route('/login')}",
                     json=payload,
                     timeout=self._http_timeout(10),
                 )
@@ -2372,6 +2415,18 @@ class BentoMLRunner(BaseRunner):
             if statuts and all(code == 404 for code in statuts):
                 results["login_introuvable"] = True
                 results["routes_declarees"] = self._routes_declarees(base_url)
+                # Routes renommées (464154 : /login_service, /predict_service) :
+                # on rejoue tout sur les routes que le service déclare. Le
+                # nommage est une consigne, le fonctionnement se mesure ; le
+                # barème décide de ce que coûte l'écart.
+                renommees = routes_renommees(results["routes_declarees"])
+                if renommees and not getattr(self, "_routes", None):
+                    self._routes = renommees
+                    self.logger.info(f"Routes renommées par la copie : {renommees} ; tests rejoués dessus")
+                    rejoue = self._run_api_tests(base_url)
+                    rejoue["routes_renommees"] = renommees
+                    rejoue["routes_declarees"] = results["routes_declarees"]
+                    return rejoue
 
         # Test 2: Predict endpoint (requires token), reusing the discovered wrapper when possible.
         if acces:
@@ -2420,7 +2475,7 @@ class BentoMLRunner(BaseRunner):
                     try:
                         self.logger.info("Testing /predict endpoint with adaptive payload...")
                         predict_response = requests.post(
-                            f"{base_url}/predict",
+                            f"{base_url}{self._route('/predict')}",
                             json=body,
                             headers=headers,
                             timeout=self._http_timeout(10),
@@ -2459,6 +2514,13 @@ class BentoMLRunner(BaseRunner):
                     "Predict failed for all supported payload variants (status codes: %s)",
                     results["predict_attempt_statuses"],
                 )
+                # 5xx : l'exception est dans les journaux du service (464154 :
+                # `src/service.py:117`, AttributeError). Elle dit à l'apprenant
+                # où regarder ; sans elle, « 500 » ne guide personne.
+                if any(isinstance(c, int) and c >= 500 for c in results["predict_attempt_statuses"]):
+                    exception = derniere_exception(self._capture_container_logs())
+                    if exception:
+                        results["predict_exception"] = exception
             self.logger.info(f"Corps /predict : provenance {results.get('corps_source', 'devine')}")
 
         # Overall result
@@ -2566,10 +2628,10 @@ class BentoMLRunner(BaseRunner):
             return r.status_code
 
         securite = {
-            "predict_sans_token": sonde("predict_sans_token", "/predict", corps_sans, sans_auth),
-            "predict_token_falsifie": sonde("predict_token_falsifie", "/predict", corps_falsifie,
+            "predict_sans_token": sonde("predict_sans_token", self._route("/predict"), corps_sans, sans_auth),
+            "predict_token_falsifie": sonde("predict_token_falsifie", self._route("/predict"), corps_falsifie,
                                             entetes_falsifies),
-            "login_mauvais_identifiants": sonde("login_mauvais_identifiants", "/login", mauvais_login, {}),
+            "login_mauvais_identifiants": sonde("login_mauvais_identifiants", self._route("/login"), mauvais_login, {}),
             "mecanisme": mecanisme,
         }
         if refus_dans_un_200:
@@ -2583,7 +2645,7 @@ class BentoMLRunner(BaseRunner):
         profil = "nominal"
         median = appliquer_profil_median(corps)
         if median != corps:
-            r = requete("POST", "/predict", json=median, headers=entetes)
+            r = requete("POST", self._route("/predict"), json=median, headers=entetes)
             if not isinstance(r, str) and r.status_code == 200:
                 try:
                     valeur_mediane = lire_prediction(r.json())
@@ -2597,7 +2659,7 @@ class BentoMLRunner(BaseRunner):
             profil = "median"
         contrat = {
             "prediction": prediction,
-            "predict_entree_invalide": code("POST", "/predict", json=invalide, headers=entetes),
+            "predict_entree_invalide": code("POST", self._route("/predict"), json=invalide, headers=entetes),
         }
         self.record_step(
             "Sondes de sécurité et de contrat",
