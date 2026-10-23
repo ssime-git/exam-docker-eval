@@ -14,6 +14,7 @@ import os
 import sys
 import types
 
+import pytest
 import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
@@ -45,6 +46,22 @@ POST /predict,
 
 CORPS_468775 = {"input_data": {"gre_score": 320, "toefl_score": 110, "university_rating": 4,
                                "sop": 4.0, "lor": 4.0, "cgpa": 9.0, "research": 1}}
+
+# 470758 : la mention de /predict dans le tableau précède le curl du LOGIN.
+# La recherche sur 300 caractères prenait ses credentials pour une prédiction.
+README_CURL = r'''| Endpoint | Description |
+| POST /login | JWT |
+| POST /predict | Prédiction |
+
+TOKEN=$(curl -s -X POST http://localhost:3000/login \
+  -H "Content-Type: application/json" \
+  -d '{"credentials":{"username":"user123","password":"password123"}}')
+
+curl -s -X POST http://localhost:3000/predict \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"input_data":{"gre_score":320,"toefl_score":110,"university_rating":4,"sop":4.0,"lor":4.0,"cgpa":9.0,"research":1}}'
+'''
 
 
 def ecrire(chemin, contenu=""):
@@ -152,6 +169,50 @@ def test_corps_curl_toujours_lu_et_source_readme(tmp_path):
     assert contrat["predict_bodies"][0] == {"gre_score": 337, "cgpa": 9.65}
     assert source_du_corps(contrat, contrat["predict_bodies"][0]) == "readme"
     assert source_du_corps(contrat, contrat["predict_bodies"][-1]) == "devine"
+
+
+def test_470758_tableau_predict_ne_capture_pas_le_curl_login(tmp_path):
+    contrat = runner_sur(tmp_path, README_CURL)._discover_api_contract()
+    assert contrat["predict_bodies"][0] == CORPS_468775
+    assert all("credentials" not in corps for corps in contrat["predict_bodies"])
+    assert source_du_corps(contrat, CORPS_468775) == "readme"
+
+
+def test_470758_sondes_predict_securite_et_contrat(tmp_path, monkeypatch):
+    post, request = service_double(lambda corps: corps == CORPS_468775)
+    brancher(monkeypatch, post, request)
+    resultats = runner_sur(tmp_path, README_CURL)._run_api_tests("http://localhost:32770")
+    assert resultats["predict_passed"], resultats
+    assert resultats["predict_attempt_statuses"] == [200]
+    assert resultats["corps_source"] == "readme"
+    assert resultats["securite"]["predict_sans_token"] == 401
+    assert resultats["contrat"]["prediction"] == 0.72
+
+
+@pytest.mark.parametrize("commande", [
+    "curl -d '{\"gre_score\":337}' http://localhost:3000/predict",
+    'curl http://localhost:3000/predict --data "{\\"gre_score\\":337}"',
+    "curl --url http://localhost:3000/predict --data-raw='{\"gre_score\":337}'",
+    "curl /predict --json '{\"gre_score\":337}'",
+    "curl /predict -d '{\n  \"gre_score\":337\n}'",
+    "Exemple : `curl /predict -d '{\"gre_score\":337}'`",
+    "curl /predict -H 'X-Description: " + "x" * 400 + "' -d '{\"gre_score\":337}'",
+    "curl /login -d '{}' ; curl /predict -d '{\"gre_score\":337}'",
+])
+def test_corps_curl_associe_a_la_route_quel_que_soit_l_ordre(tmp_path, commande):
+    contrat = runner_sur(tmp_path, commande)._discover_api_contract()
+    assert contrat["predict_bodies"][0] == {"gre_score": 337}
+
+
+@pytest.mark.parametrize("commande", [
+    "POST /predict\ncurl /login -d '{\"credentials\":{\"username\":\"x\"}}'",
+    "curl /predict\ncurl /login -d '{\"credentials\":{\"username\":\"x\"}}'",
+    "curl /predict ; curl /login -d '{\"credentials\":{\"username\":\"x\"}}'",
+    "curl /predict-doc -d '{\"credentials\":{\"username\":\"x\"}}'",
+])
+def test_aucun_corps_emprunte_a_une_autre_commande(tmp_path, commande):
+    contrat = runner_sur(tmp_path, commande)._discover_api_contract()
+    assert all("credentials" not in corps for corps in contrat["predict_bodies"])
 
 
 def test_corps_reconstruit_depuis_le_service_n_est_pas_documente(tmp_path):
