@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import socket
 import tarfile
@@ -282,6 +283,45 @@ def _provenance_documentee(chemin: str) -> str:
 _LIBELLE_CORPS = re.compile(
     r"\b(?:request\s+body|body|payload|json|corps|requête|request|input)\s*[:=]\s*", re.I)
 _ROUTE_SUIVANTE = re.compile(r"\b(?:POST|GET|PUT|PATCH|DELETE)\s+/|/login\b", re.I)
+
+
+def corps_curl_predict(texte: str):
+    """JSON de la commande curl qui cible /predict, jamais du login voisin.
+
+    Les continuations et les JSON entre guillemets peuvent être multilignes.
+    On lit les arguments sans exécuter la commande ; une fin de commande
+    hors guillemets arrête la lecture, même s'il n'y avait aucun corps.
+    """
+    texte = re.sub(r"\\\r?\n", " ", texte).replace("`", "\n")
+    for debut in re.finditer(r"\bcurl\s", texte):
+        lecture = shlex.shlex(texte[debut.start():], posix=True, punctuation_chars=";&|()\n")
+        lecture.whitespace = " \t\r"
+        lecture.whitespace_split = True
+        arguments = []
+        try:
+            for argument in lecture:
+                if set(argument) <= set(";&|()\n"):
+                    break
+                arguments.append(argument)
+        except ValueError:
+            continue  # Citation incomplète : aucun contrat établi.
+        if not any(urlparse(a).path.rstrip("/") == "/predict" for a in arguments[1:]):
+            continue
+        for i, argument in enumerate(arguments[1:], 1):
+            if argument in ("-d", "--data", "--data-raw", "--data-binary", "--json"):
+                valeur = arguments[i + 1] if i + 1 < len(arguments) else ""
+            elif re.match(r"^--(?:data|data-raw|data-binary|json)=", argument):
+                valeur = argument.split("=", 1)[1]
+            elif argument.startswith("-d"):
+                valeur = argument[2:]
+            else:
+                continue
+            try:
+                corps = json.loads(valeur)
+            except ValueError:
+                continue
+            if isinstance(corps, dict) and corps:
+                yield corps
 
 
 def corps_en_ligne_apres_predict(texte: str):
@@ -2194,13 +2234,7 @@ class BentoMLRunner(BaseRunner):
             self.logger.info(f"Payload /predict lu dans {source_path}")
 
         for source_path, text in texts:
-            for bloc in re.findall(
-                r"/predict[\s\S]{0,300}?-d\s+'(\{[\s\S]*?\})'", text
-            ):
-                try:
-                    corps = json.loads(bloc)
-                except ValueError:
-                    continue
+            for corps in corps_curl_predict(text):
                 # Un corps enveloppe (ex. {"request": {...}}) porte aussi le
                 # nom du wrapper.
                 if isinstance(corps, dict) and corps:
