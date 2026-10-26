@@ -408,10 +408,30 @@ def corps_documentes_par_les_tests(texte: str) -> list:
     except (SyntaxError, ValueError):
         return []
     constantes = {}
+
+    def lire_litteral(expression):
+        # 471639 : json={"input_data": FEATURES}. literal_eval seul
+        # refuse ce Name, même si FEATURES est un littéral du module.
+        # Résoudre uniquement les noms déjà lus, y compris dans les
+        # conteneurs ; aucun appel, attribut ou code de la copie ne tourne.
+        if isinstance(expression, ast.Name):
+            if expression.id not in constantes:
+                raise ValueError("constante inconnue")
+            return constantes[expression.id]
+        if isinstance(expression, ast.Dict):
+            if any(cle is None for cle in expression.keys):
+                raise ValueError("déballage de dictionnaire non pris en charge")
+            return {lire_litteral(cle): lire_litteral(valeur)
+                    for cle, valeur in zip(expression.keys, expression.values)}
+        if isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
+            constructeur = {ast.List: list, ast.Tuple: tuple, ast.Set: set}[type(expression)]
+            return constructeur(lire_litteral(element) for element in expression.elts)
+        return ast.literal_eval(expression)
+
     for noeud in arbre.body:
         if isinstance(noeud, ast.Assign) and len(noeud.targets) == 1 and isinstance(noeud.targets[0], ast.Name):
             try:
-                constantes[noeud.targets[0].id] = ast.literal_eval(noeud.value)
+                constantes[noeud.targets[0].id] = lire_litteral(noeud.value)
             except (ValueError, TypeError, SyntaxError, RecursionError):
                 continue
     corps_lus = []
@@ -438,10 +458,8 @@ def corps_documentes_par_les_tests(texte: str) -> list:
                     aides[noeud.name] = (parametres.index(valeur.id), valeur.id, enveloppe)
 
     def valeur_de(expression):
-        if isinstance(expression, ast.Name):
-            return constantes.get(expression.id)
         try:
-            return ast.literal_eval(expression)
+            return lire_litteral(expression)
         except (ValueError, TypeError, SyntaxError, RecursionError):
             return None
 
@@ -473,13 +491,7 @@ def corps_documentes_par_les_tests(texte: str) -> list:
             for mot in appel.keywords:
                 if mot.arg != "json":
                     continue
-                if isinstance(mot.value, ast.Name):
-                    corps = constantes.get(mot.value.id)
-                else:
-                    try:
-                        corps = ast.literal_eval(mot.value)
-                    except (ValueError, TypeError, SyntaxError, RecursionError):
-                        corps = None
+                corps = valeur_de(mot.value)
                 if isinstance(corps, dict) and profil_reconnu(corps) and corps not in corps_lus:
                     corps_lus.append(corps)
     return corps_lus
@@ -4216,8 +4228,8 @@ class BentoMLRunner(BaseRunner):
 
         `bentoml build` tourne dans un conteneur jetable : la machine de
         correction n'a pas à porter bentoml ni les dépendances de l'apprenant.
-        Le `.bento` produit est déposé dans le rendu, où le chemin existant
-        sait le conteneuriser.
+        Le `.bento` produit est déposé dans une copie de travail du rendu,
+        où le chemin existant sait le conteneuriser.
         """
         self.record_step(
             "Construire le service depuis la source",
@@ -4245,27 +4257,41 @@ class BentoMLRunner(BaseRunner):
         # l'apprenant, construire, exporter. Un second conteneur repartirait
         # sans bentoml -- l'export echouait ainsi sur une commande introuvable,
         # et le message disait « aucun bento liste » plutot que la verite.
+        # Certains rendus livrent déjà leurs modèles : une préparation ratée
+        # reste visible, mais seul le build décide si ces artefacts suffisent.
         prealables = " ".join(
-            f"if [ -f {script} ]; then echo '--- {script}'; python {script} 2>&1 | tail -5 || true; fi;"
+            f"if [ -f {script} ]; then run_phase '{script}' python {script} || "
+            f"echo 'avertissement: {script} a échoué; tentative de build avec les artefacts présents'; fi;"
             for script in ("src/prepare_data.py", "src/train_model.py",
                            "src/save_model_joblib.py", "train_model.py")
         )
         script = (
+            "set -e; "
+            # Le nettoyage ne doit jamais remplacer le code de la panne.
+            "trap 'code=$?; trap - EXIT; "
+            f"chown -R {os.getuid()}:{os.getgid()} /src 2>/dev/null || true; "
+            "exit \"$code\"' EXIT; "
+            "run_phase() { phase=$1; shift; echo \"--- $phase\"; "
+            "if \"$@\" 2>&1; then echo \"--- $phase: exit_code=0\"; "
+            "else code=$?; echo \"--- $phase: exit_code=$code\"; return \"$code\"; fi; }; "
             "cd /src; "
-            "pip install --quiet --disable-pip-version-check bentoml >/dev/null 2>&1; "
+            "run_phase 'install bentoml' pip install --disable-pip-version-check bentoml; "
             "if [ -f requirements.txt ]; then "
-            "pip install --quiet --disable-pip-version-check -r requirements.txt >/dev/null 2>&1 || true; fi; "
+            "run_phase 'install requirements.txt' pip install --disable-pip-version-check -r requirements.txt; fi; "
             "export BENTOML_HOME=/src/.bentoml_home; "
             f"{prealables} "
-            "echo '--- bentoml build'; bentoml build 2>&1 | tail -20; "
-            "echo '--- export'; "
-            "tag=$(bentoml list -o json 2>/dev/null | python -c "
-            "'import json,sys; b=json.load(sys.stdin); print(b[0][\"tag\"] if b else \"\")' 2>/dev/null); "
-            "if [ -n \"$tag\" ]; then bentoml export \"$tag\" /src/service.bento && "
-            "echo \"exporte: $tag\"; else echo 'aucun bento construit'; fi; "
-            # Le conteneur ecrit en root dans un repertoire monte : sans ca, le
-            # nettoyage cote hote echoue en EACCES et laisse le rendu derriere.
-            f"chown -R {os.getuid()}:{os.getgid()} /src 2>/dev/null || true"
+            "run_phase 'bentoml build' bentoml build; "
+            # Pas de pipeline : chaque commande doit conserver son code.
+            "list_bentos() { bentoml list -o json > /src/.bento-list.json; }; "
+            "run_phase 'bentoml list' list_bentos; "
+            "echo '--- lire le tag du bento'; "
+            "tag=$(python -c 'import json; "
+            "b=json.load(open(\"/src/.bento-list.json\")); "
+            "print(b[0][\"tag\"] if b else \"\")'); "
+            "if [ -z \"$tag\" ]; then echo 'aucun bento construit'; exit 1; fi; "
+            "run_phase 'bentoml export' bentoml export \"$tag\" /src/service.bento; "
+            "if [ ! -f /src/service.bento ]; then echo 'aucun .bento exporté'; exit 1; fi; "
+            "echo \"exporte: $tag\""
         )
         resultat = subprocess.run(
             ["docker", "run", "--rm", "-e", "PYTHONDONTWRITEBYTECODE=1",
@@ -4273,13 +4299,13 @@ class BentoMLRunner(BaseRunner):
             capture_output=True, text=True, timeout=1800,
         )
         sortie = (resultat.stdout or "") + (resultat.stderr or "")
-        self.steps[-1]["output"] = sortie[-3000:]
+        self.steps[-1]["output"] = sortie
         self.steps[-1]["exit_code"] = resultat.returncode
 
         chemin = os.path.join(source_root, "service.bento")
-        if not os.path.exists(chemin):
+        if resultat.returncode != 0 or not os.path.isfile(chemin):
             return {"success": False,
-                    "error": f"aucun .bento produit par la construction : {sortie[-400:]}"}
+                    "error": f"construction du .bento échouée (code {resultat.returncode}) : {sortie[-400:]}"}
         self.logger.info(f"✓ .bento construit : {chemin}")
         return {"success": True, "bento": chemin}
 
