@@ -408,10 +408,30 @@ def corps_documentes_par_les_tests(texte: str) -> list:
     except (SyntaxError, ValueError):
         return []
     constantes = {}
+
+    def lire_litteral(expression):
+        # 471639 : json={"input_data": FEATURES}. literal_eval seul
+        # refuse ce Name, même si FEATURES est un littéral du module.
+        # Résoudre uniquement les noms déjà lus, y compris dans les
+        # conteneurs ; aucun appel, attribut ou code de la copie ne tourne.
+        if isinstance(expression, ast.Name):
+            if expression.id not in constantes:
+                raise ValueError("constante inconnue")
+            return constantes[expression.id]
+        if isinstance(expression, ast.Dict):
+            if any(cle is None for cle in expression.keys):
+                raise ValueError("déballage de dictionnaire non pris en charge")
+            return {lire_litteral(cle): lire_litteral(valeur)
+                    for cle, valeur in zip(expression.keys, expression.values)}
+        if isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
+            constructeur = {ast.List: list, ast.Tuple: tuple, ast.Set: set}[type(expression)]
+            return constructeur(lire_litteral(element) for element in expression.elts)
+        return ast.literal_eval(expression)
+
     for noeud in arbre.body:
         if isinstance(noeud, ast.Assign) and len(noeud.targets) == 1 and isinstance(noeud.targets[0], ast.Name):
             try:
-                constantes[noeud.targets[0].id] = ast.literal_eval(noeud.value)
+                constantes[noeud.targets[0].id] = lire_litteral(noeud.value)
             except (ValueError, TypeError, SyntaxError, RecursionError):
                 continue
     corps_lus = []
@@ -438,10 +458,8 @@ def corps_documentes_par_les_tests(texte: str) -> list:
                     aides[noeud.name] = (parametres.index(valeur.id), valeur.id, enveloppe)
 
     def valeur_de(expression):
-        if isinstance(expression, ast.Name):
-            return constantes.get(expression.id)
         try:
-            return ast.literal_eval(expression)
+            return lire_litteral(expression)
         except (ValueError, TypeError, SyntaxError, RecursionError):
             return None
 
@@ -473,13 +491,7 @@ def corps_documentes_par_les_tests(texte: str) -> list:
             for mot in appel.keywords:
                 if mot.arg != "json":
                     continue
-                if isinstance(mot.value, ast.Name):
-                    corps = constantes.get(mot.value.id)
-                else:
-                    try:
-                        corps = ast.literal_eval(mot.value)
-                    except (ValueError, TypeError, SyntaxError, RecursionError):
-                        corps = None
+                corps = valeur_de(mot.value)
                 if isinstance(corps, dict) and profil_reconnu(corps) and corps not in corps_lus:
                     corps_lus.append(corps)
     return corps_lus

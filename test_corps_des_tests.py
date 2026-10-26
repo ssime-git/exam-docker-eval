@@ -319,3 +319,79 @@ def test_invalide(base_url):
     assert post_predict(base_url, BAD).status_code == 422
 '''
     assert bentoml_runner.corps_documentes_par_les_tests(texte) == []
+
+
+FEATURES_471639 = {
+    "GRE Score": 337, "TOEFL Score": 118, "University Rating": 4,
+    "SOP": 4.5, "LOR": 4.5, "CGPA": 9.65, "Research": 1,
+}
+TESTS_471639 = '''
+import requests
+FEATURES = {"GRE Score": 337, "TOEFL Score": 118, "University Rating": 4,
+            "SOP": 4.5, "LOR": 4.5, "CGPA": 9.65, "Research": 1}
+
+def test_predict_rejects_missing_token():
+    response = requests.post("http://localhost:3000/predict", json={"input_data": FEATURES})
+    assert response.status_code == 401
+
+def test_predict_returns_chance_between_zero_and_one():
+    response = requests.post("http://localhost:3000/predict", json={"input_data": FEATURES},
+                             headers={"Authorization": "Bearer token"})
+    assert response.status_code == 200
+
+def test_predict_rejects_invalid_feature_values():
+    response = requests.post("http://localhost:3000/predict", json={"input_data": {"GRE Score": 400}})
+    assert response.status_code == 400
+'''
+
+
+def test_471639_constante_imbriquee_dans_le_corps_positif():
+    """Le corps valide est écrit avec FEATURES dans l'enveloppe input_data."""
+    assert bentoml_runner.corps_documentes_par_les_tests(TESTS_471639) == [
+        {"input_data": FEATURES_471639}]
+
+
+def test_471639_corps_positif_mesure_par_la_sonde(tmp_path, monkeypatch):
+    runner = copie_462113(tmp_path, TESTS_471639)
+    brancher_service(monkeypatch, lambda corps: corps == {"input_data": FEATURES_471639})
+    resultats = runner._run_api_tests("http://localhost:32768")
+    assert resultats["predict_passed"], resultats
+    assert resultats["corps_source"] == "tests", resultats
+
+
+def test_constante_imbriquee_dans_une_constante_du_module():
+    texte = '''
+FEATURES = {"gre_score": 320, "cgpa": 9}
+BODY = {"input_data": FEATURES}
+def test_predict():
+    response = client.post("/predict", json=BODY)
+    assert response.status_code == 200
+'''
+    assert bentoml_runner.corps_documentes_par_les_tests(texte) == [
+        {"input_data": {"gre_score": 320, "cgpa": 9}}]
+
+
+def test_constante_imbriquee_d_un_test_de_refus_ne_documente_rien():
+    texte = '''
+FEATURES = {"gre_score": 400, "cgpa": 9}
+def test_predict_invalide():
+    response = client.post("/predict", json={"input_data": FEATURES})
+    assert response.status_code == 400
+'''
+    assert bentoml_runner.corps_documentes_par_les_tests(texte) == []
+
+
+def test_expressions_non_litterales_ne_sont_jamais_executees(tmp_path):
+    marqueur = tmp_path / "ne_doit_pas_exister"
+    expressions = ["INCONNU", "FEATURES.copy()", "FEATURES.inconnu",
+                   f"__import__('pathlib').Path({str(marqueur)!r}).touch()"]
+    for expression in expressions:
+        texte = f'''
+FEATURES = {{"gre_score": 320}}
+BODY = {{"input_data": {expression}}}
+def test_predict():
+    response = client.post("/predict", json={{"input_data": {expression}}})
+    assert response.status_code == 200
+'''
+        assert bentoml_runner.corps_documentes_par_les_tests(texte) == []
+    assert not marqueur.exists()
