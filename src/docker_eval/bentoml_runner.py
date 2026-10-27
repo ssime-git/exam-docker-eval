@@ -23,6 +23,7 @@ import time
 from typing import Dict, Any, Optional
 
 import requests
+import yaml
 from testcontainers.core.container import DockerContainer
 
 from . import environnement
@@ -4252,7 +4253,54 @@ class BentoMLRunner(BaseRunner):
         self._dossier_construction = copie
         source_root = copie
 
-        image = os.environ.get("EXAM_BENTOML_BUILDER_IMAGE", "python:3.11-slim")
+        # requirements.txt peut ne décrire que le client de tests. Le
+        # bentofile déclare les dépendances du service : elles doivent être
+        # disponibles dès prepare_data/train_model, pas seulement dans le
+        # futur conteneur produit par BentoML.
+        try:
+            configuration = {}
+            chemin_configuration = os.path.join(source_root, "bentofile.yaml")
+            # copytree préserve les liens : aucune lecture de configuration
+            # sur l'hôte ne doit sortir de notre copie de travail.
+            if os.path.commonpath([os.path.realpath(source_root),
+                                   os.path.realpath(chemin_configuration)]) != os.path.realpath(source_root):
+                raise ValueError("bentofile.yaml pointe hors de la copie de construction")
+            if os.path.isfile(chemin_configuration):
+                with open(chemin_configuration, encoding="utf-8") as fichier:
+                    configuration = yaml.safe_load(fichier) or {}
+            if not isinstance(configuration, dict):
+                raise ValueError("bentofile.yaml doit être un objet")
+            python = configuration.get("python") or {}
+            docker = configuration.get("docker") or {}
+            if not isinstance(python, dict) or not isinstance(docker, dict):
+                raise ValueError("bentofile.yaml : python et docker doivent être des objets")
+            packages = python.get("packages") or []
+            requirements = python.get("requirements_txt")
+            if not isinstance(packages, list) or any(not isinstance(p, str) or not p.strip() for p in packages):
+                raise ValueError("bentofile.yaml : python.packages doit être une liste de paquets")
+            if requirements is not None and (not isinstance(requirements, str) or not requirements.strip()):
+                raise ValueError("bentofile.yaml : python.requirements_txt doit être un chemin")
+            version = str(docker.get("python_version") or "3.11")
+            if not re.fullmatch(r"3\.\d+(?:\.\d+)?", version):
+                raise ValueError("bentofile.yaml : docker.python_version non reconnue")
+        except (OSError, yaml.YAMLError, ValueError) as erreur:
+            message = f"configuration de construction illisible : {erreur}"
+            self.steps[-1].update(output=message, exit_code=1)
+            return {"success": False, "error": message}
+        image = os.environ.get("EXAM_BENTOML_BUILDER_IMAGE") or f"python:{version}-slim"
+        dependances = ""
+        if packages:
+            dependances += (
+                "run_phase 'install bentofile.yaml python.packages' "
+                "pip install --disable-pip-version-check -- "
+                + " ".join(shlex.quote(paquet) for paquet in packages) + "; "
+            )
+        if requirements:
+            dependances += (
+                "run_phase 'install bentofile.yaml python.requirements_txt' "
+                "pip install --disable-pip-version-check -r "
+                + shlex.quote(requirements) + "; "
+            )
         # Tout dans un seul conteneur : installer, suivre la procedure de
         # l'apprenant, construire, exporter. Un second conteneur repartirait
         # sans bentoml -- l'export echouait ainsi sur une commande introuvable,
@@ -4278,6 +4326,7 @@ class BentoMLRunner(BaseRunner):
             "run_phase 'install bentoml' pip install --disable-pip-version-check bentoml; "
             "if [ -f requirements.txt ]; then "
             "run_phase 'install requirements.txt' pip install --disable-pip-version-check -r requirements.txt; fi; "
+            f"{dependances}"
             "export BENTOML_HOME=/src/.bentoml_home; "
             f"{prealables} "
             "run_phase 'bentoml build' bentoml build; "
