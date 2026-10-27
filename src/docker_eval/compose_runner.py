@@ -695,6 +695,63 @@ class ComposeRunner(BaseRunner):
         # Profils de la recette gardés par ces mêmes up quand l'échec du up de
         # la recette n'est pas imputé à la copie (458925 : le monitoring).
         self._profils_up = []
+        # État par service d'un `up --wait` raté dont des services sont sains
+        # (stack servante partielle) : None sinon.
+        self._demarrage_par_service = None
+
+    def _est_servante(self, services: list) -> bool:
+        mode = os.environ.get("EXAM_STACK_MODE", "auto")
+        return mode == "serving" or (mode != "pipeline" and "pipeline" not in services)
+
+    @staticmethod
+    def _dependances_du_compose(compose_file: str) -> dict:
+        import yaml
+        with open(compose_file, encoding="utf-8") as handle:
+            contenu = yaml.safe_load(handle) or {}
+        dependances = {}
+        for nom, service in (contenu.get("services") or {}).items():
+            bloc = (service or {}).get("depends_on") or []
+            dependances[nom] = list(bloc) if isinstance(bloc, list) else list(bloc.keys())
+        return dependances
+
+    def _demarrage_partiel(self, compose_name: str) -> bool:
+        """Après un `up --wait` raté : garder la stack si des services sont sains.
+
+        Vrai (et `_demarrage_par_service` fixé) seulement en stack servante, avec
+        une cause classée pour chaque service en échec et au moins un service
+        encore debout qui n'est pas en échec. Sinon faux : le `up` reste en échec.
+        """
+        classes = (self._cause_demarrage or {}).get("services") or {}
+        chemin = os.path.join(self.eval_dir, compose_name)
+        if not classes or not self._est_servante(self._services_du_compose(chemin)):
+            return False
+        releve = self._releve_sante()
+        if not any(c.status == "running" and s not in classes for s, (c, _) in releve.items()):
+            return False
+        dependances = self._dependances_du_compose(chemin)
+        par_service = {}
+        for service in self._services_du_compose(chemin):
+            if service in classes:
+                par_service[service] = {"etat": "en_echec", "cause": classes[service]["cause"],
+                                        "preuve": classes[service]["preuve"]}
+            elif service in releve:
+                par_service[service] = {"etat": "sain", "statut": releve[service][0].status}
+            else:
+                manquants = [d for d in dependances.get(service, []) if d in classes]
+                par_service[service] = {"etat": "en_echec", "cause": "non_demarre",
+                                        "preuve": (f"non démarré : dépend de {', '.join(manquants)}"
+                                                   if manquants else "non démarré")}
+        self._demarrage_par_service = par_service
+        return True
+
+    def _resume_demarrage_partiel(self) -> str:
+        lignes = ["`up --wait` en échec : stack partielle, les services sains sont évalués."]
+        for service, etat in sorted(self._demarrage_par_service.items()):
+            if etat["etat"] == "sain":
+                lignes.append(f"{service} : sain ({etat['statut']})")
+            else:
+                lignes.append(f"{service} : en échec ({etat['cause']}) — {etat['preuve']}")
+        return "\n".join(lignes)
 
     def _commande_up(self, compose_name: str) -> str:
         """La ligne du up par défaut, avec les profils et `--scale` gardés."""
@@ -1187,9 +1244,13 @@ class ComposeRunner(BaseRunner):
                         # rendu, sur un conflit de versions (467094).
                         nom_datee = self._tenter_reconstruction_datee(compose_name, echec_up)
                         if nom_datee is None:
-                            raise
-                        compose_name = nom_datee
-                        commande_up = self._commande_up(nom_datee) + " (reconstruction datée)"
+                            # `up --wait` tout-ou-rien : des services sont
+                            # sains, on garde la stack et on les évalue.
+                            if not self._demarrage_partiel(compose_name):
+                                raise
+                        else:
+                            compose_name = nom_datee
+                            commande_up = self._commande_up(nom_datee) + " (reconstruction datée)"
                     demarrage = _DemarrageSansDemontage(self.compose, self._diagnostiquer_up_rate, True)
                 with demarrage:
                     if (self._cause_demarrage or {}).get("cause") == "reseau_build" \
@@ -1197,13 +1258,22 @@ class ComposeRunner(BaseRunner):
                         # La panne réseau n'a pas persisté : le build relancé a passé.
                         self._etape_diagnostic["exit_code"] = 0
                         self._etape_diagnostic["output"] += "\nréessai : le build relancé passe."
-                    self.record_step(
-                        "Build et démarrage Compose",
-                        command=commande_up,
-                        output="Entrée dans le contexte testcontainers réussie (stdout non disponible).",
-                        exit_code=0,
-                        duration=time.time() - compose_started,
-                    )
+                    if self._demarrage_par_service is not None:
+                        self.record_step(
+                            "Build et démarrage Compose",
+                            command=commande_up,
+                            output=self._resume_demarrage_partiel(),
+                            exit_code=1,
+                            duration=time.time() - compose_started,
+                        )
+                    else:
+                        self.record_step(
+                            "Build et démarrage Compose",
+                            command=commande_up,
+                            output="Entrée dans le contexte testcontainers réussie (stdout non disponible).",
+                            exit_code=0,
+                            duration=time.time() - compose_started,
+                        )
                     self.logger.info("Services started successfully")
                     # Retenir les images construites pour cette copie : le ménage
                     # les supprimera. Celles de l'apprenant portent le préfixe du
@@ -1230,6 +1300,15 @@ class ComposeRunner(BaseRunner):
                     if servante:
                         self.logger.info(f"Stack servante ({'déclarée' if mode == 'serving' else services})")
                         result = self._avec_cause(self._evaluer_services_persistants())
+                        if self._demarrage_par_service is not None:
+                            # Stack partielle : le global reste en échec même si
+                            # les services sains passent leurs sondes (un service
+                            # « running » mais unhealthy compterait pour sain).
+                            en_echec = sorted(s for s, e in self._demarrage_par_service.items()
+                                              if e["etat"] == "en_echec")
+                            result["success"], result["exit_code"] = False, 1
+                            result["error"] = f"service(s) en échec au démarrage : {en_echec}"
+                            result["demarrage_par_service"] = self._demarrage_par_service
                         self._log_execution_end(result)
                         return result
 
