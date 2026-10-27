@@ -4304,8 +4304,14 @@ class BentoMLRunner(BaseRunner):
 
         chemin = os.path.join(source_root, "service.bento")
         if resultat.returncode != 0 or not os.path.isfile(chemin):
+            # Le stdout porte les phases (bentoml build compris) ; le stderr ne
+            # porte que le pull de l'image. Concaténés, la fin du stdout était
+            # coupée par le pull : on garde la fin de chacun.
+            fin_sortie = (resultat.stdout or "")[-600:]
+            fin_erreurs = (resultat.stderr or "")[-300:]
             return {"success": False,
-                    "error": f"construction du .bento échouée (code {resultat.returncode}) : {sortie[-400:]}"}
+                    "error": (f"construction du .bento échouée (code {resultat.returncode}) : {fin_sortie}"
+                              + (f" ; stderr : {fin_erreurs}" if fin_erreurs else ""))}
         self.logger.info(f"✓ .bento construit : {chemin}")
         return {"success": True, "bento": chemin}
 
