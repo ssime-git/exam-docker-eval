@@ -4260,6 +4260,11 @@ class BentoMLRunner(BaseRunner):
         try:
             configuration = {}
             chemin_configuration = os.path.join(source_root, "bentofile.yaml")
+            # copytree préserve les liens : aucune lecture de configuration
+            # sur l'hôte ne doit sortir de notre copie de travail.
+            if os.path.commonpath([os.path.realpath(source_root),
+                                   os.path.realpath(chemin_configuration)]) != os.path.realpath(source_root):
+                raise ValueError("bentofile.yaml pointe hors de la copie de construction")
             if os.path.isfile(chemin_configuration):
                 with open(chemin_configuration, encoding="utf-8") as fichier:
                     configuration = yaml.safe_load(fichier) or {}

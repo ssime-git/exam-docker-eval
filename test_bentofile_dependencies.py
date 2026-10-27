@@ -146,3 +146,23 @@ def test_invalid_configuration_is_visible_and_never_runs_docker(tmp_path, monkey
     assert not result["success"]
     assert "configuration de construction illisible" in result["error"]
     assert runner.steps[-1]["exit_code"] == 1
+
+def test_external_bentofile_symlink_never_read_on_host(tmp_path, monkeypatch):
+    import builtins
+    external = tmp_path / "external.yaml"
+    external.write_text("python: {packages: [pandas]}\n")
+    source = tmp_path / "copy"
+    source.mkdir()
+    (source / "bentofile.yaml").symlink_to(external)
+    runner = BentoMLRunner("copy-test", str(source), 1800, logging.getLogger("bento"))
+    original_open = builtins.open
+    def guarded_open(file, *args, **kwargs):
+        if os.path.basename(os.fspath(file)) == "bentofile.yaml":
+            pytest.fail("external configuration must not be opened on the host")
+        return original_open(file, *args, **kwargs)
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    monkeypatch.setattr(module.subprocess, "run",
+                        lambda *args, **kwargs: pytest.fail("no Docker for external configuration"))
+    result = runner._build_bento_from_source(str(source))
+    assert not result["success"]
+    assert "hors de la copie" in result["error"]
