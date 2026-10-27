@@ -1369,9 +1369,6 @@ class BentoMLRunner(BaseRunner):
             # Step 6: Run pytest tests while API is running
             pytest_results = self._run_pytest(base_url)
 
-            # Investigation outillée : conteneur encore debout, étapes en échec
-            # non annotées. Ne modifie jamais le verdict (calculé ensuite).
-            self._investiguer_echecs()
 
             result = {
                 "success": test_results.get("all_passed", False),
@@ -1482,28 +1479,6 @@ class BentoMLRunner(BaseRunner):
         finally:
             # Guaranteed cleanup
             self.cleanup(force=True)
-
-    def _investiguer_echecs(self) -> None:
-        """Lance l'Investigator sur les étapes en échec, conteneur debout."""
-        echecs = [s for s in self.steps if s.get("exit_code") not in (0, None)]
-        if not echecs:
-            return
-        from .investigator import Investigator
-        enqueteur = Investigator(self, self.eval_dir, [self.container_name])
-        if not enqueteur.disponible():
-            self.record_step(
-                "Investigation non configurée",
-                output="étapes en échec mais pas de gateway LLM "
-                       "(LIORA_GATEWAY_URL/LIORA_API_KEY ou PI_CORRECTOR_INVESTIGATE_*)",
-                exit_code=0,
-            )
-            return
-        self.logger.info(f"Investigation outillée : {len(echecs)} étape(s) en échec")
-        try:
-            enqueteur.investiguer(echecs)
-        except Exception as erreur:
-            self.record_step("Investigation interrompue",
-                             output=f"erreur interne : {erreur}", exit_code=1)
 
     def _should_use_image_only_mode(self) -> bool:
         """
@@ -1825,9 +1800,6 @@ class BentoMLRunner(BaseRunner):
             test_results = self._run_api_tests(base_url)
             pytest_results = self._run_pytest(base_url)
 
-            # Investigation outillée : conteneur encore debout, étapes en échec
-            # non annotées. Ne modifie jamais le verdict (calculé ensuite).
-            self._investiguer_echecs()
             pytest_success = (
                 pytest_results.get("executed", False)
                 and pytest_results.get("total", 0) > 0

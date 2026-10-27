@@ -1256,7 +1256,7 @@ class ComposeRunner(BaseRunner):
 
                     # Capture logs before cleanup
                     self.logger.info("Capturing container logs...")
-                    # Proto agent unique : la stack est encore debout ici ; après la sortie
+                    # Agent unique : la stack est encore debout ici ; après la sortie
                     # du `with self.compose`, testcontainers l'a déjà arrêtée.
                     from .agent_hook import avant_demontage
                     avant_demontage(self, self._noms_pour_agent())
@@ -1534,29 +1534,7 @@ class ComposeRunner(BaseRunner):
             # c'est notre lecture qui est cassée, pas la copie qui est bonne.
             succes, morts = False, {"(aucun conteneur visible)": ("absent", -1)}
 
-        # Investigation outillée (#78) : tant que la stack tourne, un vrai
-        # échec (étape non annotée « attendu ») mérite un debug actif. Après
-        # le teardown, plus rien n'est testable.
-        echecs = [s for s in self.steps if s.get("exit_code") not in (0, None)]
-        # Proto agent unique : l'agent du crochet remplace l'investigateur.
-        if echecs and not os.environ.get("EXAM_AGENT_HOOK"):
-            from .investigator import Investigator
-            enqueteur = Investigator(self, self.eval_dir, list(etats.keys()))
-            if enqueteur.disponible():
-                self.logger.info(f"Investigation outillée : {len(echecs)} étape(s) en échec")
-                try:
-                    enqueteur.investiguer(echecs)
-                except Exception as erreur:
-                    self.record_step("Investigation interrompue",
-                                     output=f"erreur interne : {erreur}", exit_code=1)
-            else:
-                self.record_step(
-                    "Investigation non configurée",
-                    output="étapes en échec mais pas de gateway LLM "
-                           "(LIORA_GATEWAY_URL/LIORA_API_KEY ou PI_CORRECTOR_INVESTIGATE_*)",
-                    exit_code=0,
-                )
-        # Proto agent unique : la stack est encore debout ici ; après la sortie
+        # Agent unique : la stack est encore debout ici ; après la sortie
         # du `with self.compose`, testcontainers l'a déjà arrêtée.
         from .agent_hook import avant_demontage
         avant_demontage(self, self._noms_pour_agent())
