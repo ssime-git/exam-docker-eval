@@ -78,6 +78,11 @@ class BaseRunner(ABC):
         # matiere du scratchpad : sans elle, un relecteur doit recouper trois
         # fichiers pour reconstituer une execution.
         self.steps: list = []
+        from .environnement import isoler_environnement
+        retires = isoler_environnement()
+        if retires:
+            self.logger.info("Environnement de la copie isolé, variables retirées : "
+                             + ", ".join(retires))
 
     _TREE_SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
 

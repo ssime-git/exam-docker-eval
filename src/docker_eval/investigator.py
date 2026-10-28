@@ -56,6 +56,8 @@ import time
 import urllib.error
 import urllib.request
 
+from .environnement import variable_correcteur
+
 ACTIONS_MAX = 6
 TIMEOUT_TOTAL_SECONDES = 240
 SORTIE_MAX = 2000
@@ -225,7 +227,7 @@ def scorer_affirmation(preuves: str, affirmation: str, *, base_url: str,
 
 def _nombre_env(nom: str, defaut, conversion):
     try:
-        return conversion(os.environ.get(nom, "").strip() or defaut)
+        return conversion((variable_correcteur(nom) or "").strip() or defaut)
     except ValueError:
         return defaut
 
@@ -244,19 +246,19 @@ class Investigator:
         # périmètre, le LLM verrait et exécuterait dans les autres stacks de
         # la machine.
         self.services = list(services)
-        self.base_url = (os.environ.get("PI_CORRECTOR_INVESTIGATE_BASE_URL")
-                         or os.environ.get("LIORA_GATEWAY_URL", "")).rstrip("/")
-        self.api_key = (os.environ.get("PI_CORRECTOR_INVESTIGATE_API_KEY")
-                        or os.environ.get("LIORA_API_KEY", ""))
+        self.base_url = (variable_correcteur("PI_CORRECTOR_INVESTIGATE_BASE_URL", "")
+                         or variable_correcteur("LIORA_GATEWAY_URL", "")).rstrip("/")
+        self.api_key = (variable_correcteur("PI_CORRECTOR_INVESTIGATE_API_KEY", "")
+                        or variable_correcteur("LIORA_API_KEY", ""))
         # Jamais de modèle en dur : la variable d'env prime, sinon la gateway
         # elle-même dit ce qu'elle sert (hot-swap côté gateway sans redéploiement).
-        self.model = os.environ.get("PI_CORRECTOR_INVESTIGATE_MODEL", "")
-        base_verification = os.environ.get("PI_CORRECTOR_VERIFY_BASE_URL", "").strip()
+        self.model = variable_correcteur("PI_CORRECTOR_INVESTIGATE_MODEL", "")
+        base_verification = variable_correcteur("PI_CORRECTOR_VERIFY_BASE_URL", "").strip()
         if scoreur is None and base_verification:
             scoreur = functools.partial(
                 scorer_affirmation, base_url=base_verification,
-                api_key=os.environ.get("PI_CORRECTOR_VERIFY_API_KEY", "").strip(),
-                model=os.environ.get("PI_CORRECTOR_VERIFY_MODEL", "").strip())
+                api_key=variable_correcteur("PI_CORRECTOR_VERIFY_API_KEY", "").strip(),
+                model=variable_correcteur("PI_CORRECTOR_VERIFY_MODEL", "").strip())
         self.scoreur = scoreur
         self.seuil = _nombre_env("PI_CORRECTOR_VERIFY_THRESHOLD", SEUIL_VERIFICATION, float)
         self.iterations_max = _nombre_env("PI_CORRECTOR_VERIFY_MAX_ITERATIONS",

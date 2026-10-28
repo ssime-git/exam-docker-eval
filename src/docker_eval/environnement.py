@@ -12,6 +12,59 @@ import os
 import re
 import subprocess
 
+# --- l'environnement que voit le code de la copie ---------------------------
+# pi-corrector lance le moteur avec ses clés de fournisseurs LLM. Tout ce que
+# le moteur lance hérite de `os.environ` : testcontainers appelle `docker
+# compose` sans `env=`, `bentoml build` importe le service de la copie, le
+# pytest de la copie tourne sur l'hôte. Un `${GROQ_API_KEY}` dans un compose
+# d'apprenant recevait la vraie clé. On garde donc ce que Docker, compose et
+# uv exigent, et les conventions d'examen ; le reste est mis de côté.
+VARIABLES_SYSTEME = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LANGUAGE", "TZ",
+    "TMPDIR", "TEMP", "TMP", "VIRTUAL_ENV", "REQUESTS_CA_BUNDLE",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    # L'hôte où joindre les ports publiés quand le correcteur tourne en conteneur.
+    "PI_CORRECTOR_DOCKER_HOST",
+})
+PREFIXES_GARDES = ("DOCKER_", "COMPOSE_", "BUILDKIT_", "BUILDX_", "TESTCONTAINERS_",
+                   "UV_", "XDG_", "LC_", "SSL_CERT_", "EXAM_")
+# Le crochet d'agent est l'affaire du moteur, pas de la copie : sa commande et
+# le chemin de ses clés n'ont rien à faire dans une interpolation compose.
+PREFIXES_PRIVES = ("EXAM_AGENT_",)
+
+_mis_de_cote: dict = {}
+
+
+def _garde(nom: str) -> bool:
+    if nom.startswith(PREFIXES_PRIVES):
+        return False
+    return nom in VARIABLES_SYSTEME or nom.startswith(PREFIXES_GARDES)
+
+
+def isoler_environnement() -> list:
+    """Retirer de `os.environ` tout ce que le code de la copie n'a pas à voir.
+
+    Les variables retirées restent lisibles par `variable_correcteur` (crochet
+    d'agent, investigateur). Idempotent : un runner imbriqué ne retire rien de
+    plus. Rend les noms retirés, jamais les valeurs."""
+    retires = sorted(nom for nom in os.environ if not _garde(nom))
+    for nom in retires:
+        _mis_de_cote[nom] = os.environ.pop(nom)
+    return retires
+
+
+def variable_correcteur(nom: str, defaut=None):
+    """Une variable du correcteur, qu'elle ait été mise de côté ou non."""
+    if nom in os.environ:
+        return os.environ[nom]
+    return _mis_de_cote.get(nom, defaut)
+
+
+def environnement_correcteur() -> dict:
+    """L'environnement complet du correcteur, pour ses propres outils (l'agent)."""
+    return {**_mis_de_cote, **os.environ}
+
+
 _DOSSIERS_IGNORES = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", "site-packages"}
 _READMES = {"readme.md", "readme.txt", "readme", "readme.rst"}
 # `uv venv --python 3.12`, `uv run --python=3.12`, `Python 3.12`, `python>=3.12`

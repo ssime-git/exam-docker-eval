@@ -25,6 +25,8 @@ import subprocess
 import tempfile
 import time
 
+from .environnement import environnement_correcteur, variable_correcteur
+
 TIMEOUT_DEFAUT = 900
 # Les gros fichiers (images .tar, .bento) ne sont pas copiés : un agent n'a
 # aucune raison de les réécrire, et les copier coûterait des minutes.
@@ -94,14 +96,14 @@ def _decrire(nom: str) -> dict:
 
 
 def avant_demontage(runner, conteneurs: list) -> None:
-    commande = os.environ.get("EXAM_AGENT_HOOK")
+    commande = variable_correcteur("EXAM_AGENT_HOOK")
     if not commande or getattr(runner, "_agent_passe", False):
         return
     runner._agent_passe = True
     logger = runner.logger
-    dossier = os.environ.get("EXAM_AGENT_DIR") or tempfile.mkdtemp(prefix="exam-agent-")
+    dossier = variable_correcteur("EXAM_AGENT_DIR") or tempfile.mkdtemp(prefix="exam-agent-")
     os.makedirs(dossier, exist_ok=True)
-    delai = int(os.environ.get("EXAM_AGENT_TIMEOUT", TIMEOUT_DEFAUT))
+    delai = int(variable_correcteur("EXAM_AGENT_TIMEOUT", TIMEOUT_DEFAUT))
 
     poignee = {
         "eval_dir": os.path.abspath(runner.eval_dir),
@@ -123,7 +125,7 @@ def avant_demontage(runner, conteneurs: list) -> None:
 
     logger.info(f"[agent-hook] passe la main : {commande} ({len(conteneurs)} conteneur(s), {delai} s)")
     debut = time.time()
-    env = {**os.environ, "STACK_HANDLE": chemin_poignee, "EXAM_AGENT_DIR": dossier}
+    env = {**environnement_correcteur(), "STACK_HANDLE": chemin_poignee, "EXAM_AGENT_DIR": dossier}
     try:
         with open(os.path.join(dossier, "agent.log"), "w", encoding="utf-8") as journal:
             code = subprocess.run(
