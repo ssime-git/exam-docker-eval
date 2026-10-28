@@ -18,6 +18,7 @@ from . import sondes_nginx, sondes_prometheus
 from .sonde_http import contexte_tls_permissif, resume, sonder
 from .config import SERVICE_READY_TIMEOUT, FLASK_READY_PATTERN, REESSAI_SANTE_MAX
 from . import diagnostic_demarrage
+from . import environnement
 from . import lancement
 from . import reconstruction_datee
 
@@ -1618,7 +1619,7 @@ class ComposeRunner(BaseRunner):
         # le teardown, plus rien n'est testable.
         echecs = [s for s in self.steps if s.get("exit_code") not in (0, None)]
         # Proto agent unique : l'agent du crochet remplace l'investigateur.
-        if echecs and not os.environ.get("EXAM_AGENT_HOOK"):
+        if echecs and not environnement.variable_correcteur("EXAM_AGENT_HOOK"):
             from .investigator import Investigator
             enqueteur = Investigator(self, self.eval_dir, list(etats.keys()))
             if enqueteur.disponible():
