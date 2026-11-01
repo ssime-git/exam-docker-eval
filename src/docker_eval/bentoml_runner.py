@@ -923,6 +923,19 @@ def _commandes_du_readme(readme: str) -> list:
     return [l.strip() for l in texte.splitlines() if l.strip()]
 
 
+def _ports_hote_documentes(readme: str, port_service: int) -> set:
+    """Ports publiés vers le service par les commandes docker run du rendu."""
+    ports = set()
+    for ligne in _commandes_du_readme(readme):
+        if not re.match(r"^(?:\$\s*)?(?:sudo\s+)?docker\s+(?:container\s+)?run\b", ligne):
+            continue
+        motif = (r"(?:^|\s)(?:-p\s*|--publish(?:=|\s+))['\"]?"
+                 r"(?:(?:127\.0\.0\.1|localhost|0\.0\.0\.0):)?(\d+):"
+                 + str(port_service) + r"(?:/tcp)?(?=['\"\s]|$)")
+        ports.update(int(port) for port in re.findall(motif, ligne))
+    return ports
+
+
 def _sans_tag(image: str) -> str:
     nom = re.sub(r"^docker\.io/(?:library/)?", "", image.split("@")[0])
     return re.sub(r":[^/:]+$", "", nom)
@@ -2876,8 +2889,11 @@ class BentoMLRunner(BaseRunner):
             re.MULTILINE,
         )
 
+        ports_service = {BENTOML_PORT} | _ports_hote_documentes(
+            self._readme_du_rendu(), BENTOML_PORT)
+        ports = "|".join(str(port) for port in sorted(ports_service, reverse=True))
         adresse_du_service = re.compile(
-            rf"http://(?:127\.0\.0\.1|localhost|0\.0\.0\.0):{BENTOML_PORT}(?![0-9])")
+            rf"http://(?:127\.0\.0\.1|localhost|0\.0\.0\.0):(?:{ports})(?![0-9])")
 
         for filepath in fichiers_de_tests(dst_tests_path):
             try:

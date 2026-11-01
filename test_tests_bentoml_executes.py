@@ -16,7 +16,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from docker_eval import bentoml_runner, environnement
-from docker_eval.bentoml_runner import BentoMLRunner
+from docker_eval.bentoml_runner import BentoMLRunner, _ports_hote_documentes
 
 TEST_459845 = '''import os
 
@@ -46,6 +46,31 @@ def test_l_adresse_documentee_du_service_vise_le_port_reel(tmp_path):
     assert 'os.environ.get("SERVICE_BASE_URL", "http://localhost:32772")' in contenu
     # Ni un autre port qui commence pareil, ni un serveur local du conftest.
     assert '"http://localhost:30001"' in contenu and '"http://127.0.0.1:8000"' in contenu
+
+
+def test_port_hote_documente_est_remappe_sans_toucher_autre_service(tmp_path):
+    ecrire(tmp_path / "README.md", "docker run -d -p 127.0.0.1:3001:3000 admission_prediction_service\n")
+    ecrire(tmp_path / "tests" / "test_api.py", '''
+LOGIN = "http://127.0.0.1:3001/login"
+PREDICT = "http://127.0.0.1:3001/predict"
+AUTRE = "http://127.0.0.1:8000/health"
+''')
+    runner = BentoMLRunner("472733", str(tmp_path), 300, logging.getLogger("t"))
+    runner._prepare_tests_for_dynamic_base_url(str(tmp_path / "tests"), "http://localhost:32768")
+    contenu = (tmp_path / "tests" / "test_api.py").read_text()
+    assert '"http://localhost:32768/login"' in contenu
+    assert '"http://localhost:32768/predict"' in contenu
+    assert '"http://127.0.0.1:8000/health"' in contenu
+
+
+def test_seuls_les_ports_docker_run_vers_le_service_sont_retenus():
+    readme = '''
+docker run --publish=3001:3000 image
+docker run -p 127.0.0.1:3002:3000/tcp image
+docker run -p 8000:8000 image
+curl http://localhost:4000
+'''
+    assert _ports_hote_documentes(readme, 3000) == {3001, 3002}
 
 
 def test_le_python_declare_passe_en_premier(tmp_path):
