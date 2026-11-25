@@ -3873,6 +3873,26 @@ class BentoMLRunner(BaseRunner):
                  for chemin, contenu in zip(morceaux[1::2], morceaux[2::2])]
         return texts
 
+    def _env_livres(self) -> list:
+        """Contenu des fichiers `.env` livrés (pas les modèles `.env.example`),
+        le plus proche de la racine d'abord."""
+        trouves = []
+        for racine, dossiers, fichiers in os.walk(self.eval_dir):
+            dossiers[:] = sorted(d for d in dossiers
+                                 if d not in ("__MACOSX", ".git", "node_modules", ".venv", "venv"))
+            for nom in sorted(fichiers):
+                if nom != ".env":
+                    continue
+                chemin = os.path.join(racine, nom)
+                try:
+                    if os.path.getsize(chemin) > 20_000:
+                        continue
+                    with open(chemin, encoding="utf-8", errors="replace") as f:
+                        trouves.append((chemin.count(os.sep), f.read()))
+                except OSError:
+                    continue
+        return [texte for _, texte in sorted(trouves, key=lambda t: t[0])]
+
     def _env_required_by_image(self) -> Dict[str, str]:
         """Variables d'environnement que le service exige pour demarrer.
 
@@ -3908,6 +3928,17 @@ class BentoMLRunner(BaseRunner):
         env: Dict[str, str] = {}
         if requis:
             declares: Dict[str, str] = {}
+            # 471621 : le `.env` livré, que le README passe en `--env-file`,
+            # porte les valeurs que le service ET les tests attendent. Il
+            # passe avant les exemples du README ; sans lui, une valeur tirée
+            # au hasard (JWT_ALGORITHM=<hex>) cassait /login en 500.
+            for texte in self._env_livres():
+                for nom, valeur in re.findall(
+                        r'^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*([^\s#]+)\s*$',
+                        texte, re.M):
+                    valeur = valeur.strip('"\'')
+                    if valeur and not any(c in valeur for c in "<>$"):
+                        declares.setdefault(nom, valeur)
             for _, texte in self._iter_submission_texts():
                 for nom, valeur in re.findall(
                         r'^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*([^\s#]+)\s*$',
